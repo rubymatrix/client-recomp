@@ -595,6 +595,16 @@ typedef struct Dev
 } Dev;
 
 static Dev g_dev; /* the game makes one device */
+/* One past the highest transform, light and vertex shader constant ever set, in any state: past
+ * them every state holds the defaults, so a state block's apply or capture stops there (a
+ * D3DSBT_ALL block is otherwise 280 matrices, 64 lights and 256 constants a copy). Never lowered. */
+static int g_xf_top, g_light_top, g_vsc_top;
+
+static void raise_top(int* top, uint32_t n)
+{
+    if ((int)n > *top)
+        *top = (int)n;
+}
 /* A 16x16 occlusion probe tests a quad at the sky's depth (z 0x3f7ffffe, 1 - 2^-23: the game's
  * probe for the sun and its lens flare) since the last probe was read; see lock_rect. */
 static int g_probe_sky;
@@ -682,28 +692,41 @@ static State* target(Mask** m)
     return &g_dev.cur;
 }
 
+/* to[i] = from[i] where m[i] (0 or 1), eight at a time: a group with none set is skipped, one with
+ * all set is one copy. n is a multiple of 8. */
+static void copy_masked(uint32_t* to, const uint32_t* from, const uint8_t* m, int n)
+{
+    for (int i = 0; i < n; i += 8)
+    {
+        uint64_t group;
+        memcpy(&group, m + i, 8);
+        if (group == 0x0101010101010101ull)
+            memcpy(to + i, from + i, 32);
+        else if (group)
+            for (int j = i; j < i + 8; ++j)
+                if (m[j])
+                    to[j] = from[j];
+    }
+}
+
 /* Copies the masked entries from `from` to `to` (Apply: block -> device; Capture: device -> block). */
 static void state_copy(State* to, const State* from, const Mask* m)
 {
-    for (int i = 0; i < 256; ++i)
-        if (m->rs[i])
-            to->rs[i] = from->rs[i];
+    copy_masked(to->rs, from->rs, m->rs, 256);
     for (int t = 0; t < 8; ++t)
     {
-        for (int i = 0; i < 32; ++i)
-            if (m->tss[t][i])
-                to->tss[t][i] = from->tss[t][i];
+        copy_masked(to->tss[t], from->tss[t], m->tss[t], 32);
         if (m->tex[t])
             bind(&to->tex[t], from->tex[t]);
     }
-    for (int i = 0; i < NXF; ++i)
+    for (int i = 0; i < g_xf_top; ++i)
         if (m->xf[i])
             memcpy(to->xf[i], from->xf[i], 64);
     if (m->vp)
         memcpy(to->vp, from->vp, sizeof to->vp);
     if (m->mat)
         memcpy(to->mat, from->mat, sizeof to->mat);
-    for (int i = 0; i < MAX_LIGHTS; ++i)
+    for (int i = 0; i < g_light_top; ++i)
     {
         if (m->light[i])
             memcpy(to->light[i].v, from->light[i].v, sizeof to->light[i].v);
@@ -728,7 +751,7 @@ static void state_copy(State* to, const State* from, const Mask* m)
         to->vs = from->vs;
     if (m->ps)
         to->ps = from->ps;
-    for (int i = 0; i < NVSC; ++i)
+    for (int i = 0; i < g_vsc_top; ++i)
         if (m->vsc[i])
             memcpy(to->vsc[i], from->vsc[i], 16);
     for (int i = 0; i < NPSC; ++i)
@@ -1111,15 +1134,16 @@ static uint32_t chain_levels(uint32_t w, uint32_t h, uint32_t levels)
  * size (locks, descriptions, XYZRHW coordinates), and its draws land on the larger texture through a
  * viewport scaled to match (scale_to_target), so the interface is drawn at the screen's resolution
  * and the final stretch is one to one. FFXI_UI_NATIVE=0 draws it at the menu resolution again. */
-/* w x h is smaller than the screen and of the --ui-aspect box's shape (1280x720 for 16:9, 1px either way) */
+/* w x h is smaller than the screen and of the --ui-aspect box's shape (1280x720 for 16:9, 1px either
+ * way): narrower than the screen in a wider window, shorter in a taller one */
 static int ui_box_shape(uint32_t w, uint32_t h)
 {
     uint32_t bw = g_dev.pp[0], bh = g_dev.pp[1];
-    float s = user32_ui_squeeze(g_dev.hwnd);
-    if (s >= 1.0f || !h || w >= bw || h >= bh)
+    float s = user32_ui_squeeze(g_dev.hwnd), sy = user32_ui_squeeze_y(g_dev.hwnd);
+    if ((s >= 1.0f && sy >= 1.0f) || !h || w >= bw || h >= bh)
         return 0;
-    double boxw = bw * (double)s;
-    return fabs((double)w * bh - boxw * h) <= (double)bh;
+    double boxw = bw * (double)s, boxh = bh * (double)sy;
+    return fabs((double)w * boxh - boxw * h) <= boxh;
 }
 
 static int native_size(uint32_t w, uint32_t h, uint32_t* pw, uint32_t* ph)
@@ -1417,6 +1441,7 @@ static void IDirect3DDevice8_SetTransform(Guest* g)
     Mask* m;
     State* s = target(&m);
     memcpy(s->xf[i], ARGP(2), 64);
+    raise_top(&g_xf_top, (uint32_t)i + 1);
     if (m)
         m->xf[i] = 1;
     RET(D3D_OK, 3);
@@ -1446,6 +1471,7 @@ static void IDirect3DDevice8_MultiplyTransform(Guest* g)
     Mask* m;
     State* s = target(&m);
     memcpy(s->xf[i], r, 64);
+    raise_top(&g_xf_top, (uint32_t)i + 1);
     if (m)
         m->xf[i] = 1;
     RET(D3D_OK, 3);
@@ -1491,6 +1517,7 @@ static void IDirect3DDevice8_SetLight(Guest* g)
     Mask* m;
     State* s = target(&m);
     memcpy(s->light[i].v, ARGP(2), 104);
+    raise_top(&g_light_top, i + 1);
     if (m)
         m->light[i] = 1;
     RET(D3D_OK, 3);
@@ -1518,6 +1545,7 @@ static void IDirect3DDevice8_LightEnable(Guest* g)
             m->light[i] = 1;
     }
     s->light[i].enabled = ARG(2) != 0;
+    raise_top(&g_light_top, i + 1);
     if (m)
         m->lighten[i] = 1;
     RET(D3D_OK, 3);
@@ -1618,6 +1646,12 @@ static void IDirect3DDevice8_CreateStateBlock(Guest* g)
     if (type < 1 || type > 3 || g_dev.rec)
         RET(D3DERR_INVALIDCALL, 3);
     Block* b = (Block*)calloc(1, sizeof(Block));
+    /* state_copy stops at the high-water marks (g_xf_top, g_light_top, g_vsc_top): past them the block
+     * starts as the device is (identity transforms, lights off, zero constants), so one applied after
+     * the game first sets such an entry puts its default back, not zeros */
+    memcpy(b->s.xf, g_dev.cur.xf, sizeof b->s.xf);
+    memcpy(b->s.light, g_dev.cur.light, sizeof b->s.light);
+    memcpy(b->s.vsc, g_dev.cur.vsc, sizeof b->s.vsc);
     Mask* m = &b->m;
     memset(m->rs, 1, sizeof m->rs);
     memset(m->tss, 1, sizeof m->tss);
@@ -2026,6 +2060,7 @@ static void IDirect3DDevice8_SetVertexShader(Guest* g)
             for (uint32_t k = 0; k < count && reg + k < NVSC && i + 1 + 4 * k + 3 < sh->ndecl; ++k)
             {
                 memcpy(s->vsc[reg + k], &sh->decl[i + 1 + 4 * k], 16);
+                raise_top(&g_vsc_top, reg + k + 1);
                 if (m)
                     m->vsc[reg + k] = 1;
             }
@@ -2065,6 +2100,7 @@ static void IDirect3DDevice8_SetVertexShaderConstant(Guest* g)
     Mask* m;
     State* s = target(&m);
     memcpy(s->vsc[r], ARGP(2), 16 * n);
+    raise_top(&g_vsc_top, r + n);
     if (m)
         memset(&m->vsc[r], 1, n);
     RET(D3D_OK, 4);
@@ -2342,7 +2378,7 @@ static int build_draw(GfxDraw* d)
         }
         const float* view = s->xf[2];
         int n = 0;
-        for (int i = 0; i < MAX_LIGHTS && n < GFX_NLIGHTS; ++i)
+        for (int i = 0; i < g_light_top && n < GFX_NLIGHTS; ++i)
         {
             const Light* l = &s->light[i];
             uint32_t type = l->v[0];
@@ -2572,30 +2608,34 @@ static void ui_present(void)
     user32_ui_hit = ui_hit;
 }
 
-/* The draw's x mapped to a + b x (the game's pixels, across the whole target): its viewport - the
- * clip rectangle the game gave it, in the target's pixels - moves and narrows to match, while the
- * XYZRHW mapping (u.vp, the viewport in the game's pixels) stays, so the draw keeps its clip */
+/* The draw's x (axis 0) or y (axis 1) mapped to a + b x (the game's pixels, across the whole
+ * target): its viewport - the clip rectangle the game gave it, in the target's pixels - moves and
+ * narrows to match, while the XYZRHW mapping (u.vp, the viewport in the game's pixels) stays, so the
+ * draw keeps its clip */
 static void ui_target_size(float* w, float* h);
 
-static void ui_map(GfxDraw* d, float a, float b)
+static void ui_map_axis(GfxDraw* d, int i, float a, float b)
 {
-    float x0 = d->u.vp[0], w = d->u.vp[2];
+    float x0 = d->u.vp[i], w = d->u.vp[i + 2];
     if (!(w > 0))
         return;
-    float k = (float)d->vp[2] / w; /* the target's pixels per game pixel */
+    float k = (float)d->vp[i + 2] / w; /* the target's pixels per game pixel */
     float l = (a + b * x0) * k, r = (a + b * (x0 + w)) * k;
     /* kept within the target: the back ends clip a viewport to it, which would shrink the mapping
      * (a bar's edge line, widened past the screen's edge, stopped short of its corner) */
     float tw, th;
     ui_target_size(&tw, &th);
+    float edge = i == 0 ? tw : th;
     l = l < 0 ? 0 : l;
-    r = r > tw * k ? tw * k : r;
-    d->vp[0] = (uint32_t)(l + 0.5f);
-    d->vp[2] = r > l ? (uint32_t)(r - l + 0.5f) : 0;
+    r = r > edge * k ? edge * k : r;
+    d->vp[i] = (uint32_t)(l + 0.5f);
+    d->vp[i + 2] = r > l ? (uint32_t)(r - l + 0.5f) : 0;
     /* what rounding the clip took off, given back to the mapping so the draw lands where asked */
-    d->u.vp[0] = x0 + ((float)d->vp[0] / k - (a + b * x0)) / b;
-    d->u.vp[2] = (float)d->vp[2] / k / b;
+    d->u.vp[i] = x0 + ((float)d->vp[i] / k - (a + b * x0)) / b;
+    d->u.vp[i + 2] = (float)d->vp[i + 2] / k / b;
 }
+
+static void ui_map(GfxDraw* d, float a, float b) { ui_map_axis(d, 0, a, b); }
 
 /* The game's size of the target the draw goes to: the back buffer's, or the menu target's */
 static void ui_target_size(float* w, float* h)
@@ -2608,8 +2648,8 @@ static void ui_target_size(float* w, float* h)
 
 static void ui_squeeze(GfxDraw* d, uint32_t first, uint32_t n, uint32_t up_data, uint32_t up_stride, int mark)
 {
-    float s = user32_ui_squeeze(g_dev.hwnd);
-    if (s >= 1.0f)
+    float s = user32_ui_squeeze(g_dev.hwnd), sy = user32_ui_squeeze_y(g_dev.hwnd);
+    if (s >= 1.0f && sy >= 1.0f)
         return;
     uint32_t base, stride, size;
     if (up_data)
@@ -2642,6 +2682,26 @@ static void ui_squeeze(GfxDraw* d, uint32_t first, uint32_t n, uint32_t up_data,
     float W, h;
     ui_target_size(&W, &h);
     float slack = 1.0f + W / 256.0f;
+    if (sy < 1.0f)
+    {
+        /* a window taller than the interface's shape: squeezed toward the middle up and down. What
+         * covers the whole target stays (the 3D scene put on the screen, fades, the dimming behind a
+         * menu); a full-width band at the top or bottom (a cutscene's bars, the lobby's help bar)
+         * keeps its outer edge on the screen's */
+        float yslack = 1.0f + h / 256.0f, a = h * 0.5f * (1.0f - sy), b = sy;
+        int wide = lo <= slack && hi >= W - slack, top = ylo <= yslack, bottom = yhi >= h - yslack;
+        if (wide && top && bottom)
+            return;
+        if (wide && (top || bottom) && yhi > ylo)
+        {
+            float t0 = top ? 0.0f : a + sy * ylo, t1 = bottom ? h : a + sy * yhi;
+            b = (t1 - t0) / (yhi - ylo), a = t0 - b * ylo;
+        }
+        ui_map_axis(d, 1, a, b);
+        if (mark)
+            ui_mark(lo / W, hi / W, (a + b * ylo) / h, (a + b * yhi) / h);
+        return;
+    }
     if (lo <= slack && hi >= W - slack)
     {
         if (yhi - ylo <= h * UI_BAR_MAX_H && g_ui_nbars < UI_MAX_BARS)

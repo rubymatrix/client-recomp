@@ -60,7 +60,11 @@ enum
     D_EndScene = 35,
     D_Clear = 36,
     D_SetTransform = 37,
+    D_GetTransform = 38,
     D_SetRenderState = 50,
+    D_ApplyStateBlock = 54,
+    D_DeleteStateBlock = 56,
+    D_CreateStateBlock = 57,
     D_SetTexture = 61,
     D_SetTextureStageState = 63,
     D_DrawPrimitive = 70,
@@ -359,6 +363,34 @@ static void test_texture_pack(void)
     call(tex, D_Release, 0);
 }
 
+/* A D3DSBT_ALL block made before a transform is first set holds that transform's default: applied
+ * after the game sets it, it puts identity back (state_copy stops at the highest transform ever set;
+ * a new block starts as the device is past it, not as calloc left it) */
+static void test_state_blocks(void)
+{
+    const uint32_t world44 = 256 + 44; /* D3DTS_WORLDMATRIX(44): no other test sets it */
+    call(g_dev, D_CreateStateBlock, 2, 1 /* D3DSBT_ALL */, g_out);
+    uint32_t block = rd32(g_out);
+    CHECK(block != 0, "CreateStateBlock");
+    uint32_t m = galloc(64);
+    for (int i = 0; i < 16; ++i)
+        wr32(m + 4u * (uint32_t)i, fbits(i % 5 == 0 ? 2.0f : 0.0f)); /* a scale by 2 */
+    call(g_dev, D_SetTransform, 2, world44, m);
+    call(g_dev, D_ApplyStateBlock, 1, block);
+    call(g_dev, D_GetTransform, 2, world44, m);
+    int identity = 1;
+    for (int i = 0; i < 16; ++i)
+    {
+        float f;
+        uint32_t u = rd32(m + 4u * (uint32_t)i);
+        memcpy(&f, &u, 4);
+        identity &= f == (i % 5 == 0 ? 1.0f : 0.0f);
+    }
+    uint32_t d0 = rd32(m), d5 = rd32(m + 20);
+    CHECK(identity, "state block: a transform first set after it was made, applied back: [0] %08x [5] %08x (want identity)", d0, d5);
+    call(g_dev, D_DeleteStateBlock, 1, block);
+}
+
 int main(void)
 {
     if (!gwin_init())
@@ -394,6 +426,7 @@ int main(void)
     test_declaration();
     test_copyrects();
     test_texture_pack();
+    test_state_blocks();
     call(g_dev, D_Present, 4, 0, 0, 0, 0);
     printf(g_fails ? "d3d8_test: %d failed\n" : "d3d8_test: ok\n", g_fails);
     return g_fails != 0;

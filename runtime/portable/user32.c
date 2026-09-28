@@ -95,6 +95,16 @@ static float ui_squeeze(const Wnd* w)
     return s < 1.0f ? s : 1.0f;
 }
 
+/* ... and of its height, when the window is taller than the aspect (a 16:9 interface on a 16:10
+ * screen): 1 when it is off or the window is no taller. */
+static float ui_squeeze_y(const Wnd* w)
+{
+    if (!(g_ui_aspect > 0) || w->w <= 0 || w->h <= 0)
+        return 1.0f;
+    float s = (float)w->w / (g_ui_aspect * (float)w->h);
+    return s < 1.0f ? s : 1.0f;
+}
+
 /* The game takes one mouse position for its interface and its 3D world alike. Over the interface
  * (where d3d8.c drew it last frame: user32_ui_hit) the cursor's client x goes to the game as the x
  * the game drew there before its draws were squeezed toward the middle, so its hit tests line up;
@@ -110,20 +120,30 @@ int user32_mouse_raw(void) { return g_mouse_raw; }
 
 void user32_mouse_given(float* fx, float* fy) { *fx = g_mouse_fx, *fy = g_mouse_fy; }
 
-static int ui_unsqueeze_x(const Wnd* w, int x, int y)
+/* The client point (*x, *y) made the one to give the game: unsqueezed across in a wider window, down
+ * in a taller one, over the interface; as it is over the world. */
+static void ui_unsqueeze(const Wnd* w, int* x, int* y)
 {
-    float s = ui_squeeze(w);
-    if (s >= 1.0f)
-        return g_mouse_raw = 1, x;
+    float s = ui_squeeze(w), t = ui_squeeze_y(w);
+    if (s >= 1.0f && t >= 1.0f)
+    {
+        g_mouse_raw = 1;
+        return;
+    }
     if (!g_mouse_held)
-        g_mouse_raw = !(user32_ui_hit && user32_ui_hit(((float)x + 0.5f) / (float)w->w, ((float)y + 0.5f) / (float)w->h));
-    g_mouse_fy = ((float)y + 0.5f) / (float)w->h;
-    if (g_mouse_raw)
-        return g_mouse_fx = ((float)x + 0.5f) / (float)w->w, x;
-    float c = (float)w->w * 0.5f, gx = c + ((float)x - c) / s;
-    int r = gx < 0 ? 0 : gx > (float)(w->w - 1) ? w->w - 1 : (int)(gx + 0.5f);
-    g_mouse_fx = ((float)r + 0.5f) / (float)w->w;
-    return r;
+        g_mouse_raw = !(user32_ui_hit && user32_ui_hit(((float)*x + 0.5f) / (float)w->w, ((float)*y + 0.5f) / (float)w->h));
+    if (!g_mouse_raw && s < 1.0f)
+    {
+        float c = (float)w->w * 0.5f, gx = c + ((float)*x - c) / s;
+        *x = gx < 0 ? 0 : gx > (float)(w->w - 1) ? w->w - 1 : (int)(gx + 0.5f);
+    }
+    if (!g_mouse_raw && t < 1.0f)
+    {
+        float c = (float)w->h * 0.5f, gy = c + ((float)*y - c) / t;
+        *y = gy < 0 ? 0 : gy > (float)(w->h - 1) ? w->h - 1 : (int)(gy + 0.5f);
+    }
+    g_mouse_fx = ((float)*x + 0.5f) / (float)w->w;
+    g_mouse_fy = ((float)*y + 0.5f) / (float)w->h;
 }
 
 static Wnd* wnd_of_sdl(SDL_WindowID id)
@@ -452,8 +472,11 @@ static void pump(void)
         case SDL_EVENT_MOUSE_MOTION:
             w = wnd_of_sdl(e.motion.windowID);
             if (w)
-                post(w->tid, w->hwnd, WM_MOUSEMOVE, mouse_keys(e.motion.state),
-                    ((uint32_t)(uint16_t)(int)e.motion.y << 16) | (uint16_t)ui_unsqueeze_x(w, (int)e.motion.x, (int)e.motion.y));
+            {
+                int mx = (int)e.motion.x, my = (int)e.motion.y;
+                ui_unsqueeze(w, &mx, &my);
+                post(w->tid, w->hwnd, WM_MOUSEMOVE, mouse_keys(e.motion.state), ((uint32_t)(uint16_t)my << 16) | (uint16_t)mx);
+            }
             break;
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
         case SDL_EVENT_MOUSE_BUTTON_UP:
@@ -468,7 +491,9 @@ static void pump(void)
                                                                  : 0;
             if (!msg)
                 break;
-            uint32_t lp = ((uint32_t)(uint16_t)(int)e.button.y << 16) | (uint16_t)ui_unsqueeze_x(w, (int)e.button.x, (int)e.button.y);
+            int bx = (int)e.button.x, by = (int)e.button.y;
+            ui_unsqueeze(w, &bx, &by);
+            uint32_t lp = ((uint32_t)(uint16_t)by << 16) | (uint16_t)bx;
             g_mouse_held = SDL_GetMouseState(NULL, NULL) != 0;
             post(w->tid, w->hwnd, msg, mouse_keys(SDL_GetMouseState(NULL, NULL)), lp);
             break;
@@ -792,7 +817,11 @@ static void sh_GetCursorPos(Guest* g)
         SDL_GetGlobalMouseState(&x, &y);
     Wnd* w = wnd(g_focus);
     if (w && x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h)
-        x = (float)(w->x + ui_unsqueeze_x(w, (int)x - w->x, (int)y - w->y));
+    {
+        int cx = (int)x - w->x, cy = (int)y - w->y;
+        ui_unsqueeze(w, &cx, &cy);
+        x = (float)(w->x + cx), y = (float)(w->y + cy);
+    }
     wr32(ARG(0), (uint32_t)(int32_t)x);
     wr32(ARG(0) + 4, (uint32_t)(int32_t)y);
     RET(1, 1);
@@ -1717,6 +1746,12 @@ float user32_ui_squeeze(uint32_t hwnd)
 {
     Wnd* w = wnd(hwnd);
     return w ? ui_squeeze(w) : 1.0f;
+}
+
+float user32_ui_squeeze_y(uint32_t hwnd)
+{
+    Wnd* w = wnd(hwnd);
+    return w ? ui_squeeze_y(w) : 1.0f;
 }
 
 void user32_client_size(uint32_t hwnd, uint32_t* cw, uint32_t* ch)

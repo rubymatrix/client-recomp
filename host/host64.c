@@ -27,7 +27,7 @@
  * --aspect auto|off|<w:h>: the 3D scene's aspect ratio. auto (the default) follows the window's
  * shape, so a widescreen window shows more to the sides instead of a 4:3 view stretched across it.
  *
- * --ui-aspect <w:h>: the interface keeps this shape (16:9, say) centered in a wider window, instead
+ * --ui-aspect <w:h>: the interface keeps this shape (16:9, say) centered in a wider or taller window, instead
  * of being stretched across it; the mouse is mapped to match. Off by default; an app bundle's
  * FFXIUIAspect key is the default.
  *
