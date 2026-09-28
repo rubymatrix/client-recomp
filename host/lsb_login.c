@@ -553,19 +553,48 @@ int read_secret(const char* prompt, char* out, size_t n)
 #endif
 }
 
-/* the version a refusal names ("... update to version '2.0.x' ..."), an x as 0 */
-static int server_version(const char* message, int out[3])
+/* The version a refusal names, an x (or *, or a missing patch) as 0. Servers word it differently -
+ * "Unsupported ... version 1.0.0.\nThis server requires version 2.2.x.", "Please update to version
+ * '2.0.x'", "Needs 2.2.x" - so every major.minor[.patch] in the message is a candidate and
+ * the last one other than the version we sent wins (the requirement follows the echo of ours). */
+static int server_version(const char* message, const int sent[3], int out[3])
 {
-    const char* p = strstr(message, "version '");
-    if (!p)
-        return 0;
-    p += strlen("version '");
-    char v[24];
-    size_t n = 0;
-    for (; *p && *p != '\'' && n + 1 < sizeof v; ++p)
-        v[n++] = *p == 'x' || *p == 'X' || *p == '*' ? '0' : *p;
-    v[n] = 0;
-    return *p == '\'' && lsb_parse_version(v, out);
+    int found = 0;
+    for (const char* p = message; *p; ++p)
+    {
+        if (*p < '0' || *p > '9' || (p > message && (p[-1] == '.' || (p[-1] >= '0' && p[-1] <= '9'))))
+            continue;
+        int v[3] = { 0, 0, 0 }, parts = 0;
+        const char* q = p;
+        while (parts < 3)
+        {
+            if (*q >= '0' && *q <= '9')
+            {
+                char* end;
+                long n = strtol(q, &end, 10);
+                if (n > 65535)
+                    break;
+                v[parts++] = (int)n;
+                q = end;
+            }
+            else if (parts == 2 && (*q == 'x' || *q == 'X' || *q == '*'))
+                v[parts++] = 0, ++q;
+            else
+                break;
+            if (parts == 3 || *q != '.' || !q[1] || !(q[1] == 'x' || q[1] == 'X' || q[1] == '*' || (q[1] >= '0' && q[1] <= '9')))
+                break;
+            ++q;
+        }
+        if (parts < 2)
+            continue;
+        if (memcmp(v, sent, sizeof v) || !found)
+        {
+            memcpy(out, v, sizeof v);
+            found = memcmp(v, sent, sizeof v) ? 2 : 1;
+        }
+        p = q - 1;
+    }
+    return found == 2;
 }
 
 int lsb_login(const LsbLogin* l, char* err, size_t errn)
@@ -611,11 +640,12 @@ int lsb_login(const LsbLogin* l, char* err, size_t errn)
             memset(pass, 0, sizeof pass);
             return 0;
         }
-        /* A version the server refuses: xi_connect names the one it wants ("Please update to version
-         * '2.0.x'"). Once, sign in again with that (x as 0) and report it for next time. */
+        /* A version the server refuses names the one it wants ("This server requires version
+         * 2.2.x."). Sign in again with that (x as 0) and report it for next time; a second refusal
+         * naming yet another version is followed too, up to a few tries. */
         int want[3];
-        if (attempt == 0 && json_str(reply, "error_message", message, sizeof message) && server_version(message, want)
-            && memcmp(want, version, sizeof want))
+        if (attempt < 3 && json_str(reply, "error_message", message, sizeof message)
+            && server_version(message, version, want))
         {
             fprintf(stderr, "[lsb] the server wants loader version %d.%d.%d, not %d.%d.%d: signing in with that\n",
                 want[0], want[1], want[2], version[0], version[1], version[2]);
