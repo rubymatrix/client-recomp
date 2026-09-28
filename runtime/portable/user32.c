@@ -605,6 +605,33 @@ void user32_set_fullscreen(uint32_t hwnd, int on)
     apply_frame(w);
 }
 
+/* The window in one of the game's modes (0 full screen, 1 a window, 2 a borderless window, 3 borderless
+ * over the desktop) at w x h (3: the desktop's size), as the game would have made it: its style, size
+ * and frame. The game is told the new size (WM_SIZE). */
+void user32_set_window(uint32_t hwnd, int mode, int width, int height)
+{
+    Wnd* w = wnd(hwnd);
+    if (!w)
+        return;
+    uint32_t dw = 0, dh = 0, hz;
+    user32_desktop_mode(&dw, &dh, &hz);
+    w->style = (w->style & 0x10000000u) | (mode == 1 ? 0x00CF0000u : 0x80000000u); /* WS_VISIBLE kept */
+    w->fullscreen = mode == 0;
+    w->w = mode == 3 && dw ? (int)dw : width, w->h = mode == 3 && dh ? (int)dh : height;
+    if (w->sdl)
+    {
+        /* out of full screen first: a full-screen window keeps its size */
+        SDL_SetWindowFullscreen(w->sdl, false);
+        SDL_SyncWindow(w->sdl);
+        SDL_SetWindowSize(w->sdl, w->w, w->h);
+        apply_frame(w);
+        if (mode == 1 || mode == 2)
+            SDL_SetWindowPosition(w->sdl, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        SDL_SyncWindow(w->sdl);
+    }
+    call_wndproc(w, WM_SIZE, 0, ((uint32_t)(uint16_t)w->h << 16) | (uint16_t)w->w);
+}
+
 /* CreateWindowExA(ex, class, title, style, x, y, w, h, parent, menu, instance, param) */
 static void sh_CreateWindowExA(Guest* g)
 {

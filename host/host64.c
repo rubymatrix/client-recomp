@@ -797,7 +797,7 @@ int main(int argc, char** argv)
     gamecore_init();
     d3d8_setup();
     d3d8_set_present_hook(present_hook);
-    ModernSetup ms = { game, data_dir, &g_fps_divisor, fps_given, ui_aspect_given };
+    ModernSetup ms = { game, data_dir, &g_fps_divisor, fps_given, ui_aspect_given, nfinals ? finals[nfinals - 1] : NULL };
     modern_init(&ms);
     setup_nameplates();
     if (getenv("FFXI_PROFILE") && getenv("FFXI_PROFILE")[0] && getenv("FFXI_PROFILE")[0] != '0')

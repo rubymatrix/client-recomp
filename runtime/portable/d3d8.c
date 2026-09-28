@@ -1084,6 +1084,9 @@ void d3d8_screen_size(uint32_t* w, uint32_t* h)
 }
 
 static void ui_present(void);
+static void apply_targets(void);
+static void (*g_after_present)(void);
+static int native_size(uint32_t w, uint32_t h, uint32_t* pw, uint32_t* ph);
 
 static void IDirect3DDevice8_Present(Guest* g)
 {
@@ -1094,7 +1097,62 @@ static void IDirect3DDevice8_Present(Guest* g)
         g_present_hook();
     Obj* bb = obj(g_dev.backbuffer);
     gfx_present(bb ? bb->gpu : NULL);
+    if (g_after_present)
+        g_after_present();
     RET(D3D_OK, 5);
+}
+
+void d3d8_set_after_present(void (*fn)(void)) { g_after_present = fn; }
+
+uint32_t d3d8_window(void) { return g_dev.hwnd; }
+
+/* The back buffer (and its depth) at a new size, the game's objects kept: its next frame draws into
+ * them at once. The render targets drawn at the screen's resolution (native_size) follow it. Between
+ * frames (d3d8_set_after_present); the game's own copies of the size are the host's to change. */
+int d3d8_resize(uint32_t w, uint32_t h)
+{
+    Dev* d = &g_dev;
+    Obj* bb = obj(d->backbuffer);
+    if (!d->guest || !bb || w < 64 || h < 64)
+        return 0;
+    if (w == d->pp[0] && h == d->pp[1])
+        return 1;
+    d->pp[0] = w, d->pp[1] = h;
+    bb->width = w, bb->height = h, bb->size = fmt_size(bb->format, w, h);
+    if (bb->mem)
+        gheap_free(bb->mem), bb->mem = 0;
+    scene_forget(bb->gpu);
+    gfx_tex_destroy(bb->gpu);
+    bb->gpu = gfx_tex_create(GFX_TEX_2D, bb->format, w, h, 1, GFX_USE_RT);
+    Obj* z = obj(d->depth);
+    if (z)
+    {
+        z->width = w, z->height = h, z->size = fmt_size(z->format, w, h);
+        if (z->mem)
+            gheap_free(z->mem), z->mem = 0;
+        scene_forget(z->gpu);
+        gfx_tex_destroy(z->gpu);
+        z->gpu = gfx_tex_create(GFX_TEX_2D, z->format, w, h, 1, GFX_USE_DEPTH);
+    }
+    /* the interface's targets: drawn at the new screen size (their contents are drawn again each frame) */
+    for (uint32_t i = 1; i < g_nobjs; ++i)
+    {
+        Obj* t = &g_objs[i];
+        if (t->kind != O_TEXTURE || !t->pw)
+            continue;
+        uint32_t pw = 0, ph = 0;
+        if (!native_size(t->width, t->height, &pw, &ph))
+            pw = t->width, ph = t->height;
+        if (pw == t->pw && ph == t->ph)
+            continue;
+        scene_forget(t->gpu);
+        gfx_tex_destroy(t->gpu);
+        t->pw = pw == t->width && ph == t->height ? 0 : pw, t->ph = t->pw ? ph : 0;
+        t->gpu = gfx_tex_create(GFX_TEX_2D, t->format, pw, ph, 1, GFX_USE_RT);
+    }
+    apply_targets();
+    rt_log("[recomp] d3d8: back buffer now %ux%u\n", w, h);
+    return 1;
 }
 
 static void IDirect3DDevice8_GetBackBuffer(Guest* g)

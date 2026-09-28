@@ -9,6 +9,14 @@ void d3d8_setup(void);
 /* Called at every Present, on the game's thread with the guest lock held, before the frame goes
  * out: where the host adjusts per-frame game state (host64: the frame-rate divisor). */
 void d3d8_set_present_hook(void (*fn)(void));
+/* Called at every Present just after the frame went out, on the game's thread: between frames, where
+ * the host changes the display (modern.c). */
+void d3d8_set_after_present(void (*fn)(void));
+/* The back buffer and its depth at a new size, the game's objects kept (the game's own copies of the
+ * size are the caller's); 0 before the device exists. */
+int d3d8_resize(uint32_t w, uint32_t h);
+/* The device's window (0 before the device exists) */
+uint32_t d3d8_window(void);
 /* The size the frame is shown at: the device window's client area, else the back buffer's; 0x0
  * before the device exists. */
 void d3d8_screen_size(uint32_t* w, uint32_t* h);

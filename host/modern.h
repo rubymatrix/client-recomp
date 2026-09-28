@@ -13,6 +13,7 @@ typedef struct ModernSetup
     const char* data_dir;  /* modern.cfg: the frame rate, the interface's shape and what Menus hides */
     uint32_t* fps_divisor; /* host64's: 1 60 fps, 2 30 */
     int fps_given, ui_aspect_given; /* on the command line: modern.cfg does not override them */
+    const char* settings_reg; /* the game's display settings (0001/0002, 0003/0004, 0037/0038): Config > Display writes them */
 } ModernSetup;
 
 /* Reads modern.cfg, applying what the command line did not give. */

@@ -34,6 +34,7 @@
 #include <SDL3/SDL.h>
 
 #include "build.h"
+#include "d3d8.h"
 #include "datui.h"
 #include "gfx.h"
 #include "gthread.h"
@@ -62,9 +63,38 @@ enum
     CONFIG_INST = FFXI_MODERN_CONFIG_INST, /* 0x10662718 the global holding the Config list's handler */
     CONFIG_VTBL = FFXI_MODERN_CONFIG_VTBL, /* 0x10337798 */
     WINDOW_PART = FFXI_MODERN_WINDOW_PART, /* 0x101181d0 thiscall window (short item): its part */
+    LOBBY_INST = FFXI_MODERN_LOBBY_INST,   /* 0x10662784 the global holding the lobby's Config window's handler */
+    LOBBY_VTBL = FFXI_MODERN_LOBBY_VTBL,   /* 0x10337140 */
+    LOBBY_INPUT = FFXI_MODERN_LOBBY_INPUT, /* 0x1019ddd0 its slot 6 */
+    LOBBY_HELP = FFXI_MODERN_LOBBY_HELP,   /* 0x10669078 the global holding the lobby's help line ("lobyhelp"): +0x2c its text's index */
+    /* the display as the game keeps it, read from the registry once at its start */
+    DISP_WIN_W = FFXI_MODERN_DISP_WIN_W,   /* 0x10456a58 0001: the window's (back buffer's) width */
+    DISP_WIN_H = FFXI_MODERN_DISP_WIN_H,   /* 0x10456c08 0002 */
+    DISP_MODE = FFXI_MODERN_DISP_MODE,     /* 0x10456a7c 0034: the window mode */
+    DISP_GFX = FFXI_MODERN_DISP_GFX,       /* 0x1045666c the global holding its graphics object: +0x15c/+0x160 the back
+                                            * buffer's size, +0x98 a stack of viewports (24 bytes each, depth at
+                                            * +0x158), the screen's first; +0x1e0 the menu target (0: none) */
+    DISP_VIEWPORT = FFXI_MODERN_DISP_VIEWPORT, /* 0x10009d20 thiscall gfx (): the top viewport the whole back buffer, set */
+    DISP_SCENE = FFXI_MODERN_DISP_SCENE,   /* 0x104568fc the global holding its scene: +0x10/+0x12 (16 bits) the back
+                                            * buffer's size, +0x14/+0x16 the menus' */
+    DISP_DEVICE = FFXI_MODERN_DISP_DEVICE, /* 0x103d3cbc the global holding its device: +0xc/+0x10 the present
+                                            * parameters' size, +0x28 windowed */
+    DISP_MENU_W = FFXI_MODERN_DISP_MENU_W, /* 0x10456ac8 0037: the menus' width */
+    DISP_MENU_H = FFXI_MODERN_DISP_MENU_H, /* 0x10456a90 0038 */
+    DISP_RT = FFXI_MODERN_DISP_RT,         /* 0x1000a6e0 thiscall gfx (w, h, void** out, usage, pool): a render-target
+                                            * texture, as the menu target is made at its start */
+    DISP_DEPTH = FFXI_MODERN_DISP_DEPTH,   /* 0x1000ad70 thiscall gfx (w, h): a depth surface */
+    WIN_SETPOS = FFXI_MODERN_WIN_SETPOS,   /* 0x10119110 thiscall window (x, y): moved there, its parts with it,
+                                            * its handler told (OnMove) */
+    LOG_INST = FFXI_MODERN_LOG_INST,       /* 0x1062193c the global holding the chat log's handler ("logwindo") */
+    LOG2_INST = FFXI_MODERN_LOG2_INST,     /* 0x10621940 ... the second log's ("logwin2") */
+    LOG_FIT = FFXI_MODERN_LOG_FIT,         /* 0x10162d90 thiscall log handler (): its window to its width */
+    CONFIG_GET = FFXI_MODERN_CONFIG_GET,   /* 0x10193850 cdecl (id): a setting of the game's Config */
+    HELP_INST = FFXI_MODERN_HELP_INST,     /* 0x105781f8 the global holding the help line's handler ("helpwind") */
+    HELP_SETRECT = FFXI_MODERN_WIN_SETRECT, /* 0x1011a5a0 thiscall window (x, y, w, h, 1, 0, 0): its frame there, at once */
     VTBL_SLOTS = 17,
     CONFIG_ITEMS = 13,          /* the Config list's own */
-    EV_DOWN = 1, EV_UP = 2, EV_LEFT = 3, EV_RIGHT = 4, EV_SELECT = 5, /* a menu's input events (OnInput) */
+    EV_DOWN = 1, EV_UP = 2, EV_RIGHT = 3, EV_LEFT = 4, EV_SELECT = 5, /* a menu's input events (OnInput); the game's own sliders go up on 3 */
 };
 
 static const char CONFIG_NAME[] = "menu    configwi", SHEET_NAME[] = "menu    modernps",
@@ -77,6 +107,7 @@ enum
     TOGGLE, /* ON / OFF */
     CHOICE, /* a button an option */
     SLIDER, /* Min to Max */
+    LIST,   /* one of a list (List): a slider along it, its value's words after Max */
 };
 
 typedef struct Row
@@ -114,8 +145,78 @@ static int g_fx_touched, g_host_touched;
 static char g_fx_keys[32][24]; /* the scene settings changed, to write */
 static int g_nfx_keys;
 
+/* ---- the display: the game's own settings (settings.reg), read when it starts ----
+ * The window's size (0001 x 0002), the background's (0003 x 0004, square) and the menus' (0037 x
+ * 0038). The menus' size is the window's over the UI scale, in the interface's shape when it has
+ * one. Written to the settings file as they change; the game takes them when it next starts. */
+enum
+{
+    MAX_LIST = 48,
+};
+
+typedef struct List
+{
+    const char* key;
+    int n;
+    char text[MAX_LIST][16];
+    int w[MAX_LIST], h[MAX_LIST]; /* @res: a size */
+    float v[MAX_LIST];            /* @menu: a scale */
+    int spr[MAX_LIST];            /* its value's sprite (list_sprites) */
+} List;
+
+static List g_res = { "@res" }, g_scale = { "@menu" };
+static char g_settings_reg[1100];
+static int g_win_w, g_win_h, g_bg, g_menu_w, g_menu_h, g_mode; /* as the settings file has them; g_mode 0034 */
+static int g_display_live; /* the window's mode or size changed: display_apply, between frames */
+
+static List* list_of(const char* key) { return !strcmp(key, "@res") ? &g_res : !strcmp(key, "@menu") ? &g_scale : NULL; }
+
+/* the menus' size for a window and a scale: w x h over it, as wide as the interface's shape */
+static void menu_size(int ww, int wh, float scale, int* mw, int* mh)
+{
+    int h = (int)lroundf((float)wh / scale), w = (int)lroundf((float)ww / scale);
+    if (g_ui_aspect > 0.0f && (int)lroundf((float)h * g_ui_aspect) < w)
+        w = (int)lroundf((float)h * g_ui_aspect);
+    *mw = (w + 1) & ~1, *mh = (h + 1) & ~1;
+}
+
+/* the list's entry nearest what the settings file has */
+static int list_at(const List* l)
+{
+    int best = 0;
+    float bd = 1e30f;
+    for (int i = 0; i < l->n; ++i)
+    {
+        float d = l == &g_res ? (float)(abs(l->w[i] - g_win_w) + abs(l->h[i] - g_win_h))
+                              : fabsf(l->v[i] - (g_menu_h > 0 ? (float)g_win_h / (float)g_menu_h : 1.0f));
+        if (d < bd)
+            bd = d, best = i;
+    }
+    return best;
+}
+
+static void list_set(List* l, int i)
+{
+    if (i < 0 || i >= l->n)
+        return;
+    /* the scale as it is (a step of its list), before the window changes it */
+    float scale = g_scale.n ? g_scale.v[list_at(&g_scale)] : 1.0f;
+    if (l == &g_res)
+        g_win_w = l->w[i], g_win_h = l->h[i];
+    else
+        scale = l->v[i];
+    menu_size(g_win_w, g_win_h, scale, &g_menu_w, &g_menu_h);
+}
+
 static float get(const Row* r)
 {
+    const List* l = list_of(r->key);
+    if (l)
+        return (float)list_at(l);
+    if (!strcmp(r->key, "@bg"))
+        return (float)g_bg;
+    if (!strcmp(r->key, "@mode"))
+        return (float)g_mode;
     if (!strcmp(r->key, "@fps"))
         return g_setup.fps_divisor ? (float)*g_setup.fps_divisor : 1.0f;
     if (!strcmp(r->key, "@ui"))
@@ -125,9 +226,24 @@ static float get(const Row* r)
     return gfx_fx_get(r->key);
 }
 
+static void save_display(void);
+
 static void set(const Row* r, float v)
 {
-    if (!strcmp(r->key, "@fps"))
+    List* l = list_of(r->key);
+    if (l || !strcmp(r->key, "@bg") || !strcmp(r->key, "@mode"))
+    {
+        if (l)
+            list_set(l, (int)v);
+        else if (!strcmp(r->key, "@bg"))
+            g_bg = (int)v;
+        else
+            g_mode = (int)v;
+        g_display_live |= l || !strcmp(r->key, "@mode"); /* at once (display_apply) */
+        /* written at once: a window closed other than by its close (the lobby's) still keeps it */
+        save_display();
+    }
+    else if (!strcmp(r->key, "@fps"))
     {
         if (g_setup.fps_divisor)
             *g_setup.fps_divisor = (uint32_t)v;
@@ -200,13 +316,26 @@ static const Row MODERN_ROWS[] = {
         "Smooth light across surfaces: the sun's, or every light's." },
     { "Sharpening", "sharpen", SLIDER, 0, { 0 }, { 0 }, 0, 1.0f, "Crisper detail over the whole screen." },
     { "Anti-Shimmer", "filter", TOGGLE, 2, { "ON", "OFF" }, { 1, 0 }, 0, 0, "Steadies fine detail in motion." },
-    { "Texture Filtering", "aniso", CHOICE, 4, { "Off", "4x", "8x", "16x" }, { 1, 4, 8, 16 }, 0, 0,
-        "Sharper ground and walls at an angle." },
     { "Draw Distance", "draw", SLIDER, 0, { 0 }, { 0 }, 1, 6, "How far out the world is drawn." },
     { "Character Distance", "draw_entities", SLIDER, 0, { 0 }, { 0 }, 1, 4, "How far out characters are drawn." },
     { "Frame Rate", "@fps", CHOICE, 2, { "30 fps", "60 fps" }, { 2, 1 }, 0, 0, "The game's frame rate." },
     { "Interface Shape", "@ui", CHOICE, 3, { "Full", "16:9", "4:3" }, { 0, 16.0f / 9.0f, 4.0f / 3.0f }, 0, 0,
         "Keeps the menus in a box of this shape on a wide screen." },
+};
+
+static const Row DISPLAY_ROWS[] = {
+    /* 0034: 1 a window, 3 borderless over the whole screen, 0 full screen (2, a borderless window, reads as none) */
+    { "Window Mode", "@mode", CHOICE, 3, { "Windowed", "Borderless", "Full" }, { 1, 3, 0 }, 0, 0,
+        "A window, borderless over the whole screen, or full screen." },
+    { "Resolution", "@res", LIST, 0, { 0 }, { 0 }, 0, 0,
+        "The window's size." },
+    { "UI Scale", "@menu", LIST, 0, { 0 }, { 0 }, 0, 0,
+        "How large the menus and text are drawn." },
+    { "Background Resolution", "@bg", CHOICE, 3, { "4096", "6144", "8192" }, { 4096, 6144, 8192 }, 0, 0,
+        "The size the world is drawn at before it fits the window. From the next start." },
+    { "Anti-Aliasing", "aa", CHOICE, 2, { "Off", "FXAA" }, { 0, 1 }, 0, 0, "Smooths the world's jagged edges." },
+    { "Texture Filtering", "aniso", CHOICE, 4, { "Off", "4x", "8x", "16x" }, { 1, 4, 8, 16 }, 0, 0,
+        "Sharper ground and walls at an angle." },
     { "FPS Counter", "fps", TOGGLE, 2, { "Show", "Hide" }, { 1, 0 }, 0, 0,
         "The frame rate, in the screen's top left corner." },
 };
@@ -295,6 +424,57 @@ static void save_fx(void)
         fprintf(stderr, "[modern] cannot replace %s\n", path);
 }
 
+/* The display's values into the settings file: its lines for them rewritten in place, the rest
+ * kept, any it lacked added */
+static void save_display(void)
+{
+    static const char* const NAMES[7] = { "0001", "0002", "0003", "0004", "0037", "0038", "0034" };
+    const int v[7] = { g_win_w, g_win_h, g_bg, g_bg, g_menu_w, g_menu_h, g_mode };
+    char tmp[1200], line[512];
+    if (!g_settings_reg[0])
+        return;
+    snprintf(tmp, sizeof tmp, "%s.new", g_settings_reg);
+    FILE* in = fopen(g_settings_reg, "r");
+    FILE* out = fopen(tmp, "w");
+    if (!out)
+    {
+        if (in)
+            fclose(in);
+        fprintf(stderr, "[modern] cannot write %s\n", tmp);
+        return;
+    }
+    int written[7] = { 0 }, crlf = 1, any = 0;
+    while (in && fgets(line, sizeof line, in))
+    {
+        size_t n = strlen(line);
+        if (!any)
+            crlf = n >= 2 && line[n - 2] == '\r', any = 1;
+        int k = -1;
+        for (int i = 0; i < 7; ++i)
+            if (line[0] == '"' && !strncmp(line + 1, NAMES[i], 4) && line[5] == '"')
+                k = i;
+        if (k < 0)
+            fputs(line, out);
+        else if (!written[k])
+        {
+            fprintf(out, "\"%s\"=dword:%08x%s", NAMES[k], (unsigned)v[k], crlf ? "\r\n" : "\n");
+            written[k] = 1;
+        }
+    }
+    if (in)
+        fclose(in);
+    else
+        fprintf(out, "REGEDIT4\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\PlayOnlineUS\\SquareEnix\\FinalFantasyXI]\r\n");
+    for (int i = 0; i < 7; ++i)
+        if (!written[i])
+            fprintf(out, "\"%s\"=dword:%08x%s", NAMES[i], (unsigned)v[i], crlf ? "\r\n" : "\n");
+    if (fclose(out) || rename(tmp, g_settings_reg))
+        fprintf(stderr, "[modern] cannot replace %s\n", g_settings_reg);
+    else
+        fprintf(stderr, "[modern] display from the next start: mode %d, %dx%d, menus %dx%d, background %d\n", g_mode,
+            g_win_w, g_win_h, g_menu_w, g_menu_h, g_bg);
+}
+
 static void save(void)
 {
     if (g_fx_touched)
@@ -337,6 +517,84 @@ static const char* cfg_value(const char* path, const char* key, char* buf, size_
     return found;
 }
 
+/* a DWORD of the settings file ("name"=dword:hex), or dflt */
+static int settings_dword(const char* name, int dflt)
+{
+    FILE* f = g_settings_reg[0] ? fopen(g_settings_reg, "r") : NULL;
+    if (!f)
+        return dflt;
+    char line[256], want[16];
+    snprintf(want, sizeof want, "\"%s\"=dword:", name);
+    int v = dflt;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, want, strlen(want)))
+            v = (int)strtoul(line + strlen(want), NULL, 16);
+    fclose(f);
+    return v;
+}
+
+static void res_add(int w, int h)
+{
+    if (w < 640 || h < 480)
+        return;
+    for (int i = 0; i < g_res.n; ++i)
+        if (g_res.w[i] == w && g_res.h[i] == h)
+            return;
+    if (g_res.n == MAX_LIST)
+        return;
+    int at = g_res.n++;
+    /* in order: narrowest first, then shortest */
+    while (at > 0 && (g_res.w[at - 1] > w || (g_res.w[at - 1] == w && g_res.h[at - 1] > h)))
+    {
+        g_res.w[at] = g_res.w[at - 1], g_res.h[at] = g_res.h[at - 1];
+        memcpy(g_res.text[at], g_res.text[at - 1], sizeof g_res.text[0]);
+        --at;
+    }
+    g_res.w[at] = w, g_res.h[at] = h;
+    snprintf(g_res.text[at], sizeof g_res.text[0], "%dx%d", w, h);
+}
+
+/* The sizes the window can be: the display's modes (the one the game's window is on), and the
+ * size the settings file has; a few common ones when SDL knows of no display yet */
+static void lists_fill(void)
+{
+    if (!g_scale.n)
+        for (int i = 0; i <= 10; ++i)
+        {
+            g_scale.v[g_scale.n] = 0.5f + 0.25f * (float)i;
+            snprintf(g_scale.text[g_scale.n++], sizeof g_scale.text[0], "%gx", (double)(0.5f + 0.25f * (float)i));
+        }
+    if (g_res.n)
+        return;
+    int nwin = 0, nmodes = 0;
+    SDL_DisplayID display = 0;
+    if (SDL_WasInit(SDL_INIT_VIDEO))
+    {
+        SDL_Window** wins = SDL_GetWindows(&nwin);
+        display = wins && nwin > 0 ? SDL_GetDisplayForWindow(wins[0]) : 0;
+        SDL_free(wins);
+        if (!display)
+            display = SDL_GetPrimaryDisplay();
+    }
+    SDL_DisplayMode** modes = display ? SDL_GetFullscreenDisplayModes(display, &nmodes) : NULL;
+    for (int i = 0; modes && i < nmodes; ++i)
+        res_add(modes[i]->w, modes[i]->h);
+    SDL_free(modes);
+    const SDL_DisplayMode* desk = display ? SDL_GetDesktopDisplayMode(display) : NULL;
+    if (desk)
+        res_add(desk->w, desk->h);
+    if (g_res.n < 2)
+    {
+        static const int COMMON[][2] = { { 1280, 720 }, { 1600, 900 }, { 1920, 1080 }, { 2560, 1440 }, { 3440, 1440 },
+            { 3840, 2160 } };
+        for (size_t i = 0; i < sizeof COMMON / sizeof COMMON[0]; ++i)
+            res_add(COMMON[i][0], COMMON[i][1]);
+    }
+    res_add(g_win_w, g_win_h);
+    fprintf(stderr, "[modern] display: %dx%d, menus %dx%d, background %d (%s); %d sizes, at %s; scale at %s\n", g_win_w, g_win_h,
+        g_menu_w, g_menu_h, g_bg, g_settings_reg, g_res.n, g_res.text[list_at(&g_res)], g_scale.text[list_at(&g_scale)]);
+}
+
 /* ---- guest memory ---- */
 
 static uint32_t gbytes(const void* p, uint32_t n)
@@ -353,12 +611,13 @@ static int guest_is(uint32_t addr, const void* bytes, size_t n) { return !memcmp
 
 /* ---- the layouts ---- */
 
-/* The layout payload called name in the menu DAT: a copy, or NULL. */
-static uint8_t* dat_layout(const char* name, size_t* size)
+/* The payload of the chunk of a type (0x30 a layout, 0x31 a sprite sheet) called name in a DAT of
+ * the install (as "ROM\\119\\51.DAT"): a copy, or NULL. */
+static uint8_t* dat_chunk(const char* file, int type, const char* name, size_t* size)
 {
     /* the game's path for it, then the file it opens: a DAT overlay's, else the install's */
     char guest[1200], path[1200];
-    snprintf(guest, sizeof guest, "%s\\ROM\\119\\51.DAT", g_game);
+    snprintf(guest, sizeof guest, "%s\\%s", g_game, file);
     if (!vfs_overlay_path(guest, path, sizeof path) && !vfs_host_path(guest, path, sizeof path))
         return NULL;
     FILE* f = fopen(path, "rb");
@@ -378,7 +637,7 @@ static uint8_t* dat_layout(const char* name, size_t* size)
         long len = (long)((info >> 7) & 0x7FFFF) * 16;
         if (len < 16 || o + len > n)
             break;
-        if ((info & 0x7F) == 0x30 && len >= 48 && !memcmp(d + o + 16, name, 16))
+        if ((int)(info & 0x7F) == type && len >= 48 && !memcmp(d + o + 16, name, 16))
         {
             *size = (size_t)len - 16;
             out = malloc(*size);
@@ -391,6 +650,11 @@ static uint8_t* dat_layout(const char* name, size_t* size)
     free(d);
     return out;
 }
+
+/* the layout called name in the menu DAT (the lobby's: 50.DAT) */
+static uint8_t* dat_layout_in(const char* file, const char* name, size_t* size) { return dat_chunk(file, 0x30, name, size); }
+
+static uint8_t* dat_layout(const char* name, size_t* size) { return dat_layout_in("ROM\\119\\51.DAT", name, size); }
 
 static void w16(uint8_t* p, int v) { p[0] = (uint8_t)v, p[1] = (uint8_t)(v >> 8); }
 
@@ -513,6 +777,8 @@ static void part(int x0, int y0, int x1, int y1, int uw, int uh, int u, int v, u
 }
 
 /* s with its line's top at x, y: a button's words (a drop shadow under each glyph) or a panel's */
+static const char* g_font = FONT; /* the glyphs' image: the lobby's panel names it "FONT    font    " */
+
 static void words(int x, int y, const char* s, int button)
 {
     for (int pass = button ? 0 : 1; pass < 2; ++pass)
@@ -528,7 +794,7 @@ static void words(int x, int y, const char* s, int button)
             }
             int top = y + g->v - g->top + d;
             part(at + d, top, at + d + g->w, top + g->h, g->w, g->h, g->u, g->v, pass ? WHITE : SHADOW,
-                pass ? (button ? M_ITEM : M_PANEL) : M_SHADOW, FONT);
+                pass ? (button ? M_ITEM : M_PANEL) : M_SHADOW, g_font);
             at += g->w - 1;
         }
     }
@@ -576,6 +842,7 @@ enum
     TITLE_H = 30, /* the title strip, and room under it */
     ROW_H = 22,
     TRACK_W = 150, /* a slider's, from 32 right of its row's controls' column */
+    LIST_VALUE_X = 32 + TRACK_W + 12 + 36, /* a list's value's words, from its row's controls' column: after Max */
     MAX_ROWS = 24,
     MAX_ITEMS = 64,
 };
@@ -594,6 +861,7 @@ typedef struct Page
     uint32_t spare; /* the menu table entry it takes, */
     const char* spare_was; /* named this (and, for the duplicate conf1win, after one of the same) */
     int spare_how;         /* SPARE_* */
+    uint32_t modes;        /* its entry's +0x28: the game modes it opens in (0x08 the lobby's, 0x01 the field's) and more */
     const Row* rows;
     int nrows;
     /* made at setup */
@@ -608,6 +876,7 @@ typedef struct Page
  * next thing in memory (first byte 0) then takes */
 enum
 {
+    SPARE_UNUSED = 0, /* an entry whose menu is in no DAT and that nothing opens */
     SPARE_DUP = 1,
     SPARE_END = 2,
     TABLE_END = FFXI_MODERN_MENUS_END, /* 0x10376270 */
@@ -616,10 +885,18 @@ enum
 static const char NO_NAME[16] = { 0 };
 
 static Page PAGES[] = {
-    { "menu    menushid", "Menus", "Show or hide items of the game's own menus.", TABLE_END, NO_NAME, SPARE_END,
+    { "menu    displayw", "Display", "Window mode, resolution, UI scale, background, anti-aliasing and the frame rate.",
+        FFXI_MODERN_MENUS_DISPLAY, "tkdebug dbdelsel", SPARE_UNUSED, 0x1c0209u, DISPLAY_ROWS,
+        sizeof DISPLAY_ROWS / sizeof DISPLAY_ROWS[0] },
+    { "menu    menushid", "Menus", "Show or hide items of the game's own menus.", TABLE_END, NO_NAME, SPARE_END, 0x1c0201u,
         MENUS_ROWS, sizeof MENUS_ROWS / sizeof MENUS_ROWS[0] },
     { "menu    modernwi", "Modern", "Graphics beyond the original's: effects, lighting and draw distance.",
-        FFXI_MODERN_MENUS_CONF1WIN, "menu    conf1win", SPARE_DUP, MODERN_ROWS, sizeof MODERN_ROWS / sizeof MODERN_ROWS[0] },
+        FFXI_MODERN_MENUS_CONF1WIN, "menu    conf1win", SPARE_DUP, 0x1c0201u, MODERN_ROWS,
+        sizeof MODERN_ROWS / sizeof MODERN_ROWS[0] },
+};
+enum
+{
+    PAGE_DISPLAY = 0, /* the one the lobby's Config window opens */
 };
 enum
 {
@@ -644,6 +921,16 @@ static void layout_items(Page* p)
         p->row_item[r] = p->nitems;
         if (row->kind == SLIDER)
             p->items[p->nitems++] = (Item){ r, -1, p->cx + 32, TRACK_W, 0 };
+        else if (row->kind == LIST)
+        {
+            const List* l = list_of(row->key);
+            int widest = 0;
+            for (int i = 0; l && i < l->n; ++i)
+                widest = text_width(l->text[i]) > widest ? text_width(l->text[i]) : widest;
+            p->items[p->nitems++] = (Item){ r, -1, p->cx + 32, TRACK_W, 0 };
+            if (p->cx + LIST_VALUE_X + widest + 16 > p->w)
+                p->w = p->cx + LIST_VALUE_X + widest + 16;
+        }
         else
         {
             int w = row->nopt > 3 ? 52 : 64;
@@ -677,7 +964,7 @@ static void page_sprites(Page* p)
         int y = row_top(r);
         part(20, y + 4, 28, y + 12, 8, 8, 0, 8, WHITE, M_GAUGE, GAUGE);
         int tx = p->cx + 32;
-        if (p->rows[r].kind == SLIDER)
+        if (p->rows[r].kind == SLIDER || p->rows[r].kind == LIST)
         {
             part(tx - 8, y, tx, y + 16, 4, 8, 0, 8, WHITE, M_GAUGE, GAUGE);
             part(tx + TRACK_W, y, tx + TRACK_W + 8, y + 16, 4, 8, 4, 8, WHITE, M_GAUGE, GAUGE);
@@ -693,13 +980,13 @@ static void page_sprites(Page* p)
     {
         sprite_begin();
         words(32, 2, p->rows[r].label, 0);
-        if (p->rows[r].kind == SLIDER)
+        if (p->rows[r].kind == SLIDER || p->rows[r].kind == LIST)
             words(p->cx, 2, "Min", 0), words(p->cx + 32 + TRACK_W + 12, 2, "Max", 0);
     }
     for (int r = 0; r < p->nrows; ++r)
     {
         p->spr_line[r] = -1;
-        if (p->rows[r].kind != SLIDER)
+        if (p->rows[r].kind != SLIDER && p->rows[r].kind != LIST)
             p->spr_line[r] = underline_sprite(p->items[p->row_item[r]].w);
     }
     for (int i = 0; i < p->nitems; ++i)
@@ -708,6 +995,17 @@ static void page_sprites(Page* p)
         else
             p->items[i].sprite = g_spr_track;
     p->spr_config = button_sprite(p->title, 88);
+}
+
+/* A list's values: each its words after the slider's Max, drawn by PAGE_MARK (at the item - the
+ * track, 32 right of the controls' column - x + 0x25, y + 4) */
+static void list_sprites(List* l)
+{
+    for (int i = 0; i < l->n; ++i)
+    {
+        l->spr[i] = sprite_begin();
+        words(LIST_VALUE_X - 32 - 0x25, 2 - 4, l->text[i], 0);
+    }
 }
 
 static int build_sheet(void)
@@ -729,6 +1027,8 @@ static int build_sheet(void)
         layout_items(&PAGES[k]);
         page_sprites(&PAGES[k]);
     }
+    list_sprites(&g_res);
+    list_sprites(&g_scale);
     S.p[count] = (uint8_t)S.sprites, S.p[count + 1] = (uint8_t)(S.sprites >> 8);
     return !S.overflow;
 }
@@ -847,6 +1147,8 @@ static uint8_t* config_layout(size_t* out_size)
 /* ---- the handlers ---- */
 
 static uint32_t g_config_slots[VTBL_SLOTS]; /* the Config list's own */
+static void lobby_input(Guest* g);
+static void lobby_setup(void);
 static uint32_t g_scratch;                  /* guest room: a name, a cursor */
 static uint32_t g_sheet_guest, g_config_guest, g_config_size; /* the game keeps pointers into these */
 
@@ -858,11 +1160,13 @@ static uint32_t find_sheet(void)
     return guest_thiscall(SHEET_FIND, SHEETS, 1, (uint32_t[]){ g_scratch + 16 });
 }
 
+static int g_nsprites; /* our sheet's */
+
 /* one of our sprites, as the game holds it */
 static uint32_t sprite(int i)
 {
     uint32_t sheet = find_sheet(), list = sheet ? rd32(sheet) : 0;
-    return list && i >= 0 && i < S.sprites ? rd32(list + 4u * (uint32_t)i) : 0;
+    return list && i >= 0 && i < g_nsprites ? rd32(list + 4u * (uint32_t)i) : 0;
 }
 
 /* item's help, in the game's help line while the cursor is on it */
@@ -924,7 +1228,25 @@ static void page_draw(Guest* g)
     {
         const Row* row = &p->rows[r];
         uint32_t id = (uint32_t)p->row_item[r] + 1;
-        if (row->kind == SLIDER)
+        const List* l = list_of(row->key);
+        if (row->kind == LIST && l && l->n)
+        {
+            int at = list_at(l);
+            float t = l->n > 1 ? (float)at / (float)(l->n - 1) : 1.0f;
+            uint32_t bits, value = sprite(l->spr[at]);
+            memcpy(&bits, &t, 4);
+            if (fill)
+            {
+                wr32(self + 0x1c, fill);
+                guest_thiscall(PAGE_FILL, self, 3, (uint32_t[]){ id, bits, 0x80808080u });
+            }
+            if (value)
+            {
+                wr32(self + 0x14, value);
+                guest_thiscall(PAGE_MARK, self, 3, (uint32_t[]){ 0, id, id });
+            }
+        }
+        else if (row->kind == SLIDER)
         {
             float t = place(row);
             uint32_t bits;
@@ -957,12 +1279,18 @@ static void page_input(Guest* g)
 {
     int ev = (int16_t)ARG(0), id = (int16_t)ARG(1);
     Page* p = page_of(g->ecx);
-    fprintf(stderr, "[modern] input %d on %d\n", ev, id); /* TODO: drop once the codes are confirmed */
     if (p && id >= 1 && id <= p->nitems)
     {
         const Item* it = &p->items[id - 1];
         const Row* row = &p->rows[it->row];
-        if (it->opt >= 0 && ev == EV_SELECT)
+        const List* l = list_of(row->key);
+        if (row->kind == LIST && l && l->n)
+        {
+            int at = list_at(l);
+            if (ev == EV_LEFT || ev == EV_RIGHT)
+                set(row, (float)(ev == EV_RIGHT ? (at + 1 < l->n ? at + 1 : at) : at > 0 ? at - 1 : 0));
+        }
+        else if (it->opt >= 0 && ev == EV_SELECT)
             set(row, row->val[it->opt]);
         else if (it->opt < 0 && (ev == EV_LEFT || ev == EV_RIGHT))
             slide(row, ev == EV_RIGHT ? 1 : -1);
@@ -977,6 +1305,7 @@ static const ShimDef SHIMS[] = {
     { "modern", "page_close", page_close },
     { "modern", "page_draw", page_draw },
     { "modern", "page_input", page_input },
+    { "modern", "lobby_input", lobby_input },
     { NULL, NULL, NULL },
 };
 
@@ -1187,6 +1516,211 @@ static void hide_apply(void)
         menu_install(&MENUS[k]);
 }
 
+/* ---- the lobby's Config window: a Display Settings row ----
+ * The title screen's Config ("menu    lobycwin", in the lobby's menu DAT, 50.DAT) is a Config page
+ * of its own: music, volume, where logging out goes, the background's shape and a Gamepad button,
+ * its panel sprite 184 of "menu    lobbywin". Here it gets a row more, a Display button under
+ * Gamepad that opens Config > Display: the panel copied from the DAT, 38 taller with the row's
+ * bullet, words and button shadow; the layout with the button after Gamepad; the handler's input
+ * first here. Its help line is the lobby's own (a text by index): none on ours. */
+enum
+{
+    LOBBY_ITEMS = 13, /* the window's own; Gamepad the last */
+    LOBBY_GAMEPAD = 13,
+    LOBBY_OURS = 14,
+    LOBBY_ROW = 38,   /* between its rows */
+    LOBBY_PANEL = 184,
+};
+
+static const char LOBBY_NAME[] = "menu    lobycwin", LOBBY_RENAMED[] = "menu    lobycwi_",
+                  LOBBY_SHEET[] = "menu    modernlb", LOBBY_WIN_SHEET[] = "menu    lobbywin",
+                  FONT_LOBBY[] = "FONT    font    ";
+static uint32_t g_lobby_sheet, g_lobby_layout, g_lobby_size, g_lobby_slots[VTBL_SLOTS], g_lobby_vt;
+static int g_lobby_ok;
+
+/* A sprite's parts in a sheet payload (name, images, sprites of parts of 61 bytes): where they
+ * start, their count; NULL when it has no such sprite */
+static const uint8_t* sheet_sprite(const uint8_t* p, size_t n, int index, int* nparts)
+{
+    size_t at = 17 + 16 * (size_t)(n > 16 ? p[16] : 0);
+    if (at + 2 > n)
+        return NULL;
+    int count = p[at] | p[at + 1] << 8;
+    at += 2;
+    for (int i = 0; i < count && at < n; ++i)
+    {
+        int k = p[at++];
+        if (at + 61 * (size_t)k > n)
+            return NULL;
+        if (i == index)
+            return *nparts = k, p + at;
+        at += 61 * (size_t)k;
+    }
+    return NULL;
+}
+
+/* The lobby's sheet: the Config window's panel a row taller, and the Display button */
+static int lobby_sheet(void)
+{
+    size_t n;
+    uint8_t* win = dat_chunk("ROM\\119\\50.DAT", 0x31, LOBBY_WIN_SHEET, &n);
+    int nparts = 0;
+    const uint8_t* parts = win ? sheet_sprite(win, n, LOBBY_PANEL, &nparts) : NULL;
+    /* the panel as known: its background (newtex) first, the window's size */
+    if (!parts || nparts < 2 || nparts > 200 || memcmp(parts + 45, NEWTEX, 16) || r16(parts + 10) != 248 ||
+        r16(parts + 18) != 248)
+    {
+        free(win);
+        return 0;
+    }
+    S.n = 0, S.sprites = 0, S.overflow = 0;
+    put(LOBBY_SHEET, 16);
+    put("\x05", 1);
+    put(NEWTEX, 16), put(GAUGE, 16), put(BUTTONTO, 16), put(FONT_LOBBY, 16), put(FONT, 16);
+    size_t count = S.n;
+    put("\0\0", 2);
+    sprite_begin();
+    for (int i = 0; i < nparts; ++i)
+    {
+        uint8_t b[61];
+        memcpy(b, parts + 61 * i, 61);
+        if (i == 0)
+        {
+            /* the background: to the new foot, its texture as tall */
+            int h = 248 + LOBBY_ROW;
+            w16(b + 10, h), w16(b + 14, h), w16(b + 18, h);
+        }
+        put(b, 61);
+        S.p[S.count_at]++;
+    }
+    free(win);
+    int y = 177 + LOBBY_ROW; /* the Gamepad row's words' top, a row down */
+    g_font = FONT_LOBBY;
+    part(20, y + 2, 28, y + 10, 8, 8, 0, 8, WHITE, M_GAUGE, GAUGE);
+    words(32, y, "Display Settings", 0);
+    pill(64, 191 + LOBBY_ROW + 2, 88, PILL_SHADOW, M_PANEL);
+    button_sprite("Display", 88);
+    g_font = FONT;
+    S.p[count] = (uint8_t)S.sprites, S.p[count + 1] = (uint8_t)(S.sprites >> 8);
+    return !S.overflow;
+}
+
+/* The window's layout from the DAT with ours after Gamepad: the window a row taller on our panel,
+ * Gamepad leading down and on to ours, the music row (the top) up to ours */
+static uint8_t* lobby_layout(size_t* out_size)
+{
+    size_t size;
+    uint8_t* src = dat_layout_in("ROM\\119\\50.DAT", LOBBY_NAME, &size);
+    if (!src || src[0x11] != LOBBY_ITEMS)
+    {
+        free(src);
+        return NULL;
+    }
+    uint8_t* dst = calloc(1, size + 128);
+    memcpy(dst, src, size);
+    free(src);
+    size_t at = 0x20, win = 0x20;
+    int ok = 0, gy = 0, gx = 0;
+    for (int b = -1; b < LOBBY_ITEMS; ++b)
+    {
+        size_t n = at + 0x20 <= size ? (size_t)r16(dst + at) : 0;
+        if (n < 0x20 || at + n > size)
+        {
+            ok = 0;
+            break;
+        }
+        if (b >= 0)
+        {
+            uint8_t* q = dst + at;
+            int id = r16(q + 0x12);
+            if (id == LOBBY_GAMEPAD)
+            {
+                q[0x16] = q[0x18] = LOBBY_OURS; /* next, down */
+                gx = r16(q + 2), gy = r16(q + 4), ok = 1;
+            }
+            if (q[0x17] == LOBBY_GAMEPAD && id != LOBBY_GAMEPAD && r16(q + 4) < 60)
+                q[0x17] = LOBBY_OURS; /* the top row's up */
+            if (q[0x15] == LOBBY_GAMEPAD && id != LOBBY_GAMEPAD && r16(q + 4) < 60)
+                q[0x15] = LOBBY_OURS; /* the first's previous */
+        }
+        at += n;
+    }
+    uint8_t* w = dst + win;
+    if (!ok || gy != 191 || r16(w + 0xc) != 248 || w[0x14] < 1 || r16(w + 0x22) != LOBBY_PANEL ||
+        memcmp(w + 0x24, LOBBY_WIN_SHEET, 16))
+    {
+        free(dst);
+        return NULL;
+    }
+    w16(w + 0xc, 248 + LOBBY_ROW);
+    w16(w + 0x22, 0);
+    memcpy(w + 0x24, LOBBY_SHEET, 16);
+    static const uint8_t links[6] = { LOBBY_GAMEPAD, 5, LOBBY_GAMEPAD, 5, LOBBY_OURS, LOBBY_OURS };
+    Ref ref = { 0, 1, LOBBY_SHEET };
+    at += block(dst + at, gx, gy + LOBBY_ROW, 88, 16, LOBBY_OURS, links, &ref, 1, "-1", "-1", 0);
+    dst[0x11] = LOBBY_ITEMS + 1;
+    *out_size = at;
+    return dst;
+}
+
+/* the lobby Config window's input: ours opens Config > Display, the rest as the game does */
+static void lobby_input(Guest* g)
+{
+    uint32_t self = g->ecx, ev = ARG(0), item = ARG(1);
+    if ((int16_t)ev == EV_SELECT && (int16_t)item == LOBBY_OURS && !rd8(self + 0x24) && !rd8(self + 0x2c))
+    {
+        guest_thiscall(MENU_OPEN, MGR, 3, (uint32_t[]){ PAGES[PAGE_DISPLAY].str_name, 1, 0 });
+    }
+    else
+        guest_thiscall(g_lobby_slots[6], self, 2, (uint32_t[]){ ev, item });
+    /* on ours, no help (the game's help for an id past its own is the volume's) */
+    uint32_t window = window_of(self), help = rd32(LOBBY_HELP);
+    if (window && help && (int16_t)rd16(window + 0x4c) == LOBBY_OURS)
+        wr32(help + 0x2c, 0);
+    RET(0, 2);
+}
+
+static void lobby_setup(void)
+{
+    size_t n;
+    uint8_t* l = lobby_sheet() ? lobby_layout(&n) : NULL;
+    if (!l)
+    {
+        fprintf(stderr, "[modern] the lobby's Config window is not the one known: no Display Settings there\n");
+        return;
+    }
+    g_lobby_sheet = gbytes(S.p, (uint32_t)S.n);
+    g_lobby_layout = gbytes(l, (uint32_t)n), g_lobby_size = (uint32_t)n;
+    free(l);
+    g_lobby_vt = gheap_alloc(4 * (VTBL_SLOTS + 1), 1);
+    for (int i = 0; i < VTBL_SLOTS; ++i)
+        g_lobby_slots[i] = rd32(LOBBY_VTBL + 4u * i), wr32(g_lobby_vt + 4u * i, g_lobby_slots[i]);
+    wr32(g_lobby_vt + 4 * 6, thunk_for("modern", "lobby_input"));
+    g_lobby_ok = g_lobby_slots[6] == LOBBY_INPUT;
+}
+
+/* ours into the lobby: its sheet, its layout in place of the game's, its handler's input */
+static void lobby_install(void)
+{
+    if (!g_lobby_ok)
+        return;
+    memcpy(GUEST_PTR(g_scratch + 16), LOBBY_SHEET, 16);
+    if (!guest_thiscall(SHEET_FIND, SHEETS, 1, (uint32_t[]){ g_scratch + 16 }))
+        add(SHEET_ADD, SHEETS, g_lobby_sheet);
+    uint32_t h = rd32(LOBBY_INST);
+    if (h && rd32(h) == LOBBY_VTBL)
+        wr32(h, g_lobby_vt);
+    uint32_t cur = find_layout(LOBBY_NAME);
+    uint32_t parsed = cur ? rd32(cur + 8) : 0, block = parsed ? rd32(parsed) : 0;
+    if (cur && !(block >= g_lobby_layout && block < g_lobby_layout + g_lobby_size))
+    {
+        memcpy(GUEST_PTR(cur + 0x46), LOBBY_RENAMED, 16);
+        if (!find_layout(LOBBY_NAME))
+            add(LAYOUT_ADD, MGR, g_lobby_layout);
+        fprintf(stderr, "[modern] the lobby's Config: Display Settings added\n");
+    }
+}
+
 /* Ours in the game's lists: the sheet, the Config list in place of the game's (renamed), the pages.
  * The game could load its menu data again, so this is looked at now and then. */
 static void install(void)
@@ -1207,6 +1741,7 @@ static void install(void)
         if (!find_layout(PAGES[k].name))
             add(LAYOUT_ADD, MGR, PAGES[k].layout);
     hide_apply();
+    lobby_install();
 }
 
 /* 0 when this is not the build the addresses are for */
@@ -1229,6 +1764,7 @@ static int setup(void)
                       find_layout(PAGES[k].spare_was))
             return 0;
     g_actions_ok = guest_is(ACTION_LISTS, ACTIONS_KNOWN, sizeof ACTIONS_KNOWN);
+    lists_fill();
     size_t csize;
     uint8_t* c = build_sheet() ? config_layout(&csize) : NULL;
     if (!c)
@@ -1236,7 +1772,7 @@ static int setup(void)
         fprintf(stderr, "[modern] the Config list in %s\\ROM\\119\\51.DAT is not the one known\n", g_game);
         return 0;
     }
-    g_sheet_guest = gbytes(S.p, (uint32_t)S.n);
+    g_sheet_guest = gbytes(S.p, (uint32_t)S.n), g_nsprites = S.sprites;
     g_config_guest = gbytes(c, (uint32_t)csize), g_config_size = (uint32_t)csize;
     free(c);
 
@@ -1273,7 +1809,7 @@ static int setup(void)
         memset(e + 16, 0, 16);
         wr32(p->spare + 0x20, global);
         wr32(p->spare + 0x24, 0x20000u);
-        wr32(p->spare + 0x28, 0x1c0201u);
+        wr32(p->spare + 0x28, p->modes);
     }
 
     /* the Config list's handler: a copy of its vtable, select and draw ours */
@@ -1286,8 +1822,157 @@ static int setup(void)
     g_hide_ready = 1;
     if (!g_actions_ok)
         fprintf(stderr, "[modern] the combat menu's lists are not the ones known: its items stay\n");
-    fprintf(stderr, "[modern] Config > Modern ready (%d sprites, %zu bytes)\n", S.sprites, S.n);
+    fprintf(stderr, "[modern] Config > Modern ready (%d sprites, %zu bytes)\n", g_nsprites, S.n);
+    lobby_setup();
     return 1;
+}
+
+/* a COM object of the game's let go (IUnknown::Release, stdcall) */
+static void com_release(uint32_t o)
+{
+    if (o)
+        guest_thiscall(rd32(rd32(o) + 8), 0, 1, (uint32_t[]){ o });
+}
+
+/* The menus at mw x mh: the menu target the game draws its interface into made again at that size, as
+ * at its start (none when it is the back buffer's: the interface drawn on it directly), and its copies
+ * of the size - the registry's, its scene's and the menu manager's area, which its windows are laid
+ * out and kept within. */
+/* The open windows kept where they were within an area now w0 x h0 larger by dw x dh: each as its
+ * layout anchors it when it opens (its window block's +0x13: 1 to the right edge, 2 the bottom, 3
+ * both; 0 the top left) - its place as opened (+0x42..+0x48) and its place now moved alike. The
+ * manager's list of them: +0 the first node; a node +0 the next, +0x10 its window, +0x14 set to skip. */
+static void windows_follow(int w0, int h0, int w1, int h1)
+{
+    int dw = w1 - w0, dh = h1 - h0, n = 0;
+    for (uint32_t node = rd32(MGR); node && n < 512; node = rd32(node), ++n)
+    {
+        uint32_t win = rd32(node + 0x10);
+        if (!win || rd8(node + 0x14))
+            continue;
+        uint32_t layout = rd32(win + 4), parsed = layout ? rd32(layout + 8) : 0, blk = parsed ? rd32(parsed) : 0;
+        if (!blk)
+            continue;
+        int a = rd8(blk + 0x13);
+        int x = (int16_t)rd16(win + 0x52), y = (int16_t)rd16(win + 0x54), ax, ay;
+        fprintf(stderr, "[modern] window %.16s: anchor %d at %d,%d, opened at %d,%d, block %d,%d, scaled %d\n",
+            (const char*)GUEST_PTR(layout + 0x46), a, x, y, (int16_t)rd16(win + 0x42), (int16_t)rd16(win + 0x44),
+            (int16_t)rd16(blk + 2), (int16_t)rd16(blk + 4), rd8(win + 0x99)); /* TODO: drop */
+        if (rd8(win + 0x99))
+        {
+            /* laid out in proportion to the area (the lobby's backgrounds) */
+            ax = w0 ? x * w1 / w0 - x : 0, ay = h0 ? y * h1 / h0 - y : 0;
+        }
+        else if (!a && x == (int16_t)rd16(win + 0x42) + (w0 - 512) / 2 && y == (int16_t)rd16(win + 0x44) + (h0 - 448) / 2)
+        {
+            /* centred as it opened (0x1011acc0: its place as opened plus half the area's room past 512 x 448) */
+            ax = (w1 - 512) / 2 - (w0 - 512) / 2, ay = (h1 - 448) / 2 - (h0 - 448) / 2;
+            if (ax || ay)
+                guest_thiscall(WIN_SETPOS, win, 2, (uint32_t[]){ (uint32_t)(x + ax), (uint32_t)(y + ay) });
+            continue;
+        }
+        else
+            ax = a == 1 || a == 3 ? dw : 0, ay = a == 2 || a == 3 ? dh : 0;
+        if (!ax && !ay)
+            continue;
+        for (int k = 0; k < 4; ++k)
+            wr16(win + 0x42 + 2 * k, (uint16_t)((int16_t)rd16(win + 0x42 + 2 * k) + (k & 1 ? ay : ax)));
+        guest_thiscall(WIN_SETPOS, win, 2, (uint32_t[]){ (uint32_t)(x + ax), (uint32_t)(y + ay) });
+    }
+    /* what lays itself out from the area once: the logs' width (the Config's chat width settings) and
+     * the help line's stretch */
+    static const struct
+    {
+        uint32_t inst;
+        int setting;
+    } LOGS[] = { { LOG_INST, 0x9c }, { LOG2_INST, 0xc5 } };
+    for (int i = 0; i < 2; ++i)
+    {
+        uint32_t h = rd32(LOGS[i].inst);
+        if (!h || !rd32(h + 8))
+            continue;
+        uint32_t pct = guest_call(CONFIG_GET, 1, (uint32_t[]){ (uint32_t)LOGS[i].setting });
+        guest_thiscall(rd32(rd32(h) + 0x5c), h, 1, (uint32_t[]){ pct });
+        guest_thiscall(LOG_FIT, h, 0, NULL);
+    }
+    /* The help line: its open (0x1013a250) makes it its layout's width plus a share of the area's past
+     * 512 - measured from its width then, so not to be run again; the share is found from its width now
+     * and given of the new area. */
+    uint32_t help = rd32(HELP_INST), hw = help ? rd32(help + 8) : 0;
+    uint32_t hl = hw ? rd32(hw + 4) : 0, hp = hl ? rd32(hl + 8) : 0, hb = hp ? rd32(hp) : 0;
+    if (hb && w0 > 0)
+    {
+        int x1 = (int16_t)rd16(hw + 0x3a), y1 = (int16_t)rd16(hw + 0x3c), x2 = (int16_t)rd16(hw + 0x3e),
+            y2 = (int16_t)rd16(hw + 0x40), lw = (int16_t)rd16(hb + 0xa);
+        int width = (int)lroundf((float)(x2 - x1 - lw + 512) * (float)w1 / (float)w0) + lw - 512;
+        if (width > 16)
+            guest_thiscall(HELP_SETRECT, hw, 7, (uint32_t[]){ (uint32_t)x1, (uint32_t)y1, (uint32_t)width, (uint32_t)(y2 - y1), 1, 0, 0 });
+    }
+}
+
+static void menu_apply(int mw, int mh)
+{
+    uint32_t gfx = rd32(DISP_GFX), scene = rd32(DISP_SCENE);
+    if (!gfx || !scene || mw < 64 || mh < 64)
+        return;
+    int bw = rd16(scene + 0x10), bh = rd16(scene + 0x12);
+    int w0 = (int16_t)rd16(MGR + 0x80) - (int16_t)rd16(MGR + 0x7c), h0 = (int16_t)rd16(MGR + 0x82) - (int16_t)rd16(MGR + 0x7e);
+    if (mw == rd16(scene + 0x14) && mh == rd16(scene + 0x16) && (rd32(gfx + 0x1e0) != 0) == (mw != bw || mh != bh))
+        return;
+    com_release(rd32(gfx + 0x1e0)), com_release(rd32(gfx + 0x1e8));
+    wr32(gfx + 0x1e0, 0), wr32(gfx + 0x1e8, 0);
+    if (mw != bw || mh != bh)
+    {
+        uint32_t tex = guest_thiscall(DISP_RT, gfx, 5, (uint32_t[]){ (uint32_t)mw, (uint32_t)mh, g_scratch + 48, 1, 0 });
+        uint32_t depth = tex ? guest_thiscall(DISP_DEPTH, gfx, 2, (uint32_t[]){ (uint32_t)mw, (uint32_t)mh }) : 0;
+        if (tex && depth)
+            wr32(gfx + 0x1e0, tex), wr32(gfx + 0x1e8, depth);
+        else
+        {
+            /* as the game does when it cannot: the interface on the back buffer, at its size */
+            com_release(tex), com_release(depth);
+            mw = bw, mh = bh;
+        }
+    }
+    wr32(DISP_MENU_W, (uint32_t)mw), wr32(DISP_MENU_H, (uint32_t)mh);
+    wr16(scene + 0x14, (uint16_t)mw), wr16(scene + 0x16, (uint16_t)mh);
+    wr16(MGR + 0x80, (uint16_t)mw), wr16(MGR + 0x82, (uint16_t)mh);
+    windows_follow(w0, h0, mw, mh);
+}
+
+/* The window's mode and size now, between frames (after Present): the window (user32), the back
+ * buffer (d3d8), then the game's own copies of them - the registry's values it read at its start,
+ * its graphics object's and its first viewport (made once, at its start), its scene's, its device's
+ * present parameters. Without a menu target (the menus the back buffer's size) its menus' size
+ * follows. What its size decides at its start - the menu target's - stays until it starts again. */
+static void display_apply(void)
+{
+    if (!g_display_live)
+        return;
+    g_display_live = 0;
+    uint32_t hwnd = d3d8_window();
+    if (!hwnd || !FFXI_MODERN)
+        return;
+    int w = g_win_w, h = g_win_h;
+    user32_set_window(hwnd, g_mode, w, h);
+    if (!d3d8_resize((uint32_t)w, (uint32_t)h))
+        return;
+    wr32(DISP_WIN_W, (uint32_t)w), wr32(DISP_WIN_H, (uint32_t)h), wr32(DISP_MODE, (uint32_t)g_mode);
+    uint32_t gfx = rd32(DISP_GFX), scene = rd32(DISP_SCENE), dev = rd32(DISP_DEVICE);
+    if (gfx)
+    {
+        wr32(gfx + 0x15c, (uint32_t)w), wr32(gfx + 0x160, (uint32_t)h);
+        if (!rd8(gfx + 0x158))
+            guest_thiscall(DISP_VIEWPORT, gfx, 0, NULL);
+        else
+            wr32(gfx + 0xa0, (uint32_t)w), wr32(gfx + 0xa4, (uint32_t)h); /* the screen's, under the others */
+    }
+    if (scene)
+        wr16(scene + 0x10, (uint16_t)w), wr16(scene + 0x12, (uint16_t)h);
+    if (dev)
+        wr32(dev + 0xc, (uint32_t)w), wr32(dev + 0x10, (uint32_t)h), wr32(dev + 0x28, g_mode != 0);
+    menu_apply(g_menu_w, g_menu_h);
+    fprintf(stderr, "[modern] display now: mode %d, %dx%d, menus %dx%d\n", g_mode, w, h, g_menu_w, g_menu_h);
 }
 
 void modern_frame(void)
@@ -1309,8 +1994,8 @@ void modern_frame(void)
             state = -1;
             return;
         }
-        /* the menus are there once the Config list's layout is */
-        if (!find_layout(CONFIG_NAME))
+        /* the menus are there once the Config list's layout is, or the lobby's Config window's */
+        if (!find_layout(CONFIG_NAME) && !find_layout(LOBBY_NAME))
             return;
         if (!setup())
         {
@@ -1330,6 +2015,7 @@ void modern_frame(void)
 void modern_init(const ModernSetup* setup)
 {
     g_setup = *setup;
+    d3d8_set_after_present(display_apply);
     SDL_strlcpy(g_game, setup->game ? setup->game : "", sizeof g_game);
     if (setup->data_dir)
         SDL_strlcpy(g_data_dir, setup->data_dir, sizeof g_data_dir);
@@ -1341,6 +2027,12 @@ void modern_init(const ModernSetup* setup)
         SDL_free(pref);
     }
     g_ui_aspect = user32_ui_aspect();
+    if (setup->settings_reg)
+        SDL_strlcpy(g_settings_reg, setup->settings_reg, sizeof g_settings_reg);
+    g_win_w = settings_dword("0001", 1280), g_win_h = settings_dword("0002", 720);
+    g_bg = settings_dword("0003", 4096);
+    g_mode = settings_dword("0034", 1);
+    g_menu_w = settings_dword("0037", g_win_w), g_menu_h = settings_dword("0038", g_win_h);
     char path[1100], buf[64];
     join(g_data_dir, "modern.cfg", path, sizeof path);
     if (!setup->fps_given && setup->fps_divisor && cfg_value(path, "fps_divisor", buf, sizeof buf))

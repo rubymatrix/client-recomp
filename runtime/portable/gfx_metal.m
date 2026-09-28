@@ -141,7 +141,7 @@ static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
         fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, draw,
-        draw_entities, fps;
+        draw_entities, fps, aa;
 } g_fxs;
 
 /* --- small hash maps (key bytes -> object) ------------------------------------------------------------- */
@@ -2020,6 +2020,48 @@ static const char FX_MSL[] =
     "  soft = soft * soft / (4.0 * k + 1e-5);\n"
     "  return float4(c * (max(soft, l - u.bloom.x) / max(l, 1e-5)), 1.0);\n"
     "}\n"
+    /* FXAA (after Lottes' 3.11, its quality preset 12 in brief): along an edge the local contrast
+     * finds, how far to either end, and a blend across it by where this pixel lies on it */
+    "constant float FXAA_Q[10] = { 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 4.0, 8.0 };\n"
+    "fragment float4 fx_fxaa(FO in [[stage_in]], constant FxU& u [[buffer(0)]], texture2d<float> t [[texture(0)]],\n"
+    "                        sampler s [[sampler(0)]]) {\n"
+    "  float2 rcp = 1.0 / u.size.xy, uv = in.pos.xy * rcp;\n"
+    "  float3 c = t.sample(s, uv).rgb;\n"
+    "  float lm = dot(c, LUMA);\n"
+    "  float ln = dot(t.sample(s, uv + float2(0, -rcp.y)).rgb, LUMA), ls = dot(t.sample(s, uv + float2(0, rcp.y)).rgb, LUMA);\n"
+    "  float lw = dot(t.sample(s, uv + float2(-rcp.x, 0)).rgb, LUMA), le = dot(t.sample(s, uv + float2(rcp.x, 0)).rgb, LUMA);\n"
+    "  float mx = max(lm, max(max(ln, ls), max(lw, le))), mn = min(lm, min(min(ln, ls), min(lw, le))), range = mx - mn;\n"
+    "  if (range < max(0.0312, mx * 0.125)) return float4(c, 1.0);\n"
+    "  float lnw = dot(t.sample(s, uv + float2(-rcp.x, -rcp.y)).rgb, LUMA), lne = dot(t.sample(s, uv + float2(rcp.x, -rcp.y)).rgb, LUMA);\n"
+    "  float lsw = dot(t.sample(s, uv + float2(-rcp.x, rcp.y)).rgb, LUMA), lse = dot(t.sample(s, uv + float2(rcp.x, rcp.y)).rgb, LUMA);\n"
+    "  float eh = abs(lnw + lne - 2.0 * ln) + 2.0 * abs(lw + le - 2.0 * lm) + abs(lsw + lse - 2.0 * ls);\n"
+    "  float ev = abs(lnw + lsw - 2.0 * lw) + 2.0 * abs(ln + ls - 2.0 * lm) + abs(lne + lse - 2.0 * le);\n"
+    "  bool horz = eh >= ev;\n"
+    "  float l1 = horz ? ln : lw, l2 = horz ? ls : le, g1 = abs(l1 - lm), g2 = abs(l2 - lm);\n"
+    "  float stp = horz ? rcp.y : rcp.x, lavg, grad;\n"
+    "  if (g1 >= g2) { stp = -stp; lavg = 0.5 * (l1 + lm); grad = g1; } else { lavg = 0.5 * (l2 + lm); grad = g2; }\n"
+    "  float2 e = uv, along = horz ? float2(rcp.x, 0) : float2(0, rcp.y);\n"
+    "  if (horz) e.y += stp * 0.5; else e.x += stp * 0.5;\n"
+    "  float2 p1 = e - along, p2 = e + along;\n"
+    "  float d1 = dot(t.sample(s, p1).rgb, LUMA) - lavg, d2 = dot(t.sample(s, p2).rgb, LUMA) - lavg;\n"
+    "  bool r1 = abs(d1) >= grad * 0.25, r2 = abs(d2) >= grad * 0.25;\n"
+    "  for (int i = 0; i < 10 && !(r1 && r2); ++i) {\n"
+    "    if (!r1) { p1 -= along * FXAA_Q[i]; d1 = dot(t.sample(s, p1).rgb, LUMA) - lavg; r1 = abs(d1) >= grad * 0.25; }\n"
+    "    if (!r2) { p2 += along * FXAA_Q[i]; d2 = dot(t.sample(s, p2).rgb, LUMA) - lavg; r2 = abs(d2) >= grad * 0.25; }\n"
+    "  }\n"
+    "  float dist1 = horz ? uv.x - p1.x : uv.y - p1.y, dist2 = horz ? p2.x - uv.x : p2.y - uv.y;\n"
+    "  bool near1 = dist1 < dist2;\n"
+    "  float dmin = min(dist1, dist2), len = dist1 + dist2;\n"
+    "  bool mid_lower = lm < lavg, good = ((near1 ? d1 : d2) < 0.0) != mid_lower;\n"
+    "  float off = good ? -dmin / len + 0.5 : 0.0;\n"
+    "  float avg = (2.0 * (ln + ls + lw + le) + lnw + lne + lsw + lse) / 12.0;\n"
+    "  float sub = saturate(abs(avg - lm) / range);\n"
+    "  sub = (-2.0 * sub + 3.0) * sub * sub;\n"
+    "  off = max(off, sub * sub * 0.75);\n"
+    "  float2 f = uv;\n"
+    "  if (horz) f.y += off * stp; else f.x += off * stp;\n"
+    "  return float4(t.sample(s, f).rgb, 1.0);\n"
+    "}\n"
     /* half the size of the source: four bilinear taps */
     "fragment float4 fx_down(FO in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
     "  float2 tx = 1.0 / float2(t.get_width(), t.get_height());\n"
@@ -2115,8 +2157,9 @@ static struct
     int tried;
     id<MTLLibrary> lib;
     id<MTLRenderPipelineState> ao_pipe, blur_pipe, bright_pipe, down_pipe, gauss_pipe, raymask_pipe, rays_pipe, comp_pipe,
-        temporal_pipe;
-    MTLPixelFormat comp_fmt;
+        temporal_pipe, aa_pipe;
+    MTLPixelFormat comp_fmt, aa_fmt;
+    id<MTLTexture> aa_src; /* the scene as it was, for the anti-aliasing pass to read (scene_aa) */
     id<MTLTexture> src, ao0, ao1, b1a, b1b, b2a, b2b, ra, rb;
     id<MTLTexture> hist[2]; /* the occlusion and shadows after the temporal pass: this frame's and the one before */
     int hist_at;            /* which of hist[] the frame before wrote */
@@ -2207,6 +2250,8 @@ static const struct
     { "draw_entities", offsetof(__typeof__(g_fxs), draw_entities), 0.0f },
     /* not an effect either: the frame-rate overlay, shown (1) or hidden (0) */
     { "fps", offsetof(__typeof__(g_fxs), fps), 1.0f },
+    /* not an effect: anti-aliasing of the finished scene, 0 none, 1 FXAA (scene_aa); with or without the effects */
+    { "aa", offsetof(__typeof__(g_fxs), aa), 0.0f },
 };
 
 static float* fx_setting(const char* key)
@@ -2805,10 +2850,52 @@ void gfx_trace_dump(const char* path)
     fclose(f);
 }
 
+/* The finished scene anti-aliased (g_fxs.aa: FXAA), within its viewport, before the interface goes on */
+static void scene_aa(GfxTex* color, const GfxScene* s)
+{
+    if (g_fxs.aa < 0.5f || !fx_init())
+        return;
+    @autoreleasepool
+    {
+        flush_pass();
+        id<MTLTexture> ct = color->tex;
+        float vx = (float)s->vp[0], vy = (float)s->vp[1], vw = (float)s->vp[2], vh = (float)s->vp[3];
+        if (vw < 16 || vh < 16 || vx + vw > ct.width || vy + vh > ct.height)
+            vx = vy = 0, vw = (float)ct.width, vh = (float)ct.height;
+        if (!g_fx.aa_pipe || g_fx.aa_fmt != ct.pixelFormat)
+        {
+            [g_fx.aa_pipe release];
+            g_fx.aa_pipe = fx_pipeline(@"fx_fxaa", ct.pixelFormat);
+            g_fx.aa_fmt = ct.pixelFormat;
+        }
+        if (!g_fx.aa_pipe || !fx_tex(&g_fx.aa_src, ct.pixelFormat, ct.width, ct.height))
+            return;
+        id<MTLBlitCommandEncoder> b = [cmd() blitCommandEncoder];
+        [b copyFromTexture:ct sourceSlice:0 sourceLevel:0 toTexture:g_fx.aa_src destinationSlice:0 destinationLevel:0
+                sliceCount:1 levelCount:1];
+        [b endEncoding];
+        FxU u;
+        memset(&u, 0, sizeof u);
+        u.size[0] = (float)ct.width, u.size[1] = (float)ct.height;
+        fx_pass(ct, MTLLoadActionLoad, g_fx.aa_pipe, (MTLViewport){ vx, vy, vw, vh, 0, 1 }, &u, &g_fx.aa_src, 1, NULL);
+        color->scene = 0; /* its mips are behind (scene_mips) */
+        color->used = g_serial;
+    }
+}
+
+static void scene_fx(GfxTex* color, const GfxScene* s);
+
 void gfx_scene_done(GfxTex* color, const GfxScene* s)
 {
-    if (!g_dev || g_fxs.fx == 0.0f || !color || color->type != GFX_TEX_2D)
+    if (!g_dev || !color || color->type != GFX_TEX_2D)
         return;
+    if (g_fxs.fx != 0.0f)
+        scene_fx(color, s);
+    scene_aa(color, s);
+}
+
+static void scene_fx(GfxTex* color, const GfxScene* s)
+{
     @autoreleasepool
     {
         flush_pass();
