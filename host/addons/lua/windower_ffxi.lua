@@ -701,6 +701,7 @@ return function(windower, h)
     ffxi.remove_attachment = stub('windower.ffxi.remove_attachment')
     ffxi.reset_attachments = stub('windower.ffxi.reset_attachments')
     ffxi.set_lockstyle = stub('windower.ffxi.set_lockstyle')
+    ffxi.get_camera = stub('windower.ffxi.get_camera') -- older name of windower.get_camera (InfoReplacer)
 
     windower.ffxi = partial(ffxi, 'windower.ffxi')
 
