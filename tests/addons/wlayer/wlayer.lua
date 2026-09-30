@@ -132,7 +132,7 @@ windower.register_event('addon command', function(cmd, ...)
         local co = coroutine.schedule(function() say('cancelled ran (wrong)') end, 0.05)
         coroutine.close(co)
     elseif cmd == 'send' then
-        windower.send_command('wl args a b; wait 0.1; wl args after; input /echo from input')
+        windower.send_command('wl args a b; wait 0.1; @wl args after; input /echo from input; load timers; setkey enter down')
     elseif cmd == 'unreg' then
         windower.unregister_event(seen.prerender)
         say('unregistered prerender')

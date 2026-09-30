@@ -89,7 +89,13 @@ return function(windower, h)
         return math.floor((os.time() - 1009810800) / 60 * 25) + 886 * 518400
     end
 
+    -- the party's and alliance's server ids, read once a frame (every mob table wants them)
+    local frame, party_cache = 0, {}
+    xi.events.on('frame', function() frame = frame + 1 end, 'windower_ffxi.frame')
+
     local function party_ids(limit)
+        local c = party_cache[limit]
+        if c and c.frame == frame then return c.set end
         local set = {}
         for i = 0, limit - 1 do
             if num(member(i, 'IsActive')) ~= 0 then
@@ -97,6 +103,7 @@ return function(windower, h)
                 if id and id ~= 0 then set[id] = true end
             end
         end
+        party_cache[limit] = { frame = frame, set = set }
         return set
     end
 

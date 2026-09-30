@@ -126,13 +126,12 @@ static int l_unpack(lua_State* L)
         luaL_checkstack(L, 8, "unpack: too many values");
         if (op.c == 'b')
         {
+            /* a field wider than 64 bits (packets' bit[128]) reads as its low 64 */
             int w = op.count < 0 ? 1 : op.count;
-            if (w > 64)
-                luaL_error(L, "unpack: bit field wider than 64");
             if ((pos * 8 + bit + (size_t)w) > len * 8)
                 break;
             uint64_t v = 0;
-            for (int i = 0; i < w; ++i)
+            for (int i = 0; i < w && i < 64; ++i)
             {
                 size_t at = pos * 8 + bit + (size_t)i;
                 v |= (uint64_t)((s[at / 8] >> (at % 8)) & 1) << i;
@@ -344,8 +343,8 @@ static int l_pack(lua_State* L)
         {
             int w = op.count < 0 ? 1 : op.count;
             uint64_t v = arg_uint(L, arg++);
-            for (int i = 0; i < w && i < 64; ++i)
-                put_bit(&b, (int)((v >> i) & 1));
+            for (int i = 0; i < w; ++i)
+                put_bit(&b, i < 64 ? (int)((v >> i) & 1) : 0);
             continue;
         }
         if (op.c == 'q')

@@ -67,6 +67,11 @@ string.unpack = wn.unpack
 package.loaded['pack'] = string
 package.preload['pack'] = function() return string end
 
+-- Windower's other native modules (DLLs in its install): not here, and loud about it
+for _, name in ipairs({ 'sqlite3', 'ssl.core', 'ssl.context', 'ssl.x509', 'ssl.config' }) do
+    package.preload[name] = function() unsupported("require('" .. name .. "') (Windower's native module)") end
+end
+
 -------------------------------------------------------------------------------- windower
 
 windower = {}
@@ -428,7 +433,8 @@ local console_unsupported = {
 local run_commands
 run_commands = function(list, from)
     for i = from, #list do
-        local cmd = list[i]:match('^%s*(.-)%s*$')
+        -- a leading '@' only keeps the command out of the console's echo
+        local cmd = list[i]:match('^%s*@?%s*(.-)%s*$')
         if cmd ~= '' then
             local word, rest = cmd:match('^(%S+)%s*(.*)$')
             local lw = word:lower():gsub('^//', '')
@@ -441,6 +447,11 @@ run_commands = function(list, from)
                 native.chat.run(cmd, 1)
             elseif lw == 'unalias' then
                 native.chat.alias('//' .. rest:match('^(%S*)'), nil)
+            elseif lw == 'load' or lw == 'unload' or lw == 'reload' then
+                -- the console's load/unload are for Windower's plugins (DLLs): none here
+                local plugin = rest:match('^(%S*)')
+                unsupported('Windower plugin ' .. plugin, false)
+                native.chat.write(('[%s] Windower plugins are not supported (%s %s)'):format(info.name, lw, plugin), 207)
             elseif console_unsupported[lw] then
                 unsupported('console command ' .. lw, false)
                 native.chat.write(('[%s] the console command "%s" is not supported yet'):format(info.name, lw), 207)

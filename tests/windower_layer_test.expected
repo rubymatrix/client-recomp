@@ -48,6 +48,8 @@
 [chat 1] scheduled ran
 [chat 1] args 2 a|b
 [game] /echo from input
+[chat 207] [wlayer] Windower plugins are not supported (load timers)
+[chat 207] [wlayer] the console command "setkey" is not supported yet
 [chat 1] args 1 after
 [chat 5] redacted
 [chat 1] a plain line
