@@ -85,6 +85,16 @@ do
         return table.concat(tried)
     end
     table.insert(searchers, 2, mapped)
+    -- the host's own modules: require('xi.<name>') is host/addons/lua/<name>.lua
+    table.insert(searchers, 2, function(name)
+        local short = name:match('^xi%.(.+)$')
+        if not short then return nil end
+        local src = native.embedded(short)
+        if not src then return '\n\tno embedded module \'' .. short .. '\'' end
+        local chunk, err = loadstring(src, '=[xi ' .. short .. ']')
+        if not chunk then error(err, 3) end
+        return chunk
+    end)
 end
 
 -- lfs with the same paths

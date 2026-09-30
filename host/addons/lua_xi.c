@@ -786,7 +786,18 @@ static int convert(lua_State* L, const char* from, const char* to)
 static int x_sjis_to_utf8(lua_State* L) { return convert(L, "SHIFT_JIS", "UTF-8"); }
 static int x_utf8_to_sjis(lua_State* L) { return convert(L, "UTF-8", "SHIFT_JIS"); }
 
-static const luaL_Reg MISC[] = { { "log", x_log }, { "error", x_error }, { "clock", x_clock }, { "time", x_time },
+/* embedded(name): the source of host/addons/lua/<name>.lua, or nil */
+static int x_embedded(lua_State* L)
+{
+    size_t n;
+    const char* s = xi_embedded(luaL_checkstring(L, 1), &n);
+    if (!s)
+        return lua_pushnil(L), 1;
+    lua_pushlstring(L, s, n);
+    return 1;
+}
+
+static const luaL_Reg MISC[] = { { "log", x_log }, { "embedded", x_embedded }, { "error", x_error }, { "clock", x_clock }, { "time", x_time },
     { "open_url", x_open_url }, { "sjis_to_utf8", x_sjis_to_utf8 }, { "utf8_to_sjis", x_utf8_to_sjis }, { NULL, NULL } };
 
 static void sub(lua_State* L, const char* name, const luaL_Reg* fns)
