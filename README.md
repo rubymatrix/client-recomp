@@ -47,15 +47,30 @@ sign-in screen's Settings.
   </tr>
 </table>
 
-## Ashita and Windower will never be supported
+## Ashita and Windower addons
 
-> [!WARNING]
-> Ashita and Windower are fundamentally incompatible with this project and will never be
-> supported. Both work by injecting a Windows DLL into the original 32-bit x86 game process and
-> hooking its code and its Direct3D 8 device at fixed addresses. Here the original game code never
-> runs: it is recompiled to native C on our own platform layer (Metal on macOS), so there are no
-> x86 addresses, no game process and no Direct3D 8 device for them to load into or hook. Their addons and plugins will not work either.
-> Please don't open issues asking for them.
+> [!NOTE]
+> In progress. Every official Ashita v4 and Windower 4 addon loads and runs in the addon test host,
+> but this hasn't been played in the live game yet.
+
+Ashita v4 and Windower 4 **Lua addons** run unmodified, with those projects' own libraries, on
+FFXI on Mac's own addon host: no DLL injection, no Windows. Each addon gets its own LuaJIT state;
+the host provides Ashita's and Windower's Lua APIs over the recompiled game, and draws their ImGui
+windows, text and images over the game's frame.
+
+- `tools/setup.py` fetches Ashita's and Windower's addons, libraries and resources (pinned
+  versions from their own repositories) into
+  `~/Library/Application Support/FFXIRecompile/FFXI/ashita` and `.../windower`, laid out like
+  their installs. Put third-party addons in the same folders.
+- Load them as you would there: `/addon load <name>`, `//lua load <name>`, or at start from
+  `ashita/scripts/default.txt` or `windower/scripts/init.txt`. `/bind`, `/alias` and
+  `//exec` work too.
+- Addons that patch the game's code (instantchat, macrofix, fastswap and the like) work through
+  translated variants of the patched functions, chosen while the addon's bytes are in place.
+- **Native plugins** (Ashita and Windower DLLs) don't run: they're 32-bit Windows code. Addons that
+  need one (Windower's Timers-based ones, for example) won't either.
+
+See [docs/addon-compat-design.md](docs/addon-compat-design.md) for how it works.
 
 ## Install (players)
 
