@@ -40,6 +40,7 @@
 extern int xi_game_open(lua_State* L);
 extern int xi_res_open(lua_State* L);
 extern void xi_ashita_open(lua_State* L);
+extern void xi_windower_open(lua_State* L);
 extern void xi_gui_lua_push_manager(lua_State* L);
 extern void xi_d3d_ffi_open(lua_State* L);
 
@@ -1009,6 +1010,7 @@ void xi_lua_open(lua_State* L, Addon* a)
     sub(L, "input", INPUT);
     sub(L, "addons", ADDONS);
     sub(L, "fs", FS);
+    xi_windower_open(L), lua_setfield(L, -2, "windower_native");
     xi_game_open(L);
     lua_setfield(L, -2, "game");
     xi_res_open(L);
