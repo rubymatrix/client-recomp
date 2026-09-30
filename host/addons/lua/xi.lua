@@ -153,10 +153,20 @@ do
             native.memory.write_uint32(p.__guest + 4 * i, v)
         end,
         __tostring = function(p) return ('guest %s: 0x%08x'):format(p.__name, p.__guest) end,
+        -- pointer arithmetic: n guest pointers (4 bytes each) further on
+        __add = function(a, b)
+            if type(a) == 'number' then a, b = b, a end
+            return proxy(a.__name, a.__guest + 4 * b)
+        end,
+        __sub = function(a, b) return proxy(a.__name, a.__guest - 4 * b) end,
+        __eq = function(a, b) return rawget(a, '__guest') == rawget(b, '__guest') end,
     }
     proxy = function(name, guest) return setmetatable({ __name = name, __guest = guest }, proxy_mt) end
 
     ffi.cast = function(ct, v)
+        if type(v) == 'table' and rawget(v, '__guest') then
+            v = rawget(v, '__guest') -- a guest pointer chain cast again: its guest address
+        end
         if type(v) == 'number' and v > 0 then
             local d, name = pointer_depth(ct)
             if d >= 1 then
@@ -203,7 +213,8 @@ do
     ffi.C = proxyC
     local load = ffi.load
     local windows = { kernel32 = true, user32 = true, gdi32 = true, winmm = true, shell32 = true, advapi32 = true,
-                      d3d8 = true, d3dx8 = true, d3dx9 = true, msvcrt = true, ntdll = true, psapi = true, ole32 = true }
+                      d3d8 = true, d3dx8 = true, d3dx9 = true, msvcrt = true, ntdll = true, psapi = true, ole32 = true,
+                      gdifonttexture = true }  -- gdifonts' renderer (tHotBar, tCrossBar): the host's own
     ffi.load = function(name, global)
         local short = tostring(name):lower():gsub('%.dll$', ''):gsub('^.*[/\\]', '')
         if windows[short] then return proxyC end

@@ -68,3 +68,7 @@ local f = ffi.C.fopen(xi.paths.xi .. "addons\\coretest\\coretest.lua", 'rb')
 print('fopen mapped: ' .. tostring(f ~= nil))
 if f ~= nil then ffi.C.fclose(f) end
 print('ffi.load winmm -> ' .. tostring(ffi.load('winmm.dll') == ffi.C))
+-- a chain cast again (Ashita's filters.lua), and moved along
+local again = ffi.cast('uint8_t*', p2)
+print('recast: ' .. tostring(xi.memory.guest(tonumber(ffi.cast('uintptr_t', again))) == xi.memory.guest(a)))
+print('chain + 1: ' .. string.format('%08x', (p2 + 1).__guest - xi.memory.guest(a)))
