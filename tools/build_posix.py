@@ -205,7 +205,10 @@ def host64(game):
     objs += compile_stale(generated('ffxi'), 'build/ffxi64', ['-I', 'generated/ffxi'])
     addon_cflags, addon_libs = addons()
     objs += compile_stale(PORTABLE + HOST_SOURCES + ADDON_SOURCES, 'build/obj/host64', sdl_cflags + tls_cflags + addon_cflags)
-    run(['clang', '-o', 'build/host64'] + objs + sdl_libs + tls_libs + addon_libs + GFX_LIBS + ['-lm', '-lpthread'])
+    # -export_dynamic: addons' ffi.C finds D3DX and Win32 (host/addons/d3d_ffi.c, win32_ffi.c) with
+    # dlsym(RTLD_DEFAULT), so their symbols stay in the executable's export table
+    export = ['-Wl,-export_dynamic'] if sys.platform == 'darwin' else ['-rdynamic']
+    run(['clang', '-o', 'build/host64'] + objs + sdl_libs + tls_libs + addon_libs + GFX_LIBS + ['-lm', '-lpthread'] + export)
     print('built build/host64; run: build/host64 --game %s --server <name>' % shlex.quote(game))
 
 

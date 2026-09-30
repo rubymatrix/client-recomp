@@ -1118,6 +1118,23 @@ void d3d8_backbuffer_size(uint32_t* w, uint32_t* h)
 
 uint32_t d3d8_window(void) { return g_dev.hwnd; }
 
+int d3d8_get_transform(uint32_t ts, float m[16])
+{
+    int i = xf_index(ts);
+    if (!g_dev.guest || i < 0)
+        return 0;
+    memcpy(m, g_dev.cur.xf[i], 16 * sizeof(float));
+    return 1;
+}
+
+int d3d8_get_render_state(uint32_t rs, uint32_t* v)
+{
+    if (!g_dev.guest || rs >= 256)
+        return 0;
+    *v = g_dev.cur.rs[rs];
+    return 1;
+}
+
 /* The back buffer (and its depth) at a new size, the game's objects kept: its next frame draws into
  * them at once. The render targets drawn at the screen's resolution (native_size) follow it. Between
  * frames (d3d8_set_after_present); the game's own copies of the size are the host's to change. */

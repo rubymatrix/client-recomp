@@ -27,6 +27,7 @@ extern "C" {
 #include "d3d8.h"
 #include "gfx.h"
 #include "host.h"
+#include "d3d_ffi.h"
 #include "plat.h"
 }
 
@@ -778,6 +779,27 @@ static ImDrawList* g_objects; /* text objects and primitives, drawn under ImGui 
 
 extern "C" int xi_gui_in_frame(void) { return g_in_frame; }
 
+/* the addons' Direct3D draws (sprites, DrawPrimitiveUP, ID3DXFont) this frame: see the end */
+static ImDrawList* g_d3d;
+static uint32_t g_d3d_frame;
+
+/* One draw list on its own (a copy of ImDrawData's framing). */
+static void render_list(ImDrawList* dl, uint32_t w, uint32_t h)
+{
+    ImDrawData dd;
+    ImDrawList* lists[1] = { dl };
+    dd.Valid = true;
+    dd.CmdListsCount = 1;
+    dd.CmdLists.Data = lists;
+    dd.CmdLists.Size = dd.CmdLists.Capacity = 1;
+    dd.DisplayPos = ImVec2(0, 0);
+    dd.DisplaySize = ImVec2((float)w, (float)h);
+    dd.FramebufferScale = ImVec2(1, 1);
+    render_draw_data(&dd, w, h);
+    dd.CmdLists.Data = NULL;
+    dd.CmdLists.Size = dd.CmdLists.Capacity = 0;
+}
+
 
 static void overlay(GfxTex* bb, uint32_t w, uint32_t h)
 {
@@ -800,6 +822,12 @@ static void overlay(GfxTex* bb, uint32_t w, uint32_t h)
         render_draw_data(&objects, w, h);
         objects.CmdLists.Data = NULL; /* not ImGui's to free */
         objects.CmdLists.Size = objects.CmdLists.Capacity = 0;
+    }
+    /* then the addons' Direct3D draws (d3d_ffi.c), in call order */
+    if (g_d3d && g_d3d->CmdBuffer.Size)
+    {
+        render_list(g_d3d, w, h);
+        draw_setup(w, h); /* their blend states undone */
     }
     render_draw_data(ImGui::GetDrawData(), w, h);
 }
@@ -879,6 +907,7 @@ static void ensure_up(void)
         gfx_tex_upload(g_white, 0, 0, &px, 4);
     }
     g_objects = IM_NEW(ImDrawList)(ImGui::GetDrawListSharedData());
+    g_d3d = IM_NEW(ImDrawList)(ImGui::GetDrawListSharedData());
     g_up = 1;
 }
 
@@ -899,6 +928,11 @@ extern "C" void xi_gui_begin(uint32_t w, uint32_t h)
     ImGui::NewFrame();
     ImGui::ErrorRecoveryStoreState(&g_recover);
     g_in_frame = 1;
+    /* the addons' Direct3D draws start over each frame */
+    g_d3d->_ResetForNewFrame();
+    g_d3d->PushClipRect(ImVec2(0, 0), io.DisplaySize);
+    g_d3d->PushTexture(io.Fonts->TexRef);
+    ++g_d3d_frame;
 }
 
 /* Around each addon's drawing event: what it leaves open (a Begin without its End, a style pushed and
@@ -1156,4 +1190,151 @@ extern "C" void xi_gui_free_owned(Addon* a)
         tex_free(t);
     if (g_drag_text && !text_of(g_drag_text->id))
         g_drag_text = NULL;
+}
+
+/* --- Direct3D from addons (d3d_ffi.c) ---------------------------------------------------------
+ *
+ * Addons' IDirect3DTexture8 objects are gui textures whose id is the low 32 bits of the object's
+ * address (what `tonumber(ffi.cast('uint32_t', tex))` hands ImGui); d3d_ffi.c picks addresses that
+ * can't be a small id. Their draws (ID3DXSprite, DrawPrimitiveUP, ID3DXFont, a font object or
+ * primitive an addon renders by hand) go into one list, in call order, drawn after the text
+ * objects and primitives and before ImGui. */
+
+extern "C" int xi_gui_d3d_texture_new(uint32_t id, int w, int h)
+{
+    if (!id || g_tex.count(id) || w <= 0 || h <= 0)
+        return 0;
+    XiTex* t = new XiTex();
+    t->id = id;
+    t->w = w, t->h = h;
+    t->owner = xi_current();
+    t->gpu = xi_headless ? NULL : gfx_tex_create(GFX_TEX_2D, 21 /* A8R8G8B8 */, (uint32_t)w, (uint32_t)h, 1, GFX_USE_SAMPLE);
+    g_tex[id] = t;
+    return 1;
+}
+
+extern "C" void xi_gui_d3d_texture_upload(uint32_t id, const uint8_t* bgra, int x, int y, int w, int h, int pitch)
+{
+    XiTex* t = tex_of(id);
+    if (!t || !t->gpu || w <= 0 || h <= 0)
+        return;
+    if (x == 0 && y == 0 && w == t->w && h == t->h)
+        gfx_tex_upload(t->gpu, 0, 0, bgra, (uint32_t)pitch);
+    else
+        gfx_tex_upload_rect(t->gpu, 0, 0, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, bgra, (uint32_t)pitch);
+}
+
+/* Whoever made it (ids d3d_ffi.c hands out are never ImGui's own). */
+extern "C" void xi_gui_d3d_texture_free(uint32_t id)
+{
+    XiTex* t = tex_of(id);
+    if (t && (t->owner || id >= 0x01000000u))
+        tex_free(t);
+}
+
+extern "C" int xi_gui_d3d_texture_exists(uint32_t id) { return tex_of(id) != NULL; }
+
+extern "C" uint32_t xi_gui_d3d_frame(void) { return g_d3d_frame; }
+
+/* the blend state a run of draws asks for: (enable << 16) | (src << 8) | dst, D3DBLEND values */
+#define D3D_BLEND_DEFAULT ((1u << 16) | (5u << 8) | 6u)
+static uintptr_t g_d3d_blend = D3D_BLEND_DEFAULT;
+
+static void set_blend(const ImDrawList*, const ImDrawCmd* cmd)
+{
+    uintptr_t b = (uintptr_t)cmd->UserCallbackData;
+    g_gd.pipe.blend = (uint8_t)((b >> 16) & 1);
+    g_gd.pipe.src = (uint8_t)((b >> 8) & 0xFF);
+    g_gd.pipe.dst = (uint8_t)(b & 0xFF);
+    g_gd.pipe.op = 1;
+}
+
+static int d3d_ready(void) { return g_up && g_d3d && ImGui::GetCurrentContext(); }
+
+static void d3d_blend(uintptr_t b)
+{
+    /* the list starts each frame with the default (render_list runs after draw_setup) */
+    if (g_d3d->CmdBuffer.Size <= 1 && g_d3d->CmdBuffer[0].ElemCount == 0)
+        g_d3d_blend = D3D_BLEND_DEFAULT;
+    if (b != g_d3d_blend)
+    {
+        g_d3d->AddCallback(set_blend, (void*)b);
+        g_d3d_blend = b;
+    }
+}
+
+extern "C" void xi_gui_d3d_triangles(uint32_t tex, const XiD3DVert* v, uint32_t n, int blend, int src, int dst)
+{
+    if (!d3d_ready() || n < 3)
+        return;
+    d3d_blend(((uintptr_t)(blend ? 1 : 0) << 16) | ((uintptr_t)(src & 0xFF) << 8) | (uintptr_t)(dst & 0xFF));
+    XiTex* t = tex ? tex_of(tex) : NULL;
+    /* untextured: the atlas's white pixel */
+    ImTextureRef ref = t ? ImTextureRef((ImTextureID)t->id) : ImGui::GetIO().Fonts->TexRef;
+    ImVec2 white = ImGui::GetIO().Fonts->TexUvWhitePixel;
+    g_d3d->PushTexture(ref);
+    n -= n % 3;
+    for (uint32_t done = 0; done < n;)
+    {
+        uint32_t k = n - done > 30000 ? 30000 : n - done;
+        g_d3d->PrimReserve((int)k, (int)k);
+        for (uint32_t i = 0; i < k; ++i)
+        {
+            const XiD3DVert& s = v[done + i];
+            ImU32 c = (s.argb & 0xFF00FF00u) | ((s.argb & 0xFFu) << 16) | ((s.argb >> 16) & 0xFFu);
+            g_d3d->PrimWriteIdx((ImDrawIdx)g_d3d->_VtxCurrentIdx);
+            g_d3d->PrimWriteVtx(ImVec2(s.x, s.y), t ? ImVec2(s.u, s.v) : white, c);
+        }
+        done += k;
+    }
+    g_d3d->PopTexture();
+}
+
+extern "C" int xi_gui_d3d_text(const char* family, float size, int bold, int italic, const char* utf8, size_t len, float x,
+    float y, uint32_t argb, float* w, float* h, int draw)
+{
+    if (!ImGui::GetCurrentContext())
+        return 0;
+    ImFont* f = font_for(family && *family ? family : "Arial", bold, italic);
+    if (!f)
+        return 0;
+    std::string s(utf8, len);
+    ImVec2 sz = f->CalcTextSizeA(size, FLT_MAX, 0.0f, s.c_str());
+    if (w)
+        *w = sz.x;
+    if (h)
+        *h = sz.y;
+    if (draw && d3d_ready())
+    {
+        d3d_blend(D3D_BLEND_DEFAULT);
+        g_d3d->AddText(f, size, ImVec2(x, y), im_color(argb), s.c_str());
+    }
+    return 1;
+}
+
+extern "C" void xi_gui_d3d_text_object(uint32_t id)
+{
+    XiText* t = text_of(id);
+    if (t && d3d_ready() && !t->text.empty())
+    {
+        d3d_blend(D3D_BLEND_DEFAULT);
+        draw_text(g_d3d, t);
+    }
+}
+
+extern "C" void xi_gui_d3d_prim_object(uint32_t id)
+{
+    XiPrim* p = prim_of(id);
+    if (p && d3d_ready())
+    {
+        d3d_blend(D3D_BLEND_DEFAULT);
+        draw_prim(g_d3d, p);
+    }
+}
+
+/* This frame's draw list, for tests: commands and vertices recorded. */
+extern "C" void xi_gui_d3d_stats(uint32_t* cmds, uint32_t* verts)
+{
+    *cmds = g_d3d ? (uint32_t)g_d3d->CmdBuffer.Size : 0;
+    *verts = g_d3d ? (uint32_t)g_d3d->VtxBuffer.Size : 0;
 }

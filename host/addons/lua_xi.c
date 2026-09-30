@@ -40,6 +40,7 @@
 extern int xi_game_open(lua_State* L);
 extern int xi_res_open(lua_State* L);
 extern void xi_gui_lua_push_manager(lua_State* L);
+extern void xi_d3d_ffi_open(lua_State* L);
 
 extern uint32_t xi_text_new(void);
 extern void xi_text_delete(uint32_t id);
@@ -918,4 +919,5 @@ void xi_lua_open(lua_State* L, Addon* a)
     lua_setfield(L, -2, "paths");
     lua_pushstring(L, FFXI_BUILD);
     lua_setfield(L, -2, "build");
+    xi_d3d_ffi_open(L); /* xi.d3d8_device and ffi.C (d3d_ffi.c) */
 }
