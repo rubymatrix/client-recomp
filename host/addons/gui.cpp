@@ -1338,3 +1338,13 @@ extern "C" void xi_gui_d3d_stats(uint32_t* cmds, uint32_t* verts)
     *cmds = g_d3d ? (uint32_t)g_d3d->CmdBuffer.Size : 0;
     *verts = g_d3d ? (uint32_t)g_d3d->VtxBuffer.Size : 0;
 }
+
+/* A font family's file as the text objects find it (gdifont_ffi.c): 1 and the path, or 0. */
+extern "C" int xi_gui_font_file(const char* family, int bold, int italic, char* out, size_t n)
+{
+    std::string p = font_file(family ? family : "", bold, italic);
+    if (p.empty() || !n)
+        return 0;
+    snprintf(out, n, "%s", p.c_str());
+    return 1;
+}

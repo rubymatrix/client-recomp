@@ -65,6 +65,11 @@ void xi_gui_d3d_text_object(uint32_t id);
 void xi_gui_d3d_prim_object(uint32_t id);
 /* This frame's list: commands and vertices (tests). */
 void xi_gui_d3d_stats(uint32_t* cmds, uint32_t* verts);
+/* A font family's file, as text objects find it (0: none). */
+int xi_gui_font_file(const char* family, int bold, int italic, char* out, size_t n);
+
+/* An A8R8G8B8 IDirect3DTexture8 holding BGRA pixels (w*4 pitch), one reference (d3d_ffi.c). */
+void* xi_d3d_texture_bgra(const uint8_t* bgra, int w, int h);
 
 /* --- images and formats (d3d_image.c) --------------------------------------------------------- */
 

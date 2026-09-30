@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
@@ -26,6 +27,7 @@
 #include "d3d8.h"
 #include "d3d_ffi.h"
 #include "host.h"
+#include "res.h"
 #include "user32.h"
 
 typedef struct
@@ -581,6 +583,183 @@ XI_FFI void* GetModuleHandleA(const char* name)
     if (!name || !strcasecmp(name, "FFXiMain.dll") || !strcasecmp(name, "FFXiMain"))
         return base ? (void*)(uintptr_t)xi_host_addr(base) : NULL;
     return NULL;
+}
+
+/* --- kernel32: code pages ---------------------------------------------------------------------- */
+
+/* MultiByteToWideChar / WideCharToMultiByte for UTF-8 (65001), Shift-JIS (932, through the resource
+ * reader's CP932 table) and the ANSI code page (0, 1252: taken as Latin-1). wchar_t is the ffi's
+ * (UTF-32 here). */
+typedef struct
+{
+    uint32_t cp;
+    uint16_t sjis;
+} SjisRev;
+static SjisRev* g_sjis_rev;
+static size_t g_sjis_nrev;
+
+static int sjis_rev_cmp(const void* a, const void* b)
+{
+    uint32_t x = ((const SjisRev*)a)->cp, y = ((const SjisRev*)b)->cp;
+    return x < y ? -1 : x > y;
+}
+
+static void sjis_rev_build(void)
+{
+    if (g_sjis_rev)
+        return;
+    g_sjis_rev = (SjisRev*)malloc(sizeof(SjisRev) * 64 * 190);
+    if (!g_sjis_rev)
+        return;
+    for (unsigned lead = 0x81; lead <= 0xFC; ++lead)
+    {
+        if (lead > 0x9F && lead < 0xE0)
+            continue;
+        for (unsigned trail = 0x40; trail <= 0xFC; ++trail)
+        {
+            uint32_t cp = res_sjis_char((uint8_t)lead, (uint8_t)trail);
+            if (cp && cp != 0xFFFD && g_sjis_nrev < 64 * 190)
+                g_sjis_rev[g_sjis_nrev++] = (SjisRev){ cp, (uint16_t)(lead << 8 | trail) };
+        }
+    }
+    qsort(g_sjis_rev, g_sjis_nrev, sizeof *g_sjis_rev, sjis_rev_cmp);
+}
+
+/* one character from a code page's bytes: its code point, and how many bytes it took */
+static uint32_t mb_next(uint32_t page, const uint8_t* s, size_t n, size_t* used)
+{
+    uint32_t c = s[0];
+    *used = 1;
+    if (page == 65001)
+    {
+        int k = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+        if (c < 0x80)
+            return c;
+        if (!k)
+            return 0xFFFD;
+        c &= 0x3Fu >> k;
+        size_t i = 1;
+        for (; k && i < n && (s[i] & 0xC0) == 0x80; --k, ++i)
+            c = (c << 6) | (s[i] & 0x3F);
+        *used = i;
+        return k ? 0xFFFD : c;
+    }
+    if (page == 932)
+    {
+        if (c < 0x80)
+            return c;
+        if (c >= 0xA1 && c <= 0xDF)
+            return 0xFF61 + (c - 0xA1);
+        if (n >= 2)
+        {
+            uint32_t u = res_sjis_char((uint8_t)c, s[1]);
+            if (u)
+            {
+                *used = 2;
+                return u;
+            }
+        }
+        return 0x30FB;
+    }
+    return c; /* Latin-1 */
+}
+
+static size_t mb_put(uint32_t page, uint32_t c, uint8_t* o)
+{
+    if (page == 65001)
+    {
+        if (c < 0x80)
+            return o[0] = (uint8_t)c, 1;
+        if (c < 0x800)
+            return o[0] = (uint8_t)(0xC0 | (c >> 6)), o[1] = (uint8_t)(0x80 | (c & 63)), 2;
+        if (c < 0x10000)
+            return o[0] = (uint8_t)(0xE0 | (c >> 12)), o[1] = (uint8_t)(0x80 | ((c >> 6) & 63)), o[2] = (uint8_t)(0x80 | (c & 63)), 3;
+        return o[0] = (uint8_t)(0xF0 | (c >> 18)), o[1] = (uint8_t)(0x80 | ((c >> 12) & 63)), o[2] = (uint8_t)(0x80 | ((c >> 6) & 63)),
+               o[3] = (uint8_t)(0x80 | (c & 63)), 4;
+    }
+    if (page == 932)
+    {
+        if (c < 0x80)
+            return o[0] = (uint8_t)c, 1;
+        if (c >= 0xFF61 && c <= 0xFF9F)
+            return o[0] = (uint8_t)(c - 0xFF61 + 0xA1), 1;
+        sjis_rev_build();
+        SjisRev key = { c, 0 };
+        const SjisRev* r = g_sjis_rev ? (const SjisRev*)bsearch(&key, g_sjis_rev, g_sjis_nrev, sizeof key, sjis_rev_cmp) : NULL;
+        if (r)
+            return o[0] = (uint8_t)(r->sjis >> 8), o[1] = (uint8_t)r->sjis, 2;
+        return o[0] = '?', 1;
+    }
+    return o[0] = (uint8_t)(c < 256 ? c : '?'), 1;
+}
+
+static int page_ok(uint32_t page) { return page == 65001 || page == 932 || page == 0 || page == 1 || page == 3 || page == 1252 || page == 28591; }
+
+XI_FFI int32_t MultiByteToWideChar(uint32_t page, uint32_t flags, const char* src, int32_t n, wchar_t* dst, int32_t cap)
+{
+    (void)flags;
+    if (!src || !page_ok(page))
+        return 0;
+    size_t len = n < 0 ? strlen(src) + 1 : (size_t)n;
+    const uint8_t* s = (const uint8_t*)src;
+    int32_t out = 0;
+    for (size_t i = 0; i < len;)
+    {
+        size_t used;
+        uint32_t c = mb_next(page, s + i, len - i, &used);
+        i += used;
+        int units = sizeof(wchar_t) == 2 && c >= 0x10000 ? 2 : 1;
+        if (cap > 0)
+        {
+            if (out + units > cap)
+                return 0; /* ERROR_INSUFFICIENT_BUFFER */
+            if (units == 2)
+            {
+                dst[out] = (wchar_t)(0xD800 + ((c - 0x10000) >> 10));
+                dst[out + 1] = (wchar_t)(0xDC00 + ((c - 0x10000) & 0x3FF));
+            }
+            else
+                dst[out] = (wchar_t)c;
+        }
+        out += units;
+    }
+    return out;
+}
+
+XI_FFI int32_t WideCharToMultiByte(uint32_t page, uint32_t flags, const wchar_t* src, int32_t n, char* dst, int32_t cap,
+    const char* def, int32_t* used_def)
+{
+    (void)flags, (void)def;
+    if (!src || !page_ok(page))
+        return 0;
+    size_t len = 0;
+    if (n < 0)
+    {
+        while (src[len])
+            ++len;
+        ++len;
+    }
+    else
+        len = (size_t)n;
+    if (used_def)
+        *used_def = 0;
+    int32_t out = 0;
+    for (size_t i = 0; i < len; ++i)
+    {
+        uint32_t c = (uint32_t)src[i];
+        if (sizeof(wchar_t) == 2 && c >= 0xD800 && c < 0xDC00 && i + 1 < len)
+            c = 0x10000 + ((c - 0xD800) << 10) + ((uint32_t)src[++i] - 0xDC00);
+        uint8_t b[4];
+        size_t k = mb_put(page, c, b);
+        if (cap > 0)
+        {
+            if (out + (int32_t)k > cap)
+                return 0;
+            memcpy(dst + out, b, k);
+        }
+        out += (int32_t)k;
+    }
+    return out;
 }
 
 /* --- winmm: sounds ---------------------------------------------------------------------------- */

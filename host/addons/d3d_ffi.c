@@ -2822,6 +2822,18 @@ NOT_SUPPORTED(D3DXCreateVolumeTextureFromFileA)
 NOT_SUPPORTED(D3DXCreateVolumeTextureFromFileW)
 #undef NOT_SUPPORTED
 
+void* xi_d3d_texture_bgra(const uint8_t* bgra, int w, int h)
+{
+    build();
+    Texture* t = tex_create((uint32_t)w, (uint32_t)h, 1, 0, FMT_A8R8G8B8, 1 /* MANAGED */);
+    if (!t)
+        return NULL;
+    for (int y = 0; y < h; ++y)
+        memcpy(t->lv[0].data + (size_t)y * t->lv[0].pitch, bgra + (size_t)y * w * 4, (size_t)w * 4);
+    tex_upload(t);
+    return t;
+}
+
 /* --- Lua ------------------------------------------------------------------------------------ */
 
 static int l_device(lua_State* L)
