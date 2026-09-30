@@ -875,10 +875,20 @@ static ImFont* add_ashita_fonts(ImFontAtlas* atlas)
     return first;
 }
 
+/* ImGui's recoverable errors (an addon's misuse it repaired): logged once each, against the addon */
+static void imgui_error(ImGuiContext*, void*, const char* msg)
+{
+    Addon* a = xi_current();
+    char key[300];
+    snprintf(key, sizeof key, "imgui-error %s %s", a ? a->name : "?", msg);
+    xi_log_once(key, "ImGui%s%s: %s", a ? " in " : "", a ? a->name : "", msg);
+}
+
 extern "C" void xi_gui_init(void)
 {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    GImGui->ErrorCallback = imgui_error;
     ImGuiIO& io = ImGui::GetIO();
     io.BackendRendererName = "ffxirecompile-gfx";
     io.BackendPlatformName = "ffxirecompile-sdl3";
