@@ -72,3 +72,12 @@ print('ffi.load winmm -> ' .. tostring(ffi.load('winmm.dll') == ffi.C))
 local again = ffi.cast('uint8_t*', p2)
 print('recast: ' .. tostring(xi.memory.guest(tonumber(ffi.cast('uintptr_t', again))) == xi.memory.guest(a)))
 print('chain + 1: ' .. string.format('%08x', (p2 + 1).__guest - xi.memory.guest(a)))
+-- the game's own functions through ffi function pointers (config's getter: -1 with no config object;
+-- the game's strlen: a string copied into guest memory for the call)
+ffi.cdef[[ typedef int32_t (__cdecl* get_config_value_t)(int32_t); ]]
+local get = ffi.cast('get_config_value_t', xi.memory.find(0, 0, '8B0D????????85C974??8B44240450E8????????C383C8FFC3', 0, 0))
+print('guest call: ' .. tostring(get(5)))
+local strlen_at = xi.memory.find(0, 0, '8B4C2404F7C10300000074', 0, 0)
+if strlen_at ~= 0 then
+    print('guest strlen: ' .. tostring(ffi.cast('uint32_t (__cdecl*)(const char*)', strlen_at)("Vana'diel")))
+end

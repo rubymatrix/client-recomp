@@ -46,3 +46,8 @@ uint32_t gt_get_error(void);
 uint32_t guest_call(uint32_t fn, unsigned nargs, const uint32_t* args);
 /* The same for a C++ method (thiscall): self in ecx. */
 uint32_t guest_thiscall(uint32_t fn, uint32_t self, unsigned nargs, const uint32_t* args);
+/* The general form: regs 0 (cdecl, stdcall), 1 (thiscall: ecx), 2 (fastcall: ecx, edx); what the
+ * callee left in edx (64-bit results) and at the top of the x87 stack (float results) comes back
+ * too when asked for. */
+uint32_t guest_call_full(uint32_t fn, int regs, uint32_t ecx, uint32_t edx, unsigned nargs, const uint32_t* args,
+    uint32_t* edx_out, double* st0_out);

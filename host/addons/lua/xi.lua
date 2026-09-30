@@ -163,7 +163,89 @@ do
     }
     proxy = function(name, guest) return setmetatable({ __name = name, __guest = guest }, proxy_mt) end
 
+    -- Function pointers onto the game's code: the addon's typedefs say how to call it (the calling
+    -- convention LuaJIT ignores off x86); a cast gives a callable that runs the recompiled function.
+    local sigs = {}
+    local function ret_kind(r)
+        r = r:gsub('const', ''):gsub('^%s+', ''):gsub('%s+$', '')
+        if r:find('%*') then return 'p' end
+        if r == 'void' then return 'v' end
+        if r == 'bool' or r == 'BOOL' and false then return 'b' end
+        if r == 'float' or r == 'double' then return 'F' end
+        if r == 'int8_t' or r == 'char' or r == 'signed char' then return 'c' end
+        if r == 'uint8_t' or r == 'unsigned char' or r == 'BYTE' then return 'C' end
+        if r == 'int16_t' or r == 'short' then return 'h' end
+        if r == 'uint16_t' or r == 'unsigned short' or r == 'WORD' then return 'H' end
+        if r:find('64') or r:find('long%s+long') then return 'l' end
+        if r:find('^uint') or r:find('^unsigned') or r == 'DWORD' or r == 'ULONG' then return 'u' end
+        return 'i'
+    end
+    local function build(ret, conv, params)
+        local k = { ['__thiscall'] = 't', ['__fastcall'] = 'f', ['__stdcall'] = 's' }
+        local kinds = {}
+        params = params:gsub('^%s+', ''):gsub('%s+$', '')
+        if params ~= '' and params ~= 'void' then
+            for p in (params .. ','):gmatch('([^,]*),') do
+                p = p:gsub('^%s+', ''):gsub('%s+$', '')
+                if p:find('%*') then kinds[#kinds + 1] = 'i'
+                elseif p:find('^double') or p:find('%sdouble') then kinds[#kinds + 1] = 'd'
+                elseif p:find('^float') or p:find('%sfloat') then kinds[#kinds + 1] = 'f'
+                else kinds[#kinds + 1] = 'i' end
+            end
+        end
+        local rk = ret_kind(ret)
+        return { conv = k[conv or ''] or 'c', sig = rk .. ':' .. table.concat(kinds), ret = rk,
+                 retct = ret:gsub('^%s+', ''):gsub('%s+$', '') }
+    end
+    local cdef = ffi.cdef
+    ffi.cdef = function(text, ...)
+        local r = cdef(text, ...)
+        if type(text) == 'string' then
+            for ret, conv, name, params in text:gmatch('typedef%s+([^;]-)%(%s*(__%a+)%s*%*%s*([%w_]+)%s*%)%s*(%b())') do
+                sigs[name] = build(ret, conv, params:sub(2, -2))
+            end
+            for ret, name, params in text:gmatch('typedef%s+([^;]-)%(%s*%*%s*([%w_]+)%s*%)%s*(%b())') do
+                sigs[name] = sigs[name] or build(ret, nil, params:sub(2, -2))
+            end
+        end
+        return r
+    end
+    local function inline_sig(ct)
+        if type(ct) ~= 'string' then return nil end
+        local s = sigs[ct]
+        if s then return s end
+        local ret, conv, params = ct:match('^(.-)%(%s*(__%a*)%s*%*%s*%)%s*(%b())%s*$')
+        if not ret then
+            ret, params = ct:match('^(.-)%(%s*%*%s*%)%s*(%b())%s*$')
+        end
+        if not ret then return nil end
+        s = build(ret, conv ~= '' and conv or nil, params:sub(2, -2))
+        sigs[ct] = s
+        return s
+    end
+    local call = native.memory.call
+    local fn_mt = {
+        __call = function(f, ...)
+            local sg = f.__sig
+            local r = call(f.__guest, sg.conv, sg.sig, ...)
+            if sg.ret == 'p' then
+                if r == nil or r == 0 then return nil end
+                return cast(sg.retct, r)
+            end
+            return r
+        end,
+        __tostring = function(f) return ('guest function 0x%08x'):format(f.__guest) end,
+        __eq = function(a, b) return rawget(a, '__guest') == rawget(b, '__guest') end,
+    }
+
     ffi.cast = function(ct, v)
+        local sg = (type(v) == 'number' or type(v) == 'table') and inline_sig(ct)
+        if sg then
+            local guest = type(v) == 'table' and rawget(v, '__guest') or (v < 4294967296 and v or native.memory.guest(v))
+            if guest and guest ~= 0 then
+                return setmetatable({ __guest = guest, __sig = sg }, fn_mt)
+            end
+        end
         if type(v) == 'table' and rawget(v, '__guest') then
             v = rawget(v, '__guest') -- a guest pointer chain cast again: its guest address
         end

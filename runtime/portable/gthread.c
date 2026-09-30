@@ -132,19 +132,27 @@ uint32_t gt_get_error(void)
 
 /* --- host -> guest ----------------------------------------------------------------------------- */
 
-static uint32_t call(uint32_t fn, int thiscall, uint32_t self, unsigned nargs, const uint32_t* args);
+static uint32_t call(uint32_t fn, int regs, uint32_t ecx, uint32_t edx, unsigned nargs, const uint32_t* args,
+    uint32_t* edx_out, double* st0_out);
 
 uint32_t guest_call(uint32_t fn, unsigned nargs, const uint32_t* args)
 {
-    return call(fn, 0, 0, nargs, args);
+    return call(fn, 0, 0, 0, nargs, args, NULL, NULL);
 }
 
 uint32_t guest_thiscall(uint32_t fn, uint32_t self, unsigned nargs, const uint32_t* args)
 {
-    return call(fn, 1, self, nargs, args);
+    return call(fn, 1, self, 0, nargs, args, NULL, NULL);
 }
 
-static uint32_t call(uint32_t fn, int thiscall, uint32_t self, unsigned nargs, const uint32_t* args)
+uint32_t guest_call_full(uint32_t fn, int regs, uint32_t ecx, uint32_t edx, unsigned nargs, const uint32_t* args,
+    uint32_t* edx_out, double* st0_out)
+{
+    return call(fn, regs, ecx, edx, nargs, args, edx_out, st0_out);
+}
+
+static uint32_t call(uint32_t fn, int regs, uint32_t ecx, uint32_t edx, unsigned nargs, const uint32_t* args,
+    uint32_t* edx_out, double* st0_out)
 {
     int took = !t_held;
     if (took)
@@ -162,12 +170,18 @@ static uint32_t call(uint32_t fn, int thiscall, uint32_t self, unsigned nargs, c
     wr32(sp, 0xFEEDF00Du); /* return address: never used, the translation returns to us */
     g->esp = sp;
     g->df = 0;
-    if (thiscall)
-        g->ecx = self;
+    if (regs >= 1)
+        g->ecx = ecx;
+    if (regs >= 2)
+        g->edx = edx;
     /* any guest function pointer: a translation, or a thunk to a shim (a method of our own gamecore
      * object, say) - exactly as guest code's own indirect calls resolve */
     rt_call_indirect(g, fn);
     uint32_t eax = g->eax;
+    if (edx_out)
+        *edx_out = g->edx;
+    if (st0_out)
+        *st0_out = g->st[g->top & 7u];
     uint16_t fcw = g->fcw;
     *g = saved;
     g->fcw = fcw;
