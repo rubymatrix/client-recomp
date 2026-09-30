@@ -56,7 +56,7 @@ HOST_SOURCES = ['runtime/portable/user32.c', 'runtime/portable/d3d8.c', 'runtime
 # the addon host (host/addons/, docs/addon-compat-design.md): C, C++ (ImGui) and its embedded Lua
 ADDON_SOURCES = sorted('host/addons/' + f for f in os.listdir(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'host', 'addons'))
                        if f.endswith('.c') or f.endswith('.cpp')) + ['generated/addons_lua.c']
-ADDON_LIBS = ('luajit', 'imgui', 'luasocket', 'lfs')
+ADDON_LIBS = ('luajit', 'imgui', 'luasocket', 'lfs', 'sqlite')
 
 
 def posix(p):

@@ -111,6 +111,24 @@ do
     end
 end
 
+-- SQLite (Windower's sqlite3 module): databases opened by Windows-shaped paths too
+for _, name in ipairs({ 'sqlite3', 'lsqlite3' }) do
+    local open_module = package.preload[name]
+    if open_module then
+        package.preload[name] = function(...)
+            local m = open_module(...)
+            if type(m) == 'table' and m.open then
+                local open = m.open
+                m.open = function(p, ...)
+                    if type(p) == 'string' and p ~= ':memory:' then p = host_path(p) end
+                    return open(p, ...)
+                end
+            end
+            return m
+        end
+    end
+end
+
 -------------------------------------------------------------------------------- ffi
 
 do

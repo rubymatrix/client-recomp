@@ -68,7 +68,7 @@ package.loaded['pack'] = string
 package.preload['pack'] = function() return string end
 
 -- Windower's other native modules (DLLs in its install): not here, and loud about it
-for _, name in ipairs({ 'sqlite3', 'ssl.core', 'ssl.context', 'ssl.x509', 'ssl.config' }) do
+for _, name in ipairs({ 'ssl.core', 'ssl.context', 'ssl.x509', 'ssl.config' }) do
     package.preload[name] = function() unsupported("require('" .. name .. "') (Windower's native module)") end
 end
 

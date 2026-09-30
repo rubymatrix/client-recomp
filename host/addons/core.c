@@ -552,6 +552,7 @@ static int addon_file(int kind, const char* name, char* dir, size_t dn, char* fi
 extern int luaopen_socket_core(lua_State* L);
 extern int luaopen_mime_core(lua_State* L);
 extern int luaopen_lfs(lua_State* L);
+extern int luaopen_lsqlite3(lua_State* L);
 
 static void preload(lua_State* L, const char* name, lua_CFunction f)
 {
@@ -650,6 +651,8 @@ int xi_addon_load(const char* name, int kind)
     preload(L, "socket.core", luaopen_socket_core);
     preload(L, "mime.core", luaopen_mime_core);
     preload(L, "lfs", luaopen_lfs);
+    preload(L, "lsqlite3", luaopen_lsqlite3);
+    preload(L, "sqlite3", luaopen_lsqlite3); /* Windower's name for it */
     g_addons[g_naddons++] = a; /* registered before it runs: its load code may raise events */
 
     /* xi.lua(native xi, addon info) -> hooks */

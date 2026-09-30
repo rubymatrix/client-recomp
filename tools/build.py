@@ -247,6 +247,9 @@ def addon_objects(env, cflags, objdir, uwp=False):
     objs += compile_stale(env, IMGUI, objdir + '\\imgui', ADDON_INCLUDES, cxx)
     objs += compile_stale(env, LUASOCKET, objdir + '\\luasocket', ADDON_INCLUDES, cflags)
     objs += compile_stale(env, ['third_party\\lfs\\lfs.c'], objdir + '\\lfs', ADDON_INCLUDES, cflags)
+    # SQLite and its Lua binding (Windower's sqlite3 module)
+    objs += compile_stale(env, ['third_party\\sqlite\\sqlite3.c', 'third_party\\sqlite\\lsqlite3\\lsqlite3.c'], objdir + '\\sqlite',
+                          ADDON_INCLUDES + ['/I', 'third_party\\sqlite', '/DSQLITE_THREADSAFE=0', '/DSQLITE_OMIT_LOAD_EXTENSION'], cflags)
     return objs + [luajit(env, uwp)]
 
 
