@@ -255,8 +255,22 @@ return function(windower, h)
 
     function ffxi.get_player()
         if not logged_in() then
-            local extra = from_wev('get_player')
-            return extra
+            -- memory has no player (the harness, a moment at login): the packets' player, if any
+            local info = from_wev('get_info')
+            if not (type(info) == 'table' and info.logged_in) then return nil end
+            local p = from_wev('get_player_extra')
+            if type(p) ~= 'table' then return nil end
+            p.name = p.name or ''
+            p.main_job_id = p.main_job_id or 0
+            p.main_job, p.main_job_full = job(p.main_job_id)
+            p.main_job_level = p.main_job_level or 0
+            if p.sub_job_id then p.sub_job, p.sub_job_full = job(p.sub_job_id) end
+            p.status = p.status or 0
+            p.in_combat = p.status == 1
+            p.buffs, p.skills, p.jobs = p.buffs or {}, p.skills or {}, p.jobs or {}
+            p.merits, p.job_points = p.merits or {}, p.job_points or {}
+            p.vitals = p.vitals or { hp = 0, mp = 0, tp = 0, hpp = 0, mpp = 0, max_hp = 0, max_mp = 0 }
+            return p
         end
         local pi = player_index()
         local main, sub = num(player('MainJob')), num(player('SubJob'))
@@ -369,7 +383,19 @@ return function(windower, h)
 
     function ffxi.get_party()
         local party = ffxi.get_party_info()
-        if not game.base('party') then return party end
+        if not game.base('party') or num(member(0, 'IsActive')) == 0 then
+            -- no party in memory: the player alone, from the packets
+            local me = ffxi.get_player()
+            if me then
+                party.party1_count = 1
+                party.p0 = {
+                    name = me.name, id = me.id, zone = ffxi.get_info().zone,
+                    hp = me.vitals.hp, mp = me.vitals.mp, tp = me.vitals.tp, hpp = me.vitals.hpp, mpp = me.vitals.mpp,
+                    mob = me.index and mob(me.index) or nil,
+                }
+            end
+            return party
+        end
         for slot = 0, 17 do
             if num(member(slot, 'IsActive')) ~= 0 then
                 local key = slot < 6 and ('p' .. slot) or ('a' .. (math.floor(slot / 6)) .. (slot % 6))
@@ -684,8 +710,8 @@ return function(windower, h)
 
     function packets.inject_incoming(id, data) xi.packets.inject(false, with_id(id, data)) end
     function packets.inject_outgoing(id, data) xi.packets.inject(true, with_id(id, data)) end
-    function packets.last_incoming(id) return (xi.packets.last(false, tonumber(id) or 0)) end
-    function packets.last_outgoing(id) return (xi.packets.last(true, tonumber(id) or 0)) end
+    function packets.last_incoming(id) return xi.packets.last(false, tonumber(id) or 0) end
+    function packets.last_outgoing(id) return xi.packets.last(true, tonumber(id) or 0) end
 
     function packets.parse_action(data)
         local e = wev()

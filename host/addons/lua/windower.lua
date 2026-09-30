@@ -526,9 +526,16 @@ function windower.dir_exists(path)
     return native.fs.is_dir(path)
 end
 
+-- files and folders (lfs: xi.fs.list filters one or the other)
 function windower.get_dir(path)
     if not native.fs.is_dir(path) then return nil end
-    return native.fs.list(path)
+    local ok, lfs = pcall(require, 'lfs')
+    if not ok then return native.fs.list(path) end
+    local t = {}
+    for name in lfs.dir(tostring(path)) do
+        if name ~= '.' and name ~= '..' then t[#t + 1] = name end
+    end
+    return t
 end
 
 function windower.create_dir(path)
@@ -670,7 +677,7 @@ function windower.get_windower_settings()
         x_res = w, y_res = h, ui_x_res = w, ui_y_res = h,
         window_x_pos = 0, window_y_pos = 0,
         launcher_version = '4.3.0.0', hook_version = '4.3.0.0', version = '4.3.0.0',
-        branch = 'stable', profile_name = 'Default', ffxi_version = native.build,
+        branch = 'stable', profile_name = 'Default', ffxi_version = wn.ffxi_version or native.build,
     }
 end
 

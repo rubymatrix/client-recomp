@@ -9,8 +9,9 @@ each addon: load it, run frames, a few seconds of time, its command with no argu
 table: loaded or not, the first error line, and the "unsupported: ..." hits the Windower layer
 logged (host/addons/lua/windower.lua).
 
-The game's structures are empty in the harness (nobody is logged in), so addons that need a
-logged-in player at load (and fail with nil errors) are expected; the table says so.
+The game's structures are empty in the harness (nobody is logged in). After the load, a zone-in, stats
+and vitals packet for a player "Tester" (WAR99/THF49) log in through windower_events' packet state,
+so login handlers run and windower.ffxi.get_player() has a player; --no-login leaves them out.
 """
 import argparse
 import os
@@ -21,18 +22,47 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+
+def packet(pid, size, fields):
+    """A packet as hex: id, then (offset, bytes) fields over zeros."""
+    b = bytearray(size)
+    b[0], b[1] = pid & 0xFF, (pid >> 8) & 1
+    for off, data in fields:
+        b[off:off + len(data)] = data
+    return b.hex()
+
+
+def le(v, n):
+    return v.to_bytes(n, 'little')
+
+
+# a player logging in: zone-in (0x00A), stats (0x061), vitals (0x0DF), as a server sends them
+PLAYER_ID, PLAYER_INDEX = 0x01000123, 0x0123
+LOGIN = [
+    packet(0x00A, 0x104, [(0x04, le(PLAYER_ID, 4)), (0x08, le(PLAYER_INDEX, 2)), (0x30, le(230, 2)),
+                          (0x84, b'Tester'), (0xB4, b'\x01'), (0xB7, b'\x06'), (0xBD, b'\x63'), (0xC2, b'\x31'),
+                          (0xE8, le(1500, 4)), (0xEC, le(50, 4))]),
+    packet(0x061, 0x70, [(0x04, le(1500, 4)), (0x08, le(50, 4)), (0x0C, bytes([1, 99, 6, 49]))]),
+    packet(0x0DF, 0x28, [(0x04, le(PLAYER_ID, 4)), (0x08, le(1400, 4)), (0x0C, le(40, 4)), (0x10, le(1000, 4)),
+                         (0x14, le(PLAYER_INDEX, 2)), (0x16, bytes([93, 80])), (0x20, bytes([1, 99, 6, 49]))]),
+]
+
 # a few packets through the pipeline (header included; the harness fixes the size field)
 PACKETS_IN = [
-    '0a00 0000' + '00' * 0x100,          # zone in (mostly zeros)
-    '1700 0000' + '00' * 0x40,           # chat message
-    '2800 0000' + '00' * 0x40,           # action
-    '6100 0000' + '00' * 0x50,           # char stats
-    '6300 0000' + '09 00' + '00' * 0x40,  # set update
+    # a /say from another player (mode 0, name, message)
+    packet(0x017, 0x30, [(0x04, bytes([0, 0])), (0x08, b'Someone'), (0x17, b'hello there')]),
+    # a status change of the player (0x037: buffs, id, status)
+    packet(0x037, 0x60, [(0x04, bytes([0xFF] * 32)), (0x24, le(PLAYER_ID, 4)), (0x30, bytes([0]))]),
+    # vitals again, with other numbers
+    packet(0x0DF, 0x28, [(0x04, le(PLAYER_ID, 4)), (0x08, le(1200, 4)), (0x0C, le(30, 4)), (0x10, le(2000, 4)),
+                         (0x14, le(PLAYER_INDEX, 2)), (0x16, bytes([80, 60])), (0x20, bytes([1, 99, 6, 49]))]),
 ]
 PACKETS_OUT = [
-    '1500 0000' + '00' * 0x14,           # position
-    '1a00 0000' + '00' * 0x1c,           # action
+    packet(0x015, 0x20, [(0x04, le(0, 4))]),   # position
+    packet(0x0B5, 0x30, [(0x04, bytes([0])), (0x06, b'hi')]),  # a chat line
 ]
+
 
 
 def command_names(src, name):
@@ -42,10 +72,17 @@ def command_names(src, name):
     return names or [name]
 
 
-def script_for(name, cmd):
-    lines = [
+def script_for(name, cmd, login=True):
+    # logged in before the load (as addons usually are: the state is primed from the last packets),
+    # then the zone-in again after it (its zone change handlers)
+    lines = [f'packet_in {p}' for p in LOGIN] if login else []
+    lines += [
         f'load {name} windower',
         'frames 5',
+    ]
+    if login:
+        lines += [f'packet_in {p}' for p in LOGIN] + ['frames 3']
+    lines += [
         f'command //{cmd}',
         f'command //{cmd} help',
         'frames 3',
@@ -68,7 +105,7 @@ def survey(args, name, main):
     src = open(main, encoding='latin-1').read()
     cmd = command_names(src, name)[0]
     with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False) as f:
-        f.write(script_for(name, cmd))
+        f.write(script_for(name, cmd, not args.no_login))
         script = f.name
     env = dict(os.environ)
     if args.lua:
@@ -108,6 +145,7 @@ def main():
     ap.add_argument('--only', default='')
     ap.add_argument('--timeout', type=float, default=60)
     ap.add_argument('--markdown')
+    ap.add_argument('--no-login', action='store_true', help='no login packets (a player that never logs in)')
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args()
 

@@ -29,6 +29,8 @@
 
 #include <SDL3/SDL.h>
 
+#include "build.h"
+
 #include "lauxlib.h"
 #include "lua.h"
 
@@ -502,4 +504,6 @@ void xi_windower_open(lua_State* L)
     set(L, "clipboard_get", l_clipboard_get);
     set(L, "clipboard_set", l_clipboard_set);
     set(L, "play_sound", l_play_sound);
+    lua_pushstring(L, FFXI_VERSION); /* the game's version as patch.ver has it: get_windower_settings */
+    lua_setfield(L, -2, "ffxi_version");
 }
