@@ -861,7 +861,7 @@ extern "C" void xi_gui_init(void)
     io.IniFilename = ini.c_str();
     io.ConfigErrorRecovery = true;
     io.ConfigErrorRecoveryEnableAssert = false; /* an addon's misuse is logged, never fatal */
-    io.ConfigErrorRecoveryEnableDebugLog = true;
+    io.ConfigErrorRecoveryEnableDebugLog = false; /* logged once per addon instead (xi_gui_addon_end) */
     io.ConfigErrorRecoveryEnableTooltip = false;
     ImGui::StyleColorsDark();
     g_default_font = add_ashita_fonts(io.Fonts);
@@ -899,6 +899,35 @@ extern "C" void xi_gui_begin(uint32_t w, uint32_t h)
     ImGui::NewFrame();
     ImGui::ErrorRecoveryStoreState(&g_recover);
     g_in_frame = 1;
+}
+
+/* Around each addon's drawing event: what it leaves open (a Begin without its End, a style pushed and
+ * never popped) is closed before the next addon draws, and logged once against it. */
+static ImGuiErrorRecoveryState g_addon_state;
+
+extern "C" void xi_gui_addon_begin(void)
+{
+    if (g_in_frame)
+        ImGui::ErrorRecoveryStoreState(&g_addon_state);
+}
+
+extern "C" void xi_gui_addon_end(Addon* a)
+{
+    if (!g_in_frame)
+        return;
+    ImGuiContext& g = *GImGui;
+    int windows = g.CurrentWindowStack.Size - g_addon_state.SizeOfWindowStack;
+    int ids = g.CurrentWindow ? g.CurrentWindow->IDStack.Size - g_addon_state.SizeOfIDStack : 0;
+    int styles = g.StyleVarStack.Size - g_addon_state.SizeOfStyleVarStack;
+    int colors = g.ColorStack.Size - g_addon_state.SizeOfColorStack;
+    if (windows || ids || styles || colors)
+    {
+        char key[128];
+        snprintf(key, sizeof key, "imgui-unbalanced %s", a ? a->name : "?");
+        xi_log_once(key, "%s left ImGui unbalanced (windows %d, ids %d, style vars %d, colours %d): closed", a ? a->name : "?",
+            windows, ids, styles, colors);
+        ImGui::ErrorRecoveryTryToRecoverState(&g_addon_state);
+    }
 }
 
 /* This frame's text objects and primitives, in creation order (built before ImGui renders: a new

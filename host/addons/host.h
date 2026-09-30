@@ -128,6 +128,9 @@ void xi_gui_init(void);
 void xi_gui_begin(uint32_t w, uint32_t h);
 void xi_gui_end(void);
 int xi_gui_in_frame(void);
+/* Around one addon's drawing event: what it leaves open in ImGui is closed (and logged). */
+void xi_gui_addon_begin(void);
+void xi_gui_addon_end(Addon* a);
 /* Input: 1 when the overlay takes it (the game must not see it). */
 int xi_gui_mouse(int msg, int x, int y, int delta);
 int xi_gui_key(uint32_t vk, int down, uint32_t scancode);

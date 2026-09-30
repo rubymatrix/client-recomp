@@ -884,7 +884,13 @@ void xi_raise_kind(XiEvent* e, int kind)
         push_event(L, e);
         lua_pushvalue(L, -1);
         lua_insert(L, top + 1); /* the table kept under the call */
-        if (call(a, 1, 1, e->name))
+        int drawing = !strcmp(e->name, "present");
+        if (drawing)
+            xi_gui_addon_begin();
+        int ok = call(a, 1, 1, e->name);
+        if (drawing)
+            xi_gui_addon_end(a);
+        if (ok)
         {
             if (lua_toboolean(L, -1))
                 e->handled = 1;
