@@ -39,6 +39,7 @@
 
 extern int xi_game_open(lua_State* L);
 extern int xi_res_open(lua_State* L);
+extern void xi_ashita_open(lua_State* L);
 extern void xi_gui_lua_push_manager(lua_State* L);
 
 extern uint32_t xi_text_new(void);
@@ -906,6 +907,7 @@ void xi_lua_open(lua_State* L, Addon* a)
     lua_setfield(L, -2, "game");
     xi_res_open(L);
     lua_setfield(L, -2, "res");
+    xi_ashita_open(L), lua_setfield(L, -2, "ashita_native"); /* ashita_native.c */
     /* paths */
     lua_newtable(L);
     lua_pushstring(L, xi_data_dir());
