@@ -23,6 +23,7 @@
 
 #include "host.h"
 #include "addons.h"
+#include "gui_lua.h"
 #include "d3d8.h"
 #include "gthread.h"
 #include "gwin.h"
@@ -580,7 +581,10 @@ static void addon_free(Addon* a)
 {
     xi_gui_free_owned(a);
     if (a->L && !a->dead)
+    {
+        xi_gui_lua_forget_state(a->L);
         lua_close(a->L);
+    }
     free(a);
 }
 

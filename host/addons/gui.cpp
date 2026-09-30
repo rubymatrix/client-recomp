@@ -804,6 +804,49 @@ static void overlay(GfxTex* bb, uint32_t w, uint32_t h)
     render_draw_data(ImGui::GetDrawData(), w, h);
 }
 
+/* Ashita's fonts: Agave at 18 (the default), 24 and 32 pixels, each with Font Awesome 6's regular,
+ * brands and solid icons merged in (addons' ICON_FA_* strings), from the fonts built in. */
+static ImFont* add_ashita_fonts(ImFontAtlas* atlas)
+{
+    size_t n;
+    const char* agave = xi_embedded("font/Agave-Regular", &n);
+    if (!agave)
+        return atlas->AddFontDefault();
+    ImFont* first = NULL;
+    static const float SIZES[] = { 18.0f, 24.0f, 32.0f };
+    for (float size : SIZES)
+    {
+        ImFontConfig cfg;
+        cfg.FontDataOwnedByAtlas = false;
+        ImFont* f = atlas->AddFontFromMemoryTTF((void*)agave, (int)n, size, &cfg);
+        if (!first)
+            first = f;
+        static const struct
+        {
+            const char* name;
+            ImWchar lo, hi;
+        } ICONS[] = { { "font/fa-regular-400", 0xe005, 0xf8ff }, { "font/fa-brands-400", 0xe007, 0xf8e8 },
+                      { "font/fa-solid-900", 0xe005, 0xf8ff } };
+        for (auto& ic : ICONS)
+        {
+            size_t in;
+            const char* data = xi_embedded(ic.name, &in);
+            if (!data)
+                continue;
+            static ImWchar ranges[3][3];
+            ImWchar* r = ranges[&ic - ICONS];
+            r[0] = ic.lo, r[1] = ic.hi, r[2] = 0;
+            ImFontConfig mc;
+            mc.MergeMode = true;
+            mc.FontDataOwnedByAtlas = false;
+            mc.GlyphMinAdvanceX = size;
+            mc.GlyphRanges = r;
+            atlas->AddFontFromMemoryTTF((void*)data, (int)in, size, &mc);
+        }
+    }
+    return first;
+}
+
 extern "C" void xi_gui_init(void)
 {
     IMGUI_CHECKVERSION();
@@ -821,7 +864,7 @@ extern "C" void xi_gui_init(void)
     io.ConfigErrorRecoveryEnableDebugLog = true;
     io.ConfigErrorRecoveryEnableTooltip = false;
     ImGui::StyleColorsDark();
-    g_default_font = io.Fonts->AddFontDefault();
+    g_default_font = add_ashita_fonts(io.Fonts);
     d3d8_set_overlay(overlay);
 }
 

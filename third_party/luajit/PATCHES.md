@@ -37,3 +37,10 @@ A lone `;` as an empty statement needed no patch: LuaJIT 2.1 already accepts it.
 Not supported: the Ashita v4 LuaLS stub files `addons/libs/annotations/SDK/IGuiManager.lua` and
 `IGuiManagerTypes.lua` (`---@meta`) use keywords as names (`repeat`, `end`). No Lua can parse
 them, and they are never loaded. They exist only for editor type hints.
+
+## ffi C parser: a single `L` suffix is 32 bits (lj_strscan.c)
+
+Ashita's libs (win32types.lua) declare constants like `0x8000FFFFL` in `ffi.cdef`. They were written
+for Windows, where `long` is 32 bits; on a 64-bit POSIX host LuaJIT made `L` a 64-bit integer, which
+the C parser then rejected as malformed. A single `L` now means a 32-bit long, as on Windows; `LL`
+is unchanged.

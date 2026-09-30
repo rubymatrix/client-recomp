@@ -484,7 +484,9 @@ StrScanFmt lj_strscan_scan(const uint8_t *p, MSize len, TValue *o,
 	  p++;
 	  if (casecmp(*p, 'l')) p++, fmt += STRSCAN_I64 - STRSCAN_INT;
 	  else if (!(opt & STRSCAN_OPT_C)) return STRSCAN_ERROR;
-	  else if (sizeof(long) == 8) fmt += STRSCAN_I64 - STRSCAN_INT;
+	  /* FFXIRecompile (Windows long): a single L suffix is a 32-bit long, as
+	  ** on Windows (LLP64), where the ffi.cdef declarations addons carry were
+	  ** written ("0x8000FFFFL"); LP64's 64-bit long made them malformed. */
 	}
 	if (casecmp(*p, 'u') && (fmt == STRSCAN_INT || fmt == STRSCAN_I64))
 	  p++, fmt += STRSCAN_U32 - STRSCAN_INT;
