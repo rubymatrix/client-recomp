@@ -87,6 +87,10 @@ void xi_raise_kind(XiEvent* e, int kind);
 
 /* --- hooks and chat (hooks.c) ---------------------------------------------------------------- */
 
+/* A line for the game alone, next frame: it already went through the host's commands and the addons
+ * (a line text_out changed, an alias nobody handled). */
+void xi_chat_queue_game(int mode, const char* line);
+
 void xi_hooks_init(void);
 void xi_hooks_frame(void);            /* chat lines and commands queued for the game */
 /* The chat input line: text, open state. */
@@ -99,6 +103,13 @@ void xi_packet_inject(int outgoing, const uint8_t* p, size_t n);
 size_t xi_packet_last(int outgoing, uint16_t id, uint8_t* out, size_t cap, uint64_t* when_ms);
 /* A plain buffer (0x1C header, packets) through the pipeline, as the packet hooks do (the harness). */
 size_t xi_packets_process(int outgoing, const uint8_t* buf, size_t size, uint8_t* out, size_t cap);
+
+/* --- code patches (patch.c) ------------------------------------------------------------------ */
+
+/* An addon is about to write n bytes at addr (xi.memory): reported if it is in the game's code. */
+void xi_code_patch(Addon* a, uint32_t addr, const uint8_t* bytes, uint32_t n);
+/* Every frame: finds code changed by other means (ffi stores). */
+void xi_patch_watch(void);
 
 /* --- commands (cmd.c) ------------------------------------------------------------------------ */
 

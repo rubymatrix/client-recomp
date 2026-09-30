@@ -119,6 +119,11 @@
         "write_line": "0x100767c0",
         "packet_decrypt": "0x100dd6c0",
         "packet_encrypt": "0x100dd590"
+      },
+      "patches": {
+        "instantchat": {
+          "0x1016258c": "909090"
+        }
       }
     },
     "2025-12-26": {

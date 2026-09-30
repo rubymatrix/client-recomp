@@ -494,7 +494,7 @@ int xi_command(const char* in, int mode, int injected)
             int r = xi_command(again, mode, 1);
             depth--;
             if (!r)
-                xi_chat_queue(mode, again); /* a line for the game: it runs through the game's own parser */
+                xi_chat_queue_game(mode, again); /* a line for the game: it runs through the game's own parser */
             return 1;
         }
     }
@@ -532,8 +532,8 @@ int xi_command(const char* in, int mode, int injected)
     if (t.mod_size != t.size || memcmp(t.mod, line, t.size))
     {
         mod[t.mod_size] = 0;
-        /* the changed line runs in the original's place (the host skips its events: injected) */
-        xi_chat_queue(t.mode_mod, (const char*)mod);
+        /* the changed line runs in the original's place, straight to the game (not routed again) */
+        xi_chat_queue_game(t.mode_mod, (const char*)mod);
         return 1;
     }
     return 0;

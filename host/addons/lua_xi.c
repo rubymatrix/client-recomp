@@ -79,20 +79,13 @@ static uint32_t arg_addr(lua_State* L, int i)
 
 static void push_addr(lua_State* L, uint32_t guest) { lua_pushnumber(L, xi_host_addr(guest)); }
 
-/* Writes into FFXiMain's code change nothing (the recompiled C is what runs): logged once per
- * addon and address, so a code-patching addon is easy to find. */
-static int code_write(lua_State* L, uint32_t a, uint32_t n)
+/* Writes into FFXiMain's code change nothing by themselves (the recompiled C is what runs): each is
+ * reported as a code patch (patch.c), which a translated variant may stand for. Called before the
+ * bytes are written. */
+static void code_write(lua_State* L, uint32_t a, const void* src, uint32_t n)
 {
-    uint32_t text, size;
-    xi_image(NULL, NULL, &text, &size);
-    if (a + n <= text || a >= text + size)
-        return 0;
     Addon* ad = addon_of(L);
-    char key[160];
-    snprintf(key, sizeof key, "patch %s %08x", ad ? ad->name : "?", a);
-    xi_log_once(key, "%s patched the game's code at %08x (%u bytes): ignored, the recompiled game doesn't run those bytes",
-        ad ? ad->name : "?", a, n);
-    return 0; /* the bytes are written anyway (harmless, and reads see them) */
+    xi_code_patch(ad, a, (const uint8_t*)src, n);
 }
 
 /* --- xi.memory -------------------------------------------------------------------------------- */
@@ -116,6 +109,8 @@ static int m_find(lua_State* L)
         if (lua_isnumber(L, 2) && lua_tonumber(L, 2) > 0)
             size = (uint32_t)lua_tonumber(L, 2);
     }
+    else if (lua_isnumber(L, 1) && lua_tonumber(L, 1) == 0 && lua_tonumber(L, 2) == 0)
+        xi_image(NULL, NULL, &start, &size); /* Ashita's find(0, 0, ...): FFXiMain */
     else
     {
         start = arg_addr(L, 1);
@@ -158,7 +153,7 @@ READ(double, double, rdf64)
         T v = (T)luaL_checknumber(L, 2);                                                                               \
         if (!xi_mapped(a, sizeof(T)))                                                                                  \
             return lua_pushboolean(L, 0), 1;                                                                           \
-        code_write(L, a, sizeof(T));                                                                                   \
+        code_write(L, a, &v, sizeof(T));                                                                               \
         memcpy(GUEST_PTR(a), &v, sizeof v);                                                                            \
         lua_pushboolean(L, 1);                                                                                         \
         return 1;                                                                                                      \
@@ -199,7 +194,7 @@ static int m_write_string(lua_State* L)
     int terminate = lua_isnoneornil(L, 3) || lua_toboolean(L, 3);
     if (!xi_mapped(a, (uint32_t)n + (terminate ? 1 : 0)))
         return lua_pushboolean(L, 0), 1;
-    code_write(L, a, (uint32_t)n);
+    code_write(L, a, s, (uint32_t)n);
     memcpy(GUEST_PTR(a), s, n);
     if (terminate)
         wr8(a + (uint32_t)n, 0);
@@ -231,7 +226,7 @@ static int m_write_array(lua_State* L)
         const char* s = lua_tolstring(L, 2, &n);
         if (!xi_mapped(a, (uint32_t)n))
             return lua_pushboolean(L, 0), 1;
-        code_write(L, a, (uint32_t)n);
+        code_write(L, a, s, (uint32_t)n);
         memcpy(GUEST_PTR(a), s, n);
         return lua_pushboolean(L, 1), 1;
     }
@@ -239,13 +234,16 @@ static int m_write_array(lua_State* L)
     uint32_t n = (uint32_t)lua_objlen(L, 2);
     if (!xi_mapped(a, n))
         return lua_pushboolean(L, 0), 1;
-    code_write(L, a, n);
+    uint8_t* bytes = (uint8_t*)malloc(n ? n : 1);
     for (uint32_t i = 0; i < n; ++i)
     {
         lua_rawgeti(L, 2, (int)i + 1);
-        wr8(a + i, (uint8_t)lua_tonumber(L, -1));
+        bytes[i] = (uint8_t)lua_tonumber(L, -1);
         lua_pop(L, 1);
     }
+    code_write(L, a, bytes, n);
+    memcpy(GUEST_PTR(a), bytes, n);
+    free(bytes);
     return lua_pushboolean(L, 1), 1;
 }
 

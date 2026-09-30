@@ -115,22 +115,99 @@ end
 
 do
     local ffi = require('ffi')
-    local cast = ffi.cast
+    local cast, typeof = ffi.cast, ffi.typeof
     local base = native.memory.base()
-    local pointer = setmetatable({}, { __mode = 'k' })
-    local function is_pointer(ct)
-        local known = pointer[ct]
-        if known ~= nil then return known end
-        local ok, t = pcall(ffi.typeof, ct)
-        local r = ok and tostring(t):find('[%*&]%s*>$') ~= nil or false
-        if type(ct) ~= 'number' then pointer[ct] = r end
-        return r
+    local rd32 = native.memory.read_uint32
+
+    -- pointer depth of a ctype ('uint8_t***' -> 3), and the ctype one level down
+    local depth_of = setmetatable({}, { __mode = 'k' })
+    local function pointer_depth(ct)
+        local d = depth_of[ct]
+        if d then return d end
+        local ok, t = pcall(typeof, ct)
+        local name = ok and tostring(t):match('^ctype<(.*)>$') or ''
+        d = 0
+        for _ in name:gsub('%s', ''):gmatch('%*') do d = d + 1 end
+        if name:find('%(') then d = math.min(d, 1) end -- function pointers are one pointer
+        if type(ct) ~= 'number' then depth_of[ct] = d end
+        return d, name
     end
+
+    -- A pointer to guest pointers ('T**' onto guest memory): the guest's pointers are 4 bytes, not
+    -- 8, so [i] reads a 32-bit guest pointer and gives it back one level down, base added.
+    local proxy
+    local function down(name, guest)
+        if guest == 0 then return nil end
+        local inner = name:gsub('%*%s*$', '', 1)
+        local _, n = inner:gsub('%*', '')
+        if n >= 2 then return proxy(inner, guest) end
+        return cast(inner, guest + base)
+    end
+    local proxy_mt = {
+        __index = function(p, i)
+            if type(i) ~= 'number' then return nil end
+            return down(p.__name, rd32(p.__guest + 4 * i))
+        end,
+        __newindex = function(p, i, v)
+            if type(v) ~= 'number' then v = native.memory.guest(tonumber(cast('uintptr_t', v))) end
+            native.memory.write_uint32(p.__guest + 4 * i, v)
+        end,
+        __tostring = function(p) return ('guest %s: 0x%08x'):format(p.__name, p.__guest) end,
+    }
+    proxy = function(name, guest) return setmetatable({ __name = name, __guest = guest }, proxy_mt) end
+
     ffi.cast = function(ct, v)
-        if type(v) == 'number' and v > 0 and v < 4294967296 and is_pointer(ct) then
-            v = v + base
+        if type(v) == 'number' and v > 0 then
+            local d, name = pointer_depth(ct)
+            if d >= 1 then
+                local guest = v < 4294967296 and v or native.memory.guest(v)
+                if d >= 2 and guest ~= 0 and (v < 4294967296 or v - base < 4294967296) then
+                    return proxy(name, guest)
+                end
+                if v < 4294967296 then v = v + base end
+            end
         end
         return cast(ct, v)
+    end
+
+    -- ffi.C and ffi.load: Windows paths given to the C library's file functions are mapped, and
+    -- Windows DLLs addons load by name are the host's own exports (the Win32 and D3DX stand-ins).
+    local C = ffi.C
+    local mapped = {}
+    for _, f in ipairs({ 'fopen', '_wfopen', 'freopen', 'remove', 'rename', '_access', 'access', 'CreateFileA',
+                         'GetFileAttributesA', 'DeleteFileA', 'CreateDirectoryA' }) do
+        mapped[f] = true
+    end
+    local wrapped = {}
+    local proxyC = setmetatable({}, {
+        __index = function(_, k)
+            local w = wrapped[k]
+            if w then return w end
+            local f = C[k]
+            if mapped[k] and type(f) == 'cdata' then
+                w = function(p, ...)
+                    if type(p) == 'string' then p = host_path(p) end
+                    if k == 'rename' then
+                        local q = ...
+                        return f(p, type(q) == 'string' and host_path(q) or q)
+                    end
+                    return f(p, ...)
+                end
+                wrapped[k] = w
+                return w
+            end
+            return f
+        end,
+        __newindex = function(_, k, v) C[k] = v end,
+    })
+    ffi.C = proxyC
+    local load = ffi.load
+    local windows = { kernel32 = true, user32 = true, gdi32 = true, winmm = true, shell32 = true, advapi32 = true,
+                      d3d8 = true, d3dx8 = true, d3dx9 = true, msvcrt = true, ntdll = true, psapi = true, ole32 = true }
+    ffi.load = function(name, global)
+        local short = tostring(name):lower():gsub('%.dll$', ''):gsub('^.*[/\\]', '')
+        if windows[short] then return proxyC end
+        return load(host_path(name), global)
     end
 end
 

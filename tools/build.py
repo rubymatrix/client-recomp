@@ -131,8 +131,15 @@ def compile_stale(env, sources, objdir, extra, cflags=CFLAGS):
 def recomp(out, extra):
     hooks = ','.join('%s=%s' % kv for kv in BUILD['hooks'].items())  # host hook points (recomp.py --hooks)
     wraps = ','.join('%s=%s' % kv for kv in BUILD['wraps'].items())  # host-replaceable functions (--wraps)
+    # addons' code patches, translated as variants (--patches): generated/patches.json
+    patches = os.path.join(ROOT, 'generated', 'patches.json')
+    text = json.dumps(BUILD['patches'], indent=1, sort_keys=True)
+    if not os.path.exists(patches) or open(patches).read() != text:
+        with open(patches, 'w') as f:
+            f.write(text)
     run([sys.executable, 'recomp/recomp.py', '--meta', META, '--image', IMAGE, '--retail', RETAIL, '--out', out]
-        + (['--hooks', hooks] if hooks else []) + (['--wraps', wraps] if wraps else []) + extra)
+        + (['--hooks', hooks] if hooks else []) + (['--wraps', wraps] if wraps else [])
+        + (['--patches', patches] if BUILD['patches'] else []) + extra)
 
 
 def difftest(env):

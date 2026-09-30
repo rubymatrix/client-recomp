@@ -24,6 +24,19 @@ extern const unsigned char rt_table_patch[];
 extern const uint32_t rt_image_base, rt_image_timestamp, rt_image_size, rt_image_text_rva, rt_image_text_size,
     rt_image_packed_rva, rt_image_packed_len, rt_image_oep, rt_image_reloc_rva;
 
+/* Addon code patches (recomp.py --patches): a run of bytes an addon writes over the game's code,
+ * and the flag that selects the translated variant with them in place. */
+typedef struct RtPatch
+{
+    const char* group;
+    uint32_t addr;
+    const unsigned char* bytes;
+    unsigned size;
+    volatile int* on;
+} RtPatch;
+extern const RtPatch rt_patches[];
+extern const unsigned rt_patch_count;
+
 /* The image is at runtime_base: sets the relocation delta and the image range. */
 void rt_set_image(uint32_t runtime_base);
 

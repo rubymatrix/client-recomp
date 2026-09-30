@@ -2,7 +2,7 @@
 
   python recomp/recomp.py --meta <meta.json> --image <unpacked.dll> --out generated/ \
       [--functions 0x10317480,0x10312980,...] [--all] [--stats] [--hooks name=0x100863d6,...]
-      [--wraps name=0x10080dc0,...]
+      [--wraps name=0x10080dc0,...] [--patches <patches.json>]
 
 --functions translates those entries plus everything they reach by direct call or tail jump
 (the closure), which is what a differential test needs. --all translates every function in the
@@ -18,6 +18,13 @@ f_XXXXXXXX becomes f_XXXXXXXX_body, and f_XXXXXXXX calls the host's rt_wrap_<nam
 host sets it) instead of it when set. The host runs at the function's entry (esp at the return
 address) and either calls rt_orig_<name> (the body) or returns for it (runtime.h rt_return).
 Every call reaches the wrap: direct calls, tail jumps and rt_table (indirect calls, vtables).
+
+--patches names code patches addons make ({"group": {"0xADDR": "hexbytes", ...}, ...}, from
+meta/builds.json "patches"): the bytes an addon writes over the game's code, which the recompiled C
+would otherwise never run. Each function a group touches is translated a second time with the
+group's bytes in place (f_XXXXXXXX_p_<group>), and runs instead of the original while the host sets
+rt_patch_<group> (host/addons/patch.c: while those bytes are in guest memory). table.c lists the
+patches (rt_patches) for the host to check.
 """
 import argparse
 import collections
@@ -50,6 +57,8 @@ class Program:
         self.hooks = {}  # address -> name (--hooks)
         self.hooked = set()
         self.wraps = {}  # function entry -> name (--wraps)
+        self.patches = {}  # group -> {address: bytes} (--patches)
+        self.overlay = None  # while translating a patched variant: {address: byte}
         self.relocs = self.text_relocations(pe)
         self.inner = self.add_data_entries(pe)
         self.inner |= self.add_branch_entries()
@@ -225,7 +234,22 @@ class Program:
 
     def read(self, va, n):
         off = va - self.base
-        return self.image[off:off + n]
+        b = self.image[off:off + n]
+        if self.overlay:
+            b = bytearray(b)
+            for a, v in self.overlay.items():
+                if va <= a < va + n:
+                    b[a - va] = v
+            b = bytes(b)
+        return b
+
+    def function_of(self, a):
+        """The entry of the function whose ranges hold address a (None if none does)."""
+        for e, ranges in self.functions.items():
+            for lo, hi in ranges:
+                if lo <= a < hi:
+                    return e
+        return None
 
 
 def write_if_changed(path, text):
@@ -289,22 +313,35 @@ def image_constants(prog, image_path):
     }
 
 
-def wrap(prog, e, lines):
-    """--wraps: the translation renamed to <name>_body, and a new entry that defers to the host."""
+def gate(prog, e, lines, variants):
+    """--wraps and --patches: the translation renamed to <fn>_body; each patched variant as
+    <fn>_p_<group>; <fn>_sel picks a variant whose patch is in place, else the body; and the entry
+    <fn> itself defers to the host's wrap when there is one, else to the selection."""
     fn = '%s%08x' % (prog.prefix, e)
     head = 'void %s(Guest* g)' % fn
     if lines[0] != head:
-        raise SystemExit('--wraps: unexpected translation header for %#x' % e)
-    name = prog.wraps[e]
-    return ['void %s_body(Guest* g)' % fn] + lines[1:] + [
-        '',
-        '/* recomp.py --wraps %s: the host may replace this function */' % name,
-        head,
-        '{',
-        '    if (rt_wrap_%s) rt_wrap_%s(g);' % (name, name),
-        '    else %s_body(g);' % fn,
-        '}',
-    ]
+        raise SystemExit('--wraps/--patches: unexpected translation header for %#x' % e)
+    out = ['void %s_body(Guest* g)' % fn] + lines[1:]
+    inner = fn + '_body'
+    if variants:
+        for group, v in variants:
+            if v[0] != head:
+                raise SystemExit('--patches: unexpected translation header for %#x' % e)
+            out += ['', '/* recomp.py --patches %s: this function with the patch in place */' % group,
+                    'void %s_p_%s(Guest* g)' % (fn, group)] + v[1:]
+        out += ['', 'void %s_sel(Guest* g)' % fn, '{']
+        for group, _ in variants:
+            out.append('    if (rt_patch_%s) { %s_p_%s(g); return; }' % (group, fn, group))
+        out += ['    %s_body(g);' % fn, '}']
+        inner = fn + '_sel'
+    out.append('')
+    if e in prog.wraps:
+        name = prog.wraps[e]
+        out += ['/* recomp.py --wraps %s: the host may replace this function */' % name, head, '{',
+                '    if (rt_wrap_%s) rt_wrap_%s(g);' % (name, name), '    else %s(g);' % inner, '}']
+    else:
+        out += [head, '{', '    %s(g);' % inner, '}']
+    return out
 
 
 def main():
@@ -319,6 +356,7 @@ def main():
     ap.add_argument('--retail', help='the retail (packed) DLL; default: FFXiMain.dll from the registry')
     ap.add_argument('--hooks', default='', help='name=0xADDR,...: host hook points (see above)')
     ap.add_argument('--wraps', default='', help='name=0xADDR,...: functions the host may replace (see above)')
+    ap.add_argument('--patches', default='', help='a JSON file of addon code patches (see above)')
     ap.add_argument('--module', default='',
                     help='a second module (e.g. ffxi for FFXi.dll): functions are named <module>_XXXXXXXX, the '
                          'module has its own relocation delta, and table.c defines RtModule rt_module_<module> '
@@ -337,6 +375,23 @@ def main():
         if a not in prog.entries:
             raise SystemExit('--wraps: %s=%#x is not a function entry in the metadata' % (name, a))
         prog.wraps[a] = name
+    patched = {}  # function entry -> [groups that patch it]
+    if args.patches:
+        with open(args.patches) as f:
+            for group, spots in json.load(f).items():
+                if not group.replace('_', '').isalnum():
+                    raise SystemExit('--patches: %r is not a C identifier' % group)
+                prog.patches[group] = {}
+                for addr, hexbytes in spots.items():
+                    a = int(addr, 16)
+                    data = bytes.fromhex(hexbytes)
+                    for i, v in enumerate(data):
+                        prog.patches[group][a + i] = v
+                    e = prog.function_of(a)
+                    if e is None:
+                        raise SystemExit('--patches: %s at %#x is in no function' % (group, a))
+                    if group not in patched.setdefault(e, []):
+                        patched[e].append(group)
 
     if args.all:
         todo = sorted(prog.entries)
@@ -359,8 +414,14 @@ def main():
         prog.referenced = set()
         t = FunctionTranslator(prog, e, prog.functions[e])
         done[e] = t.translate()
-        if e in prog.wraps:
-            done[e] = wrap(prog, e, done[e])
+        variants = []
+        for group in patched.get(e, []):
+            prog.overlay = prog.patches[group]
+            v = FunctionTranslator(prog, e, prog.functions[e]).translate()
+            prog.overlay = None
+            variants.append((group, v))
+        if e in prog.wraps or variants:
+            done[e] = gate(prog, e, done[e], variants)
         for addr, mn, why in t.unimpl:
             unimpl[why if why.startswith('x87') else mn] += 1
             unimpl_funcs.add(e)
@@ -381,6 +442,14 @@ def main():
         for e, name in sorted(prog.wraps.items()):
             f.write('void %s%08x_body(Guest* g);\nextern GuestFn rt_wrap_%s;\nextern const GuestFn rt_orig_%s;\n'
                     % (prog.prefix, e, name, name))
+        for e, groups in sorted(patched.items()):
+            f.write('void %s%08x_sel(Guest* g);\n' % (prog.prefix, e))
+            if e not in prog.wraps:
+                f.write('void %s%08x_body(Guest* g);\n' % (prog.prefix, e))
+            for group in groups:
+                f.write('void %s%08x_p_%s(Guest* g);\n' % (prog.prefix, e, group))
+        for group in sorted(prog.patches):
+            f.write('extern volatile int rt_patch_%s;\n' % group)
     chunks = set()
     for k in range(0, len(entries), args.chunk):
         name = 'funcs_%03d.c' % (k // args.chunk)
@@ -421,7 +490,33 @@ def main():
         for name in sorted(prog.hooks.values()):
             f.write('GuestFn rt_hook_%s; /* recomp.py --hooks */\n' % name)
         for e, name in sorted(prog.wraps.items()):
-            f.write('GuestFn rt_wrap_%s; /* recomp.py --wraps */\nconst GuestFn rt_orig_%s = f_%08x_body;\n' % (name, name, e))
+            orig = 'f_%08x_sel' % e if e in patched else 'f_%08x_body' % e
+            f.write('GuestFn rt_wrap_%s; /* recomp.py --wraps */\nconst GuestFn rt_orig_%s = %s;\n' % (name, name, orig))
+        for group in sorted(prog.patches):
+            f.write('volatile int rt_patch_%s; /* recomp.py --patches */\n' % group)
+        # the patches, one entry per run of consecutive bytes, for the host to compare with memory
+        f.write('static const unsigned char rt_patch_bytes[] = {')
+        patch_runs, off = [], 0
+        blob = []
+        for group in sorted(prog.patches):
+            spots = sorted(prog.patches[group].items())
+            k = 0
+            while k < len(spots):
+                start, run = spots[k][0], [spots[k][1]]
+                while k + 1 < len(spots) and spots[k + 1][0] == spots[k][0] + 1:
+                    k += 1
+                    run.append(spots[k][1])
+                patch_runs.append((group, start, off, len(run)))
+                blob += run
+                off += len(run)
+                k += 1
+        f.write(','.join('0x%02x' % b for b in blob) or '0')
+        f.write('};\nconst RtPatch rt_patches[] = {\n')
+        for group, start, o, n in patch_runs:
+            f.write('    { "%s", 0x%08Xu, rt_patch_bytes + %d, %d, &rt_patch_%s },\n' % (group, start, o, n, group))
+        if not patch_runs:
+            f.write('    { 0, 0, 0, 0, 0 },\n')
+        f.write('};\nconst unsigned rt_patch_count = %d;\n' % len(patch_runs))
         if prog.hooks or prog.wraps:
             f.write('\n')
         f.write('const RtEntry rt_table[] = {\n')
