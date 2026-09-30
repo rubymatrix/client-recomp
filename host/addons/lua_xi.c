@@ -70,7 +70,8 @@ static uint32_t arg_addr(lua_State* L, int i)
 {
     if (lua_type(L, i) == 10 /* LUA_TCDATA: an ffi pointer */)
     {
-        const void* p = lua_topointer(L, i);
+        /* lua_topointer gives where a cdata's value is held: the pointer is that value */
+        const void* p = *(void* const*)lua_topointer(L, i);
         return xi_guest_addr((double)(uintptr_t)p, NULL);
     }
     int ok;

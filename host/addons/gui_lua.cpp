@@ -298,7 +298,8 @@ void* opt_rawptr(lua_State* L, int idx)
     case LUA_TSTRING:
         return (void*)lua_tostring(L, idx);
     default:
-        return (void*)lua_topointer(L, idx); // cdata
+        // cdata: lua_topointer gives where its value is held; a pointer (or 64-bit integer) is that value
+        return lua_topointer(L, idx) ? *(void* const*)lua_topointer(L, idx) : nullptr;
     }
 }
 
@@ -1029,7 +1030,7 @@ template <class Fn> auto with_id(lua_State* L, Fn fn)
     case LUA_TNONE:
         return fn("", nullptr, nullptr, 0, 0);
     default:
-        return fn(nullptr, nullptr, lua_topointer(L, 1) ? lua_topointer(L, 1) : opt_rawptr(L, 1), 0, 2);
+        return fn(nullptr, nullptr, opt_rawptr(L, 1), 0, 2);
     }
 }
 
