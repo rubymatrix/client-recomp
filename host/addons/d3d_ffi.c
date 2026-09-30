@@ -30,6 +30,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 
 #include "d3d8.h"
 #include "d3d_ffi.h"
@@ -323,31 +328,91 @@ static int valid(const void* p, int kind)
     return c && c->magic == MAGIC && c->kind == kind;
 }
 
-/* Object memory. A texture's address must not be read as one of ImGui's small ids once cut to 32
- * bits, nor clash with a live texture's: such blocks are set aside while another is tried. */
+/* Texture objects live in one slab mapped where every address, cut to 32 bits, is at least
+ * 0x10000000 (never one of ImGui's small ids) and unique among live textures: the id Lua gets from
+ * tonumber(ffi.cast('uint32_t', tex)) is the gui texture's. (Taking blocks from malloc and retrying
+ * failed whenever the allocator's region sat low in its 4 GB.) */
+#define TEX_SLOTS 16384u
+static uint8_t* g_slab;
+static size_t g_slot_size, g_slab_bytes, g_slab_next;
+static void* g_slab_free;
+
+static void* map_bytes(void* hint, size_t n)
+{
+#if defined(_WIN32)
+    return VirtualAlloc(hint, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* p = mmap(hint, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+#endif
+}
+
+static void unmap_bytes(void* p, size_t n)
+{
+#if defined(_WIN32)
+    (void)n;
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
+    munmap(p, n);
+#endif
+}
+
+static int slab_fits(uintptr_t a, size_t n)
+{
+    uint64_t lo = (uint32_t)a;
+    return lo >= 0x10000000u && lo + n <= 0xFFFFFFFFull;
+}
+
+static void* slab_alloc(size_t n)
+{
+    if (!g_slab)
+    {
+        g_slot_size = (n + 63) & ~(size_t)63;
+        g_slab_bytes = g_slot_size * TEX_SLOTS;
+        uint8_t* p = (uint8_t*)map_bytes(NULL, g_slab_bytes);
+        for (int tries = 0; p && !slab_fits((uintptr_t)p, g_slab_bytes) && tries < 32; ++tries)
+        {
+            /* the same 4 GB, higher up (0x20000000 + a step each try) */
+            uintptr_t hint = ((uintptr_t)p & ~(uintptr_t)0xFFFFFFFFu) + 0x20000000u + (uintptr_t)tries * 0x04000000u;
+            unmap_bytes(p, g_slab_bytes);
+            p = (uint8_t*)map_bytes((void*)hint, g_slab_bytes);
+        }
+        if (!p || !slab_fits((uintptr_t)p, g_slab_bytes))
+        {
+            xi_log("d3d8 ffi: no memory for texture objects where their ids fit");
+            if (p)
+                unmap_bytes(p, g_slab_bytes);
+            return NULL;
+        }
+        g_slab = p;
+    }
+    if (n > g_slot_size)
+        return NULL;
+    void* p;
+    if (g_slab_free)
+    {
+        p = g_slab_free;
+        g_slab_free = *(void**)p;
+    }
+    else if (g_slab_next < TEX_SLOTS)
+        p = g_slab + g_slot_size * g_slab_next++;
+    else
+    {
+        xi_log_once("d3d8 texture slots", "d3d8 ffi: %u textures alive at once: no more", TEX_SLOTS);
+        return NULL;
+    }
+    memset(p, 0, g_slot_size);
+    return p;
+}
+
+static int in_slab(const void* p)
+{
+    return g_slab && (const uint8_t*)p >= g_slab && (const uint8_t*)p < g_slab + g_slab_bytes;
+}
+
 static void* obj_alloc(size_t n, int kind, int* id_out)
 {
-    void* reject[64];
-    int nrej = 0;
-    void* p = NULL;
-    for (;;)
-    {
-        p = calloc(1, n);
-        if (!p || kind != K_TEXTURE)
-            break;
-        uint32_t lo = (uint32_t)(uintptr_t)p;
-        if (lo >= 0x10000000u && !xi_gui_d3d_texture_exists(lo))
-            break;
-        if (nrej == 64)
-        {
-            free(p);
-            p = NULL;
-            break;
-        }
-        reject[nrej++] = p;
-    }
-    while (nrej)
-        free(reject[--nrej]);
+    void* p = kind == K_TEXTURE ? slab_alloc(n) : calloc(1, n);
     if (p)
     {
         Com* c = (Com*)p;
@@ -365,7 +430,13 @@ static void* obj_alloc(size_t n, int kind, int* id_out)
 static void obj_free(void* p)
 {
     ((Com*)p)->magic = 0;
-    free(p);
+    if (in_slab(p))
+    {
+        *(void**)p = g_slab_free;
+        g_slab_free = p;
+    }
+    else
+        free(p);
 }
 
 static HR com_qi(Com* self, const void* iid, void** out)
