@@ -818,6 +818,7 @@ static uint32_t make_vtbl(const char* iface, const char* const* names)
 
 static uint32_t g_xpacket[4];
 static XPad g_xlast[4];
+void (*dinput_xpad_hook)(uint32_t user, XPad* pad);
 static int g_xseen[4] = { -1, -1, -1, -1 }; /* connected at the last poll: -1 never polled */
 static int g_xinput_seen[4];
 
@@ -845,6 +846,8 @@ static void XI_GetState(Guest* g)
             memset(GUEST_PTR(out), 0, 16);
         RETC(ERROR_DEVICE_NOT_CONNECTED);
     }
+    if (dinput_xpad_hook)
+        dinput_xpad_hook(user, &x); /* the addon host: button events, and buttons it keeps from the game */
     if (memcmp(&x, &g_xlast[user], sizeof x))
         g_xlast[user] = x, g_xpacket[user]++;
     /* XINPUT_STATE: dwPacketNumber, then XINPUT_GAMEPAD {wButtons, bLeftTrigger, bRightTrigger,

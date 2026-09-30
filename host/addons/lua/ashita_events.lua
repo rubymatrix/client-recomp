@@ -312,20 +312,13 @@ local EVENTS = {
         end,
     },
     xinput_button = {
-        xi = 'frame',
-        run = function()
-            local pad = poll_pad()
-            local now = pad and pad.buttons or 0
-            local was = pad_buttons
-            pad_buttons = now
-            if now == was then return end
-            for b = 0, 15 do
-                local m = bit.lshift(1, b)
-                if bit.band(now, m) ~= bit.band(was, m) then
-                    each('xinput_button', true, nil,
-                        { button = b, state = bit.band(now, m) ~= 0 and 1 or 0, injected = false, blocked = false })
-                end
-            end
+        -- from the game's own XInput reads (keys.c): a press blocked here stays up for the game
+        xi = 'xinput_button',
+        run = function(xe)
+            if (xe.id or 0) ~= 0 then return end
+            local e = { button = xe.key, state = xe.down and 1 or 0, injected = false, blocked = xe.blocked or false }
+            each('xinput_button', true, nil, e)
+            if e.blocked then xe.blocked = true end
         end,
     },
     d3d_dp = { never = true },

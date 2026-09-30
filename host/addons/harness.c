@@ -14,6 +14,8 @@
  *   text_in <mode> <text>               a line the chat log is given
  *   key <dik> <0|1>                     a key event
  *   mouse <message> <x> <y> [delta]     a mouse event
+ *   xpad <buttons hex>                  pad 0 read by the game with these XInput buttons (prints what
+ *                                       the game gets)
  *   lua <addon> <code>                  runs code in an addon's state (prints what it returns)
  *   echo <text>                         prints the text */
 #include <ctype.h>
@@ -22,6 +24,7 @@
 #include <string.h>
 
 #include "addons.h"
+#include "dinput.h"
 #include "gthread.h"
 #include "host.h"
 #include "plat.h"
@@ -202,6 +205,17 @@ int addons_harness(const char* script)
             e.name = "mouse", e.msg = (int)msg;
             xi_raise(&e);
             printf("[harness] mouse %x%s\n", msg, e.blocked || e.handled ? " (blocked)" : "");
+        }
+        else if (!strcmp(cmd, "xpad"))
+        {
+            XPad x;
+            memset(&x, 0, sizeof x);
+            unsigned b = 0;
+            sscanf(p, "%x", &b);
+            x.buttons = (uint16_t)b;
+            if (dinput_xpad_hook)
+                dinput_xpad_hook(0, &x);
+            printf("[harness] xpad %04x -> game sees %04x\n", b, x.buttons);
         }
         else if (!strcmp(cmd, "lua"))
             run_lua(p);

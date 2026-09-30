@@ -16,6 +16,7 @@
 
 #include "addons.h"
 #include "d3d8.h"
+#include "dinput.h"
 #include "host.h"
 #include "input.h"
 #include "user32.h"
@@ -324,11 +325,40 @@ static int hook(const void* ev, int ww, int wh)
     }
 }
 
+/* XInput, as the game reads it (dinput_xpad_hook): each button change is an xinput_button event
+ * (key = the bit in wButtons, down); a press an addon blocks is kept from the game until released. */
+static void xpad(uint32_t user, XPad* pad)
+{
+    static uint16_t last[4], held[4];
+    if (user > 3)
+        return;
+    uint16_t now = pad->buttons, changed = (uint16_t)(now ^ last[user]);
+    for (unsigned b = 0; changed && b < 16; ++b)
+    {
+        uint16_t m = (uint16_t)(1u << b);
+        if (!(changed & m))
+            continue;
+        int down = (now & m) != 0;
+        XiEvent e;
+        memset(&e, 0, sizeof e);
+        e.name = "xinput_button";
+        e.key = b, e.down = down, e.id = user;
+        xi_raise(&e);
+        if (down && (e.blocked || e.handled))
+            held[user] |= m;
+        if (!down)
+            held[user] &= (uint16_t)~m;
+    }
+    last[user] = now;
+    pad->buttons &= (uint16_t)~held[user];
+}
+
 static void quit(void) { addons_shutdown(); }
 
 void xi_input_init(void)
 {
     user32_event_hook = hook;
     user32_quit_hook = quit;
+    dinput_xpad_hook = xpad;
     (void)name_of_dik;
 }
