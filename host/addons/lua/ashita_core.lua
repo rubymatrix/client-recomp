@@ -779,10 +779,13 @@ local memory_src = xi.embedded('ashita_memory')
 local MemoryManager = assert(loadstring(memory_src, '=[xi ashita_memory]'))(xi.game)
 -- a manager call on a missing member: loud like the rest
 setmetatable(MemoryManager, class('IMemoryManager', {}))
+-- members addons test for that Ashita doesn't have (its usertypes answer nil): nil here too
+local memory_nils = { IPlayer = { isZoning = true } }
 for name, iface in pairs(MemoryManager.interfaces) do
     if getmetatable(iface) == nil then
+        local nils = memory_nils[name] or {}
         setmetatable(iface, { __index = function(_, k)
-            if type(k) ~= 'string' or k:sub(1, 2) == '__' then return nil end
+            if type(k) ~= 'string' or k:sub(1, 2) == '__' or nils[k] then return nil end
             return util.unsupported(name .. '.' .. k, 2)
         end })
     end
