@@ -941,6 +941,7 @@ void addons_frame(void)
     if (g_shut)
         return;
     g_started = 1;
+    xi_patch_watch();
     xi_cmd_frame();
     xi_hooks_frame();
     for (unsigned i = 0; i < g_naddons; ++i)

@@ -104,6 +104,13 @@ size_t xi_packet_last(int outgoing, uint16_t id, uint8_t* out, size_t cap, uint6
 /* A plain buffer (0x1C header, packets) through the pipeline, as the packet hooks do (the harness). */
 size_t xi_packets_process(int outgoing, const uint8_t* buf, size_t size, uint8_t* out, size_t cap);
 
+/* --- code patches (patch.c) ------------------------------------------------------------------ */
+
+/* An addon is about to write n bytes at addr (xi.memory): reported if it is in the game's code. */
+void xi_code_patch(Addon* a, uint32_t addr, const uint8_t* bytes, uint32_t n);
+/* Every frame: finds code changed by other means (ffi stores). */
+void xi_patch_watch(void);
+
 /* --- commands (cmd.c) ------------------------------------------------------------------------ */
 
 /* A line from the command line (or injected): 1 if the host or an addon handled it (the game
