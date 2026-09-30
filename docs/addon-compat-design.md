@@ -1,7 +1,33 @@
 # Ashita and Windower addon support: design
 
-Status: draft, 2026-09-30. Input: Vekien's VanaCore write-up (how CatsEyeXI's client core runs
-Ashita v4 and Windower 4 addons and plugins without either present).
+Status: being built on branch feat/addons (2026-09-30). Input: Vekien's VanaCore write-up (how
+CatsEyeXI's client core runs Ashita v4 and Windower 4 addons and plugins without either present);
+the implementation is our own.
+
+Where things are:
+
+| Piece | Files |
+|---|---|
+| Recompiler wraps (section 4) | `recomp/recomp.py --wraps`, `meta/builds.json` "wraps", `runtime/runtime.h` rt_arg/rt_return |
+| Core: addons, states, events, errors, crash guard | `host/addons/core.c`, `host.h`, `addons.h` |
+| Game hooks: command line, chat log, packets | `host/addons/hooks.c` |
+| Commands, scripts, aliases | `host/addons/cmd.c` |
+| Input, binds | `host/addons/keys.c` (+ `user32_event_hook` in user32.c) |
+| Overlay: ImGui, text objects, primitives, textures | `host/addons/gui.cpp` (+ `d3d8_set_overlay`, `GfxDraw.scissor`) |
+| Ashita's ImGui manager for Lua | `host/addons/gui_lua.cpp`, `tools/gen_imgui_lua.py` |
+| Native `xi.*` | `host/addons/lua_xi.c` |
+| Runtime every state starts with | `host/addons/lua/xi.lua` |
+| Game data (Ashita's IMemoryManager) | `host/addons/game.c`, `game_lua.c`, `lua/ashita_memory.lua` |
+| DAT resources | `host/addons/res.c`, `res_lua.c` |
+| Ashita / Windower layers | `host/addons/lua/ashita*.lua`, `lua/windower*.lua` |
+| Headless test host | `host64 --addon-harness <script>` (`host/addons/harness.c`) |
+| Fetching the projects' libraries | `tools/addons_fetch.py` (run by `tools/setup.py`) |
+
+Decisions made while building, beyond the plan below: LuaJIT's ffi treats `long` as 32 bits and a
+single `L` literal suffix as a 32-bit long (Windows' LLP64), because every `ffi.cdef` addons carry
+is a Windows one (third_party/luajit/PATCHES.md); ImGui is the exact commit Ashita wraps (1.92.3
+WIP docking, a28cb615), since Ashita's imgui.lua hardcodes that build's enum values; Ashita's fonts
+(Agave, Font Awesome 6) are built into host64.
 
 ## 1. Goal and scope
 
@@ -146,14 +172,14 @@ wrap still holds the guest lock, but Lua must only be entered by one OS thread; 
 
 ### 6.2 Folders and kinds
 
-Under the data dir (`~/Library/Application Support/FFXIRecompile/FFXI/` on macOS):
+Under the data dir (`~/Library/Application Support/FFXIRecompile/FFXI/` on macOS), each kind has a
+root laid out exactly as that project's own install, so their path-building code works unchanged:
 
 ```
-addons/ashita/<name>/<name>.lua     addons/ashita/libs/...        (Ashita layout)
-addons/windower/<name>/<name>.lua   addons/windower/libs/, res/   (Windower layout, exactly)
-addons/native/<name>/<name>.lua     (our own xi.* API)
-config/                             (Ashita addon settings: config\addons\<addon>\<name>_<id>\)
-scripts/                            boot.txt and //exec scripts
+ashita/    addons/<name>/, addons/libs/, config/ (addon settings, pointers/offsets ini), resources/,
+           scripts/default.txt (run on the first frame)
+windower/  addons/<name>/, addons/libs/, res/*.lua, scripts/init.txt (run on the first frame)
+xi/        addons/<name>/ (our own xi.* API), scripts/boot.txt
 ```
 
 Kind detection as VanaCore does it (count `windower.` + `_addon.` against `ashita.` + `AshitaCore`
@@ -382,9 +408,11 @@ We own DirectInput, user32 and the SDL pump, so capture is simpler than on Windo
 
 The survey method is what makes "fully" measurable:
 
-- **Headless host**: `host64 --gfx null --replay <capture>` runs the real translated game with
-  `gfx_null.c`, feeds a recorded packet stream through the decrypt wrap (captured with a
-  `--record-packets` switch from real sessions on our servers), and fakes input.
+- **Headless host** (built): `host64 --addon-harness <script>` maps the game's image and runs its
+  DLLs' initialisation, then instead of starting the game runs a script of addon loads, commands,
+  packets, chat lines, keys, mouse events and frames with no window or GPU; chat goes to stdout.
+  `FFXI_ADDONS_LUA=<folder>` loads the layers' Lua from there instead of the copies built in.
+  Still to add: replaying packet captures recorded from real sessions.
 - **Corpus runner** (`tools/addon_survey.py`): for each addon, load it, run N seconds of replay,
   issue its documented commands, unload; collect Lua errors, `unsupported` hits, faults and code
   patches into one table. CI fails on regressions in the pass list.
@@ -434,7 +462,8 @@ Decided (2026-09-30):
    binding generator are written here, not taken from VanaCore. Vekien's write-up is a reference for
    behaviour and pitfalls only.
 2. **ImGui 1.92** with a 1.81 alias table; report interface 4.30.
-3. **Fetch** Ashita/Windower libs and Windower `Resources` at install time, pinned by commit.
+3. **Fetch** Ashita/Windower libs and Windower `Resources` at install time, pinned by commit
+   (`tools/addons_fetch.py`).
 
 Open:
 
