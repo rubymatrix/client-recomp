@@ -30,6 +30,7 @@
 #include <SDL3/SDL.h>
 
 #include "build.h"
+#include "host.h"
 
 #include "lauxlib.h"
 #include "lua.h"
@@ -431,8 +432,19 @@ static int l_pack(lua_State* L)
 
 /* --- clipboard, sound ------------------------------------------------------------------------- */
 
+/* Under --addon-harness nothing leaves the process: the clipboard is a string of our own and sounds
+ * are only logged. */
+static char* g_fake_clipboard;
+
 static int l_clipboard_get(lua_State* L)
 {
+    if (xi_headless)
+    {
+        if (!g_fake_clipboard)
+            return lua_pushnil(L), 1;
+        lua_pushstring(L, g_fake_clipboard);
+        return 1;
+    }
     if (!SDL_HasClipboardText())
         return lua_pushnil(L), 1;
     char* s = SDL_GetClipboardText();
@@ -445,6 +457,12 @@ static int l_clipboard_get(lua_State* L)
 
 static int l_clipboard_set(lua_State* L)
 {
+    if (xi_headless)
+    {
+        free(g_fake_clipboard);
+        g_fake_clipboard = strdup(luaL_checkstring(L, 1));
+        return lua_pushboolean(L, 1), 1;
+    }
     lua_pushboolean(L, SDL_SetClipboardText(luaL_checkstring(L, 1)));
     return 1;
 }
@@ -455,6 +473,11 @@ static SDL_AudioStream* g_sounds[16];
 static int l_play_sound(lua_State* L)
 {
     const char* path = luaL_checkstring(L, 1);
+    if (xi_headless)
+    {
+        xi_log("play_sound (harness: not played): %s", path);
+        return lua_pushboolean(L, 1), 1;
+    }
     if (!(SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO))
         return lua_pushboolean(L, 0), 1;
     int slot = -1;
