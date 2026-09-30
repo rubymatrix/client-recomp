@@ -256,10 +256,31 @@ because the recompiled C is what runs. Policy:
 
 ### 7.4 Win32 / D3D8 through `ffi.C`
 
-`ffi.C.GetModuleHandleA`, `ffi.C` D3D8 calls, `ffi.load('user32')` don't exist on macOS. Provide an
-`ffi.C` shim table for the functions the corpus uses (from our own user32/k32 shims where they
-exist), and a Lua `d3d8` library replacement (device info, textures loaded from files into overlay
-textures) sufficient for Ashita's ImGui addons that use it (12 of 34 in VanaCore's survey).
+Done natively, so Ashita's own `libs/d3d8` works unchanged (host/addons/d3d_ffi.c, d3d_image.c,
+win32_ffi.c, gdifont_ffi.c; test: tests/addons/d3d8_ffi.py):
+
+- **COM objects in host memory**, laid out as the ffi declarations expect (a vtable of host
+  functions first): one static IDirect3DDevice8 (`xi.d3d8_device()`, what
+  `AshitaCore:GetDirect3DDevice()` returns), IDirect3D8, textures, surfaces, vertex and index
+  buffers, ID3DXSprite, ID3DXFont. Methods nobody implements log once and return E_NOTIMPL.
+- **Draws** (sprites, DrawPrimitive[UP] with XYZ or XYZRHW FVFs, DrawText) are transformed and
+  near-clipped on the CPU and queued to the overlay in call order, after text objects and
+  primitives, before ImGui. Get* of transforms and render states read the game's device (d3d8.c)
+  unless an addon set its own this frame; Set* only affect the addons' draws.
+- **Texture ids**: a texture's gui id is the low 32 bits of its address (objects are placed so it
+  can't be a small ImGui id), so `tonumber(ffi.cast('uint32_t', tex))` handed to ImGui works.
+- **D3DX**: textures from files/memory (BMP, bare DIBs such as the item icons with FFXI's 0x80
+  alpha, DDS DXT1-5, PNG/JPEG/TGA via stb_image), image info, surfaces from memory/files/surfaces.
+- **ffi.C lookup**: dlsym(RTLD_DEFAULT) on POSIX, so the stand-ins are exported from host64
+  (`-export_dynamic`). On Windows LuaJIT looks in the exe's exports, then the CRT, kernel32,
+  user32, gdi32: D3DX and gdifonts are `__declspec(dllexport)`, Win32 is the real thing.
+- **Win32** (POSIX): keys, cursor, window position/size/style/topmost, focus, system metrics,
+  process/thread ids and affinity, timers, code pages (UTF-8, Shift-JIS, Latin-1), PlaySound (WAV
+  through SDL), ShellExecute of http(s) links, GetModuleHandleA (FFXiMain's base).
+- **gdifonts** (tHotBar, tCrossBar): its native renderer's exports draw text (stb_truetype) and
+  rounded rectangles into textures.
+- Not done: render targets other than the back buffer, cube/volume textures, shaders, lighting,
+  texture stage ops other than modulate.
 
 ## 8. Our core API: `xi.*`
 
