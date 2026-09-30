@@ -490,6 +490,16 @@ def install(app, where):
     raise Failure('Could not copy the app to %s.' % ' or '.join(targets))
 
 
+def fetch_addons():
+    """Ashita's and Windower's addons, libraries and resources into the data folder (the addon host
+    runs them; they aren't ours to ship). Not fatal: the game runs without them."""
+    note('Addons: fetching Ashita and Windower addons and libraries into %s' % user_path(DATA_DIR))
+    try:
+        run([sys.executable, os.path.join(HERE, 'addons_fetch.py'), '--data-dir', DATA_DIR])
+    except Exception as e:  # noqa: BLE001 - offline, or GitHub unreachable
+        note('Addons: not fetched (%s); run tools/addons_fetch.py later' % e)
+
+
 def main():
     ap = argparse.ArgumentParser(description='Set up FINAL FANTASY XI on this Mac.')
     ap.add_argument('--game', help='the FINAL FANTASY XI folder (found automatically when left out)')
@@ -505,6 +515,8 @@ def main():
     ap.add_argument('--settings-only', action='store_true',
                     help='ask the questions, print what the build would get, and stop (nothing built or saved)')
     ap.add_argument('--no-open', action='store_true', help='do not start the game, even with --open')
+    ap.add_argument('--no-addons', action='store_true',
+                    help="don't fetch Ashita's and Windower's addons and libraries (tools/addons_fetch.py)")
     a = ap.parse_args()
     if a.find:
         for c in candidates():
@@ -548,6 +560,8 @@ def main():
         step(8)
         dest = app if a.no_install else install(app, a.install_dir and user_path(a.install_dir))
         save_settings(settings)
+        if not a.no_addons:
+            fetch_addons()
     except Failure as e:
         print('\n  FAILED: %s' % e)
         return 1
