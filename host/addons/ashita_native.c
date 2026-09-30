@@ -7,6 +7,7 @@
  *       Returns 1-based inclusive positions; groups[1] is the whole match. Errors on a bad pattern.
  *   clipboard_get() -> string | nil          clipboard_set(text) -> boolean
  *   play_sound(path) -> boolean               a WAV file through SDL's default playback device
+ *   xpad(index) -> buttons, lt, rt, lx, ly, rx, ry | nil   an XInput pad as the game reads it
  *
  * Self-contained: nothing else in the host calls these. */
 #include <ctype.h>
@@ -18,6 +19,7 @@
 #include <SDL3/SDL.h>
 
 #include "host.h"
+#include "input.h"
 
 #include "lauxlib.h"
 #include "lua.h"
@@ -318,7 +320,24 @@ static int n_play_sound(lua_State* L)
     return 1;
 }
 
+static int n_xpad(lua_State* L)
+{
+    XPad x;
+    int i = (int)luaL_optnumber(L, 1, 0);
+    if (xi_headless || i < 0 || i > 3 || !input_xpad(i, &x))
+        return lua_pushnil(L), 1;
+    lua_pushnumber(L, x.buttons);
+    lua_pushnumber(L, x.lt);
+    lua_pushnumber(L, x.rt);
+    lua_pushnumber(L, x.lx);
+    lua_pushnumber(L, x.ly);
+    lua_pushnumber(L, x.rx);
+    lua_pushnumber(L, x.ry);
+    return 7;
+}
+
 static const luaL_Reg FNS[] = {
+    { "xpad", n_xpad },
     { "regex_find", n_regex_find },
     { "clipboard_get", n_clipboard_get },
     { "clipboard_set", n_clipboard_set },

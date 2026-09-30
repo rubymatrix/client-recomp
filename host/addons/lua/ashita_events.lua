@@ -22,8 +22,12 @@ Ashita event      xi event     what the callback gets
   d3d_present     present      (nil, nil, nil, nil)   inside the overlay's (ImGui's) frame
   d3d_endscene    postrender   (true)
   plugin_event    message      e: name, data, data_raw, size, blocked
-  d3d_dp, d3d_dip, xinput_button, xinput_state, dinput_button, dinput_state: accepted, never raised (no per-draw-call or
-      XInput hook here); the first registration logs "unsupported: <event>".
+  xinput_state    frame        e: state (XINPUT_STATE* of the first pad), injected, blocked
+  xinput_button   frame        e: button (bit number in wButtons), state (1 down, 0 up), injected, blocked
+                               (both polled from the pad the game reads; blocking doesn't hide
+                               anything from the game here)
+  d3d_dp, d3d_dip, dinput_button, dinput_state: accepted, never raised (no per-draw-call or
+      DirectInput-pad hook here); the first registration logs "unsupported: event <name>".
 
 Handlers of the input events run as coroutines, so a handler may coroutine.sleep (the rest runs
 from the task list). Errors in one handler are reported and the next still runs.
@@ -196,6 +200,25 @@ end
 
 local keystate = u8arr(256)
 
+-- The first XInput pad as the game reads it (XINPUT_STATE), polled once a frame.
+ffi.cdef[[ typedef struct { uint32_t dwPacketNumber; uint16_t wButtons; uint8_t bLeftTrigger, bRightTrigger;
+    int16_t sThumbLX, sThumbLY, sThumbRX, sThumbRY; } xi_xinput_state_t; ]]
+local pad_state = ffi.new('xi_xinput_state_t')
+local pad_ptr = ffi.cast('uint8_t*', pad_state)
+local pad_buttons, pad_packet = 0, 0
+local function poll_pad()
+    local buttons, lt, rt, lx, ly, rx, ry = xi.ashita_native.xpad(0)
+    if not buttons then return nil end
+    if buttons ~= pad_state.wButtons or lt ~= pad_state.bLeftTrigger or rt ~= pad_state.bRightTrigger or
+        lx ~= pad_state.sThumbLX or ly ~= pad_state.sThumbLY or rx ~= pad_state.sThumbRX or ry ~= pad_state.sThumbRY then
+        pad_packet = pad_packet + 1
+    end
+    pad_state.dwPacketNumber = pad_packet
+    pad_state.wButtons, pad_state.bLeftTrigger, pad_state.bRightTrigger = buttons, lt, rt
+    pad_state.sThumbLX, pad_state.sThumbLY, pad_state.sThumbRX, pad_state.sThumbRY = lx, ly, rx, ry
+    return { ptr = pad_ptr, buttons = buttons }
+end
+
 local EVENTS = {
     load = { xi = 'load', co = true, run = function() each('load', true) end },
     unload = { xi = 'unload', run = function() each('unload', false) end },
@@ -280,10 +303,33 @@ local EVENTS = {
             if e.blocked then xe.blocked = true end
         end,
     },
+    xinput_state = {
+        xi = 'frame',
+        run = function()
+            local pad = poll_pad()
+            if not pad then return end
+            each('xinput_state', false, nil, { state = pad.ptr, state_raw = pad.ptr, injected = false, blocked = false })
+        end,
+    },
+    xinput_button = {
+        xi = 'frame',
+        run = function()
+            local pad = poll_pad()
+            local now = pad and pad.buttons or 0
+            local was = pad_buttons
+            pad_buttons = now
+            if now == was then return end
+            for b = 0, 15 do
+                local m = bit.lshift(1, b)
+                if bit.band(now, m) ~= bit.band(was, m) then
+                    each('xinput_button', true, nil,
+                        { button = b, state = bit.band(now, m) ~= 0 and 1 or 0, injected = false, blocked = false })
+                end
+            end
+        end,
+    },
     d3d_dp = { never = true },
     d3d_dip = { never = true },
-    xinput_button = { never = true },
-    xinput_state = { never = true },
     dinput_button = { never = true },
     dinput_state = { never = true },
 }
