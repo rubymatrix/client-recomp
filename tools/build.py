@@ -189,6 +189,60 @@ SIGNIN_SCREEN = ['host\\signin.c', 'host\\sewave.c', 'host\\modern.c', 'host\\da
 HOST_LIBS = ['synchronization.lib', 'ws2_32.lib', 'advapi32.lib', 'bcrypt.lib', 'secur32.lib'] + GFX_LIBS
 
 
+# The addon host (host/addons/, docs/addon-compat-design.md): its C and C++ sources, the embedded Lua
+# (tools/embed_lua.py), and the vendored libraries it links: LuaJIT (its own msvcbuild.bat, in a copy of
+# its tree), Dear ImGui, LuaSocket (Winsock back end) and LuaFileSystem.
+ADDON_DIR = os.path.join(ROOT, 'host', 'addons')
+IMGUI = ['third_party\\imgui\\' + f for f in ('imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp',
+                                                'imgui_demo.cpp')] + ['third_party\\imgui\\misc\\cpp\\imgui_stdlib.cpp']
+LUASOCKET = ['third_party\\luasocket\\src\\' + f for f in ('luasocket.c', 'timeout.c', 'buffer.c', 'io.c', 'auxiliar.c',
+                                                              'compat.c', 'options.c', 'inet.c', 'except.c', 'select.c', 'tcp.c',
+                                                              'udp.c', 'wsocket.c', 'mime.c')]
+ADDON_INCLUDES = ['/I', 'host\\addons', '/I', 'third_party\\luajit\\src', '/I', 'third_party\\imgui', '/I',
+                  'third_party\\luasocket\\src', '/I', 'third_party\\lfs', '/DIMGUI_USER_CONFIG="imconfig_xi.h"',
+                  '/D_CRT_SECURE_NO_WARNINGS', '/DLUASOCKET_NODEBUG']
+
+
+def luajit(env, uwp):
+    """LuaJIT as a static library (with our parser patch, Lua 5.2 compatibility), built by its own
+    msvcbuild.bat in a copy of third_party/luajit. The UWP app's has the dynamic CRT and no JIT: a
+    packaged app without the codeGeneration capability may not make executable memory."""
+    work = os.path.join(ROOT, 'build', 'third_party', 'luajit-uwp' if uwp else 'luajit-win')
+    lib = os.path.join(work, 'src', 'lua51.lib')
+    src_tree = os.path.join(ROOT, 'third_party', 'luajit')
+    newest = max(os.path.getmtime(os.path.join(d, f)) for d, _, fs in os.walk(src_tree) for f in fs)
+    if os.path.exists(lib) and os.path.getmtime(lib) >= newest:
+        return lib
+    if os.path.exists(work):
+        shutil.rmtree(work)
+    shutil.copytree(src_tree, work)
+    bat = os.path.join(work, 'src', 'msvcbuild.bat')
+    text = open(bat).read()
+    extra = ' /MD /DLUAJIT_DISABLE_JIT' if uwp else ' /MT'
+    text = text.replace('@set LJCOMPILE=cl /nologo /c /O2 /W3', '@set LJCOMPILE=cl /nologo /c /O2 /W3' + extra, 1)
+    open(bat, 'w').write(text)
+    print('> msvcbuild.bat lua52compat static (%s)' % ('uwp' if uwp else 'win'))
+    subprocess.check_call(['cmd', '/c', 'msvcbuild.bat', 'lua52compat', 'static'], cwd=os.path.join(work, 'src'), env=env)
+    return lib
+
+
+def addon_objects(env, cflags, objdir, uwp=False):
+    """The addon host's objects and LuaJIT's library, compiled with the host's C flags (C++: the same
+    runtime, C++17)."""
+    run([sys.executable, 'tools/embed_lua.py'])
+    names = sorted(os.listdir(ADDON_DIR))
+    c = ['host\\addons\\' + f for f in names if f.endswith('.c')] + ['generated\\addons_lua.c']
+    cpp = ['host\\addons\\' + f for f in names if f.endswith('.cpp')]
+    sdl_inc = ['/I', os.path.join(SDL3, 'include')]
+    cxx = [f for f in cflags if f != '/std:c11'] + ['/std:c++17', '/EHsc', '/Zc:__cplusplus']
+    objs = compile_stale(env, c, objdir + '\\addons', ADDON_INCLUDES + sdl_inc + HOST_INCLUDES + ['/I', 'runtime\\portable'], cflags)
+    objs += compile_stale(env, cpp, objdir + '\\addons_cpp', ADDON_INCLUDES + sdl_inc + HOST_INCLUDES + ['/I', 'runtime\\portable'], cxx)
+    objs += compile_stale(env, IMGUI, objdir + '\\imgui', ADDON_INCLUDES, cxx)
+    objs += compile_stale(env, LUASOCKET, objdir + '\\luasocket', ADDON_INCLUDES, cflags)
+    objs += compile_stale(env, ['third_party\\lfs\\lfs.c'], objdir + '\\lfs', ADDON_INCLUDES, cflags)
+    return objs + [luajit(env, uwp)]
+
+
 def sdl3():
     """SDL3's include flags and import library."""
     if not os.path.exists(os.path.join(SDL3, 'include', 'SDL3', 'SDL.h')):
@@ -218,6 +272,7 @@ def host64(env):
     objs = game_objects(env)
     sdl_inc, sdl_lib = sdl3()
     objs += compile_stale(env, PORTABLE + HOST_SOURCES, 'build\\host64', sdl_inc + HOST_INCLUDES, CFLAGS64)
+    objs += addon_objects(env, CFLAGS64, 'build\\host64')
     run(['link', '/nologo', '/OUT:build\\host64.exe', '/MACHINE:X64', sdl_lib] + HOST_LIBS + objs, env)
     shutil.copy(os.path.join(SDL3, 'lib', 'x64', 'SDL3.dll'), os.path.join(ROOT, 'build'))
     print('built build\\host64.exe; run: build\\host64.exe --game "%s" ...' % BUILD['game'])
@@ -253,6 +308,7 @@ def uwp_lib(env):
     # the app signs in itself (its own login screen): no sign-in screen
     host = [s for s in HOST_SOURCES if s not in SIGNIN_SCREEN] + ['host\\signin_none.c', 'runtime\\portable\\sdl_uwp.c']
     objs += compile_stale(env, PORTABLE + host, 'build\\uwp\\host', sdl_inc + ['/Dmain=host_main'], UWP_CFLAGS)
+    objs += addon_objects(env, UWP_CFLAGS, 'build\\uwp', uwp=True)
     run(['lib', '/nologo', '/OUT:build\\uwp\\ffxi_uwp.lib'] + objs, env)
     print('built build\\uwp\\ffxi_uwp.lib')
 

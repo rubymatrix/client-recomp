@@ -171,8 +171,21 @@ static SRWLOCK g_mlock = SRWLOCK_INIT;
 static float g_mx, g_my;
 static SDL_MouseButtonFlags g_mbuttons;
 
+static bool g_keystate[SDL_SCANCODE_COUNT];
+
+const bool* SDL_GetKeyboardState(int* numkeys)
+{
+    if (numkeys)
+        *numkeys = SDL_SCANCODE_COUNT;
+    return g_keystate;
+}
+
+bool SDL_OpenURL(const char* url) { (void)url; return false; } /* no browser from the game on the console */
+
 void uwp_key(int scancode, int down, int repeat)
 {
+    if (scancode >= 0 && scancode < SDL_SCANCODE_COUNT)
+        g_keystate[scancode] = down != 0;
     SDL_Event e;
     memset(&e, 0, sizeof e);
     e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
@@ -259,6 +272,23 @@ void uwp_close(void)
     e.type = SDL_EVENT_WINDOW_CLOSE_REQUESTED;
     e.window.windowID = WINDOW_ID;
     push(&e);
+}
+
+SDL_Keymod SDL_GetModState(void)
+{
+    /* the addon host's binds and ImGui: from the keys the app has passed in */
+    SDL_Keymod m = 0;
+    const bool* k = SDL_GetKeyboardState(NULL);
+    if (k)
+    {
+        if (k[SDL_SCANCODE_LCTRL] || k[SDL_SCANCODE_RCTRL])
+            m |= SDL_KMOD_CTRL;
+        if (k[SDL_SCANCODE_LSHIFT] || k[SDL_SCANCODE_RSHIFT])
+            m |= SDL_KMOD_SHIFT;
+        if (k[SDL_SCANCODE_LALT] || k[SDL_SCANCODE_RALT])
+            m |= SDL_KMOD_ALT;
+    }
+    return m;
 }
 
 SDL_MouseButtonFlags SDL_GetMouseState(float* x, float* y)

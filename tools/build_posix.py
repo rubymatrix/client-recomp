@@ -191,7 +191,7 @@ def addons():
         thirdparty.build(name)
         cflags += thirdparty.flags(name)
         libs += thirdparty.libs(name)
-    return cflags, libs + ['-lc++'] + (['-liconv'] if sys.platform == 'darwin' else [])
+    return cflags, libs + ['-lc++']
 
 
 def host64(game):

@@ -33,7 +33,9 @@
 #include "lua.h"
 #include "lualib.h"
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -416,8 +418,10 @@ static int guarded_pcall(Addon* a, lua_State* L, int nargs, int nres, int errfun
     {
         r = lua_pcall(L, nargs, nres, errfunc);
     }
-    __except (GetExceptionCode() == 0xE24C4A02 /* LuaJIT's own error */ ? EXCEPTION_CONTINUE_SEARCH
-                                                                         : EXCEPTION_EXECUTE_HANDLER)
+    __except ((GetExceptionCode() & 0xFFFFFF00u) == 0xE24C4A00u /* LuaJIT's own errors (lj_err.c) */ ||
+                      GetExceptionCode() == 0xE06D7363u /* C++ */
+                  ? EXCEPTION_CONTINUE_SEARCH
+                  : EXCEPTION_EXECUTE_HANDLER)
     {
         a->dead = 1;
         xi_log("%s: native fault %08x: the addon is stopped", a->name, GetExceptionCode());

@@ -15,6 +15,12 @@
 #include "guest.h"
 #include "runtime.h"
 
+#if defined(_MSC_VER)
+#include <string.h>
+#define strcasecmp _stricmp
+#define strncasecmp _strnicmp
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

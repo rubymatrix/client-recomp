@@ -23,14 +23,16 @@
 #include "gthread.h"
 #include "gwin.h"
 #include "host.h"
+#include "res.h"
 #include "plat.h"
 
 #include "lauxlib.h"
 #include "lua.h"
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <dirent.h>
-#include <iconv.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -706,6 +708,23 @@ static int f_list(lua_State* L)
         lua_rawseti(L, -2, ++n);
     }
     closedir(d);
+#else
+    char pattern[1300];
+    snprintf(pattern, sizeof pattern, "%s\\*", out);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return 1;
+    do
+    {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+            continue;
+        if (lua_gettop(L) >= 2 && !lua_isnil(L, 2) && dirs != !!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            continue;
+        lua_pushstring(L, fd.cFileName);
+        lua_rawseti(L, -2, ++n);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
 #endif
     return 1;
 }
@@ -753,38 +772,101 @@ static int x_open_url(lua_State* L)
     return 1;
 }
 
-static int convert(lua_State* L, const char* from, const char* to)
+/* Shift-JIS (FFXI's text, with its colour and auto-translate codes) and UTF-8, through the resource
+ * reader's CP932 table (res.c): no iconv, so every host converts the same way. */
+static int x_sjis_to_utf8(lua_State* L)
 {
     size_t n;
     const char* s = luaL_checklstring(L, 1, &n);
-#if !defined(_WIN32)
-    iconv_t cd = iconv_open(to, from);
-    if (cd == (iconv_t)-1)
-        return lua_pushlstring(L, s, n), 1;
-    size_t cap = n * 4 + 16, left = cap, in_left = n;
+    int flags = (int)luaL_optnumber(L, 2, RES_UTF8_KEEP_CODES);
+    size_t cap = n * 3 + 16;
     char* out = (char*)malloc(cap);
-    char *o = out, *i = (char*)s;
-    while (in_left)
+    size_t w = res_utf8(s, n, out, cap, flags);
+    if (w >= cap) /* auto-translate phrases grow more than three times */
     {
-        if (iconv(cd, &i, &in_left, &o, &left) == (size_t)-1)
-        {
-            if (errno == E2BIG || !left)
-                break;
-            /* a byte that doesn't convert (FFXI's colour and auto-translate codes): as it is */
-            *o++ = *i++, left--, in_left--;
-        }
+        free(out);
+        cap = w + 1;
+        out = (char*)malloc(cap);
+        w = res_utf8(s, n, out, cap, flags);
     }
-    iconv_close(cd);
-    lua_pushlstring(L, out, (size_t)(o - out));
+    lua_pushlstring(L, out, w < cap ? w : cap - 1);
     free(out);
-#else
-    lua_pushlstring(L, s, n);
-#endif
     return 1;
 }
 
-static int x_sjis_to_utf8(lua_State* L) { return convert(L, "SHIFT_JIS", "UTF-8"); }
-static int x_utf8_to_sjis(lua_State* L) { return convert(L, "UTF-8", "SHIFT_JIS"); }
+typedef struct Rev
+{
+    uint32_t cp;
+    uint16_t sjis;
+} Rev;
+static Rev* g_rev;
+static size_t g_nrev;
+
+static int rev_cmp(const void* a, const void* b)
+{
+    uint32_t x = ((const Rev*)a)->cp, y = ((const Rev*)b)->cp;
+    return x < y ? -1 : x > y;
+}
+
+static void build_rev(void)
+{
+    if (g_rev)
+        return;
+    g_rev = (Rev*)malloc(sizeof(Rev) * 64 * 190);
+    for (unsigned lead = 0x81; lead <= 0xFC; ++lead)
+    {
+        if (lead > 0x9F && lead < 0xE0)
+            continue;
+        for (unsigned trail = 0x40; trail <= 0xFC; ++trail)
+        {
+            uint32_t cp = res_sjis_char((uint8_t)lead, (uint8_t)trail);
+            if (cp && cp != 0xFFFD && g_nrev < 64 * 190)
+                g_rev[g_nrev++] = (Rev){ cp, (uint16_t)(lead << 8 | trail) };
+        }
+    }
+    qsort(g_rev, g_nrev, sizeof *g_rev, rev_cmp);
+}
+
+static int x_utf8_to_sjis(lua_State* L)
+{
+    size_t n;
+    const unsigned char* s = (const unsigned char*)luaL_checklstring(L, 1, &n);
+    build_rev();
+    luaL_Buffer b;
+    luaL_buffinit(L, &b);
+    for (size_t i = 0; i < n;)
+    {
+        uint32_t c = s[i];
+        size_t k = c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        if (k > 1 && i + k <= n)
+        {
+            c &= 0xFF >> (k + 1);
+            for (size_t j = 1; j < k; ++j)
+                c = (c << 6) | (s[i + j] & 0x3F);
+        }
+        else
+            k = 1;
+        i += k;
+        if (c < 0x80)
+            luaL_addchar(&b, (char)c);
+        else if (c >= 0xFF61 && c <= 0xFF9F) /* half-width katakana: one byte */
+            luaL_addchar(&b, (char)(c - 0xFF61 + 0xA1));
+        else
+        {
+            Rev key = { c, 0 };
+            const Rev* r = (const Rev*)bsearch(&key, g_rev, g_nrev, sizeof *g_rev, rev_cmp);
+            if (r)
+            {
+                luaL_addchar(&b, (char)(r->sjis >> 8));
+                luaL_addchar(&b, (char)(r->sjis & 0xFF));
+            }
+            else
+                luaL_addchar(&b, '?');
+        }
+    }
+    luaL_pushresult(&b);
+    return 1;
+}
 
 /* embedded(name): the source of host/addons/lua/<name>.lua, or nil */
 static int x_embedded(lua_State* L)
