@@ -569,7 +569,7 @@ XI_FFI int32_t MessageBoxA(void* hwnd, const char* text, const char* caption, ui
 XI_FFI void* ShellExecuteA(void* hwnd, const char* op, const char* file, const char* params, const char* dir, int32_t show)
 {
     (void)hwnd, (void)op, (void)params, (void)dir, (void)show;
-    if (file && (!strncmp(file, "http://", 7) || !strncmp(file, "https://", 8)) && SDL_OpenURL(file))
+    if (file && (!strncmp(file, "http://", 7) || !strncmp(file, "https://", 8)) && xi_open_url(file))
         return (void*)(uintptr_t)42;
     xi_log("ShellExecute %s: refused (only http(s) links open)", file ? file : "(null)");
     return (void*)(uintptr_t)5; /* SE_ERR_ACCESSDENIED */

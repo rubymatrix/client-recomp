@@ -40,6 +40,8 @@ typedef struct Addon
 
 /* --addon-harness: no game running (chat lines to stdout, commands routed directly, no GPU). */
 extern int xi_headless;
+/* A web page in the player's browser (never from the harness). */
+int xi_open_url(const char* url);
 
 /* --- registry (core.c) ----------------------------------------------------------------------- */
 

@@ -299,6 +299,100 @@ static int m_module(lua_State* L)
     return 2;
 }
 
+/* call(fn, conv, sig, ...): a function of the game's (recompiled) called from Lua, as an ffi.cast of
+ * its address to a function pointer type would call it on Windows (xi.lua builds the calls from the
+ * addons' typedefs). conv: 'c' cdecl, 's' stdcall, 't' thiscall (the first argument in ecx), 'f'
+ * fastcall (the first two in ecx and edx). sig: the result's kind, ':', each argument's kind -
+ * 'i' 32 bits (numbers, booleans, pointers: host or guest addresses, cdata; strings are copied into
+ * guest memory for the call), 'f' float, 'd' double; results also 'v' void, 'u' unsigned, 'b' bool,
+ * 'c'/'C' 8-bit, 'h'/'H' 16-bit, 'l' 64-bit, 'p' a pointer (the host address), 'F' float/double. */
+static int m_call(lua_State* L)
+{
+    uint32_t fn = arg_addr(L, 1);
+    const char* conv = luaL_checkstring(L, 2);
+    const char* sig = luaL_checkstring(L, 3);
+    char ret = sig[0];
+    const char* kinds = strchr(sig, ':') ? strchr(sig, ':') + 1 : "";
+    uint32_t words[32], temps[16];
+    unsigned nw = 0, nt = 0;
+    int nargs = lua_gettop(L) - 3;
+    for (int i = 0; i < nargs && nw < 30; ++i)
+    {
+        int at = 4 + i;
+        char k = kinds[i] ? kinds[i] : 'i';
+        if (k == 'f' || k == 'd')
+        {
+            double d = lua_tonumber(L, at);
+            if (k == 'f')
+            {
+                float f = (float)d;
+                memcpy(&words[nw++], &f, 4);
+            }
+            else
+            {
+                uint64_t u;
+                memcpy(&u, &d, 8);
+                words[nw++] = (uint32_t)u, words[nw++] = (uint32_t)(u >> 32);
+            }
+            continue;
+        }
+        switch (lua_type(L, at))
+        {
+        case LUA_TBOOLEAN: words[nw++] = (uint32_t)lua_toboolean(L, at); break;
+        case LUA_TSTRING:
+        {
+            size_t n;
+            const char* str = lua_tolstring(L, at, &n);
+            uint32_t g = gheap_alloc((uint32_t)n + 1, 1);
+            if (g)
+                memcpy(GUEST_PTR(g), str, n);
+            if (nt < 16)
+                temps[nt++] = g;
+            words[nw++] = g;
+            break;
+        }
+        case LUA_TNUMBER:
+        {
+            double v = lua_tonumber(L, at);
+            int ok;
+            uint32_t g = xi_guest_addr(v, &ok);
+            words[nw++] = ok ? g : (uint32_t)(int64_t)v; /* a host address in the window: its guest address */
+            break;
+        }
+        case LUA_TNIL:
+        case LUA_TNONE: words[nw++] = 0; break;
+        default: words[nw++] = arg_addr(L, at); break; /* cdata pointers */
+        }
+    }
+    int regs = conv[0] == 't' ? 1 : conv[0] == 'f' ? 2 : 0;
+    uint32_t ecx = 0, edx = 0;
+    unsigned skip = 0;
+    if (regs >= 1 && nw > 0)
+        ecx = words[0], skip = 1;
+    if (regs >= 2 && nw > 1)
+        edx = words[1], skip = 2;
+    uint32_t hi = 0;
+    double st0 = 0;
+    uint32_t eax = guest_call_full(fn, regs, ecx, edx, nw - skip, words + skip, &hi, &st0);
+    for (unsigned i = 0; i < nt; ++i)
+        if (temps[i])
+            gheap_free(temps[i]);
+    switch (ret)
+    {
+    case 'v': return 0;
+    case 'b': lua_pushboolean(L, (eax & 0xFF) != 0); return 1;
+    case 'c': lua_pushnumber(L, (int8_t)eax); return 1;
+    case 'C': lua_pushnumber(L, (uint8_t)eax); return 1;
+    case 'h': lua_pushnumber(L, (int16_t)eax); return 1;
+    case 'H': lua_pushnumber(L, (uint16_t)eax); return 1;
+    case 'u': lua_pushnumber(L, eax); return 1;
+    case 'l': lua_pushnumber(L, (double)(int64_t)((uint64_t)hi << 32 | eax)); return 1;
+    case 'p': push_addr(L, eax); return 1;
+    case 'F': lua_pushnumber(L, st0); return 1;
+    default: lua_pushnumber(L, (int32_t)eax); return 1;
+    }
+}
+
 static int m_guest(lua_State* L)
 {
     lua_pushnumber(L, arg_addr(L, 1));
@@ -327,7 +421,7 @@ static const luaL_Reg MEMORY[] = {
     { "write_uint32", m_write_uint32 }, { "write_int64", m_write_int64 }, { "write_uint64", m_write_uint64 },
     { "write_float", m_write_float }, { "write_double", m_write_double }, { "write_string", m_write_string },
     { "write_array", m_write_array }, { "alloc", m_alloc }, { "free", m_free }, { "protect", m_protect },
-    { "unprotect", m_protect }, { "module", m_module }, { "guest", m_guest }, { "host", m_host }, { "base", m_base },
+    { "unprotect", m_protect }, { "module", m_module }, { "guest", m_guest }, { "host", m_host }, { "base", m_base }, { "call", m_call },
     { NULL, NULL },
 };
 
@@ -767,9 +861,21 @@ static int x_time(lua_State* L)
     return 1;
 }
 
+/* A web page in the player's browser, as an addon asks. Never from the harness: surveys run every
+ * addon's commands, and a wiki link would open the browser each time. */
+int xi_open_url(const char* url)
+{
+    if (xi_headless)
+    {
+        xi_log("open_url %s: not opened (harness)", url);
+        return 1;
+    }
+    return SDL_OpenURL(url);
+}
+
 static int x_open_url(lua_State* L)
 {
-    lua_pushboolean(L, SDL_OpenURL(luaL_checkstring(L, 1)));
+    lua_pushboolean(L, xi_open_url(luaL_checkstring(L, 1)));
     return 1;
 }
 
