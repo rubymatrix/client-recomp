@@ -203,7 +203,8 @@ do
     ffi.C = proxyC
     local load = ffi.load
     local windows = { kernel32 = true, user32 = true, gdi32 = true, winmm = true, shell32 = true, advapi32 = true,
-                      d3d8 = true, d3dx8 = true, d3dx9 = true, msvcrt = true, ntdll = true, psapi = true, ole32 = true }
+                      d3d8 = true, d3dx8 = true, d3dx9 = true, msvcrt = true, ntdll = true, psapi = true, ole32 = true,
+                      gdifonttexture = true }  -- gdifonts' renderer (tHotBar, tCrossBar): the host's own
     ffi.load = function(name, global)
         local short = tostring(name):lower():gsub('%.dll$', ''):gsub('^.*[/\\]', '')
         if windows[short] then return proxyC end
