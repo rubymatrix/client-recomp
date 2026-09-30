@@ -343,6 +343,13 @@ def carry(old_label, new_label, write, only=None):
         put('hook', k, a, b, how)
         if b:
             entry['hooks'][k] = '0x%08x' % b
+    for group, spots in old_entry.get('patches', {}).items():  # addons' code patches: code sites
+        for addr, hexbytes in spots.items():
+            a = int(addr, 16)
+            b, how = map_code(main_old, main_new, a)
+            put('patch', group, a, b, how)
+            if b:
+                entry.setdefault('patches', {}).setdefault(group, {})['0x%08x' % b] = hexbytes
     for k, v in old_entry.get('wraps', {}).items():  # host-replaceable functions: function entries
         a = int(v, 16)
         b, how = map_code(main_old, main_new, a)
