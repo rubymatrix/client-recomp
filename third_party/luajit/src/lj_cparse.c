@@ -1591,7 +1591,10 @@ end_decl:
       sz = 8;
     } else if ((cds & CDF_LONG)) {
       info |= CTF_LONG;
-      sz = sizeof(long);
+      /* FFXIRecompile (Windows long): long is 32 bits, as on Windows (LLP64),
+      ** where every ffi.cdef the addons carry was written (DWORD, LONG, RECT,
+      ** D3DCOLOR are longs there); LP64's 8-byte long broke their layouts. */
+      sz = 4;
     } else if (!sz) {
       if (!(cds & (CDF_SIGNED|CDF_UNSIGNED)))
 	cp_errmsg(cp, cp->tok, LJ_ERR_FFI_DECLSPEC);

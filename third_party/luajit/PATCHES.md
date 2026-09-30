@@ -44,3 +44,11 @@ Ashita's libs (win32types.lua) declare constants like `0x8000FFFFL` in `ffi.cdef
 for Windows, where `long` is 32 bits; on a 64-bit POSIX host LuaJIT made `L` a 64-bit integer, which
 the C parser then rejected as malformed. A single `L` now means a 32-bit long, as on Windows; `LL`
 is unchanged.
+
+## ffi: `long` is 32 bits (lj_cparse.c)
+
+Ashita's libs/win32types.lua declares `typedef unsigned long DWORD`, `typedef long LONG` and the
+Windows structures on top (RECT, POINT, D3DCOLOR, D3DSURFACE_DESC...). On an LP64 host `long` was 8
+bytes and every such layout was wrong. `long` in ffi declarations is now 4 bytes, as on Windows
+(LLP64); `long long` stays 8. Native functions the host exposes to ffi.C take 32-bit integers where
+Win32 has LONG/DWORD.
