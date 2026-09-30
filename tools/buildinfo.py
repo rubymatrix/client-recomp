@@ -62,6 +62,7 @@ def current(required=True):
         'addresses': b['addresses'],
         'hooks': b.get('hooks', {}),
         'wraps': b.get('wraps', {}),
+        'patches': b.get('patches', {}),
         'crt': b['crt'],
         'modern': b.get('modern', {}),
         'modern_keys': sorted({k for other in known().values() for k in other.get('modern', {})}),
