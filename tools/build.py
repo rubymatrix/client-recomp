@@ -280,6 +280,11 @@ def host64(env):
     sdl_inc, sdl_lib = sdl3()
     objs += compile_stale(env, PORTABLE + HOST_SOURCES, 'build\\host64', sdl_inc + HOST_INCLUDES, CFLAGS64)
     objs += addon_objects(env, CFLAGS64, 'build\\host64')
+    # Addons' ffi.C looks in the exe's own exports first, then the CRT, kernel32, user32 and gdi32: the
+    # D3DX and gdifonts stand-ins (host/addons/d3d_ffi.c, gdifont_ffi.c) are __declspec(dllexport), so
+    # host64.exe exports them (link also writes an import .lib/.exp nobody needs). Win32 functions are the
+    # real ones (win32_ffi.c is empty on Windows); ones in other DLLs (winmm's PlaySound, shell32) need
+    # xi.lua to ffi.load the real DLL there rather than map it to ffi.C.
     run(['link', '/nologo', '/OUT:build\\host64.exe', '/MACHINE:X64', sdl_lib] + HOST_LIBS + objs, env)
     shutil.copy(os.path.join(SDL3, 'lib', 'x64', 'SDL3.dll'), os.path.join(ROOT, 'build'))
     print('built build\\host64.exe; run: build\\host64.exe --game "%s" ...' % BUILD['game'])
