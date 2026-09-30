@@ -78,6 +78,7 @@ static uint32_t guest_scratch(int which, uint32_t size)
 /* --- the command line ------------------------------------------------------------------------ */
 
 static int g_injecting; /* the line parse_input sees is one the host runs (queued commands) */
+static int g_raw;       /* ... and one that already went through the host and addons: straight to the game */
 
 #if defined(FFXI_WRAP_PARSE_INPUT)
 static void wrap_parse_input(Guest* g)
@@ -88,6 +89,12 @@ static void wrap_parse_input(Guest* g)
     guest_str(text, line, sizeof line);
     int injected = g_injecting;
     g_injecting = 0;
+    if (g_raw)
+    {
+        g_raw = 0;
+        rt_orig_parse_input(g);
+        return;
+    }
     if (!strncmp(line, "/shutdown", 9) || !strncmp(line, "/logout", 7))
     {
         /* the game is going: addons save their settings in unload */
@@ -109,7 +116,7 @@ static void wrap_parse_input(Guest* g)
 typedef struct Queued
 {
     int mode;
-    int command; /* a line to run, not one to write */
+    int command; /* a line to run (1; 2: for the game alone, routed already), not one to write */
     char* text;
     struct Queued* next;
 } Queued;
@@ -159,6 +166,7 @@ void xi_chat_write(int mode, const char* text)
 }
 
 void xi_chat_queue(int mode, const char* line) { enqueue(mode, line, 1); }
+void xi_chat_queue_game(int mode, const char* line) { enqueue(mode, line, 2); }
 
 static uint32_t g_write_line_fn, g_chatlog_global;
 
@@ -219,11 +227,11 @@ static void game_write(int mode, const char* text)
 #endif
 }
 
-static void game_run(int mode, const char* line)
+static void game_run(int mode, const char* line, int raw)
 {
     if (xi_headless)
     {
-        if (!xi_command(line, mode, 1))
+        if (raw || !xi_command(line, mode, 1))
             printf("[game] %s\n", line);
         fflush(stdout);
         return;
@@ -232,12 +240,15 @@ static void game_run(int mode, const char* line)
     uint32_t s = gheap_strdup(line);
     uint32_t args[2] = { s, (uint32_t)mode };
     g_injecting = 1;
+    g_raw = raw;
     guest_call(FFXI_WRAP_PARSE_INPUT, 2, args);
     g_injecting = 0;
+    g_raw = 0;
     gheap_free(s);
 #else
     (void)mode;
-    xi_command(line, 1, 1);
+    if (!raw)
+        xi_command(line, 1, 1);
 #endif
 }
 
@@ -596,7 +607,7 @@ void xi_hooks_frame(void)
             }
         }
         if (q->command)
-            game_run(q->mode, q->text);
+            game_run(q->mode, q->text, q->command == 2);
         else
             game_write(q->mode, q->text);
         free(q->text);

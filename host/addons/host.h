@@ -87,6 +87,10 @@ void xi_raise_kind(XiEvent* e, int kind);
 
 /* --- hooks and chat (hooks.c) ---------------------------------------------------------------- */
 
+/* A line for the game alone, next frame: it already went through the host's commands and the addons
+ * (a line text_out changed, an alias nobody handled). */
+void xi_chat_queue_game(int mode, const char* line);
+
 void xi_hooks_init(void);
 void xi_hooks_frame(void);            /* chat lines and commands queued for the game */
 /* The chat input line: text, open state. */
