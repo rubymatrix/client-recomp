@@ -7,6 +7,8 @@
 [chat 1] two: 00180048 vs 00180048
 [chat 1] fopen mapped: true
 [chat 1] ffi.load winmm -> true
+[chat 1] recast: true
+[chat 1] chain + 1: 00000004
 [chat 1] coretest loaded, build 2026-09-03
 [chat 207] addon: loaded coretest (xi)
 [addons] coretest left ImGui unbalanced (windows 1, ids 0, style vars 0, colours 0): closed
