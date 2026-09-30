@@ -108,6 +108,8 @@ static int m_find(lua_State* L)
         if (lua_isnumber(L, 2) && lua_tonumber(L, 2) > 0)
             size = (uint32_t)lua_tonumber(L, 2);
     }
+    else if (lua_isnumber(L, 1) && lua_tonumber(L, 1) == 0 && lua_tonumber(L, 2) == 0)
+        xi_image(NULL, NULL, &start, &size); /* Ashita's find(0, 0, ...): FFXiMain */
     else
     {
         start = arg_addr(L, 1);
