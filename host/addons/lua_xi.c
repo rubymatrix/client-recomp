@@ -780,6 +780,7 @@ static int f_list(lua_State* L)
     char out[1200];
     xi_host_path(luaL_checkstring(L, 1), out, sizeof out);
     int dirs = lua_toboolean(L, 2);
+    int filter = lua_gettop(L) >= 2 && !lua_isnil(L, 2); /* before the result goes on the stack */
     lua_newtable(L);
     int n = 0;
 #if !defined(_WIN32)
@@ -791,7 +792,7 @@ static int f_list(lua_State* L)
     {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
             continue;
-        if (dirs >= 0 && lua_gettop(L) >= 2 && !lua_isnil(L, 2))
+        if (filter)
         {
             char full[1500];
             struct stat st;
@@ -815,7 +816,7 @@ static int f_list(lua_State* L)
     {
         if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
             continue;
-        if (lua_gettop(L) >= 2 && !lua_isnil(L, 2) && dirs != !!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        if (filter && dirs != !!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
             continue;
         lua_pushstring(L, fd.cFileName);
         lua_rawseti(L, -2, ++n);

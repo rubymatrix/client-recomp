@@ -507,6 +507,24 @@ static int packets_wanted(int outgoing)
     return xi_addon_count() || g_inject[outgoing];
 }
 
+/* With no addon to see them, packets still leave their last copy per id: an addon loaded later
+ * (after login) starts from them (xi.packets.last; Windower's last_incoming). */
+static void record_last(int outgoing, const uint8_t* buf, size_t size)
+{
+    uint64_t now = rt_monotonic_ns() / 1000000ull;
+    for (size_t off = 0x1C; off + 4 <= size;)
+    {
+        const uint8_t* p = buf + off;
+        size_t n = (size_t)((p[1] >> 1) & 0x7F) * 4;
+        if (n < 4 || off + n > size)
+            break;
+        Last* l = &g_last[outgoing][(p[0] | p[1] << 8) & 0x1FF];
+        l->size = (uint16_t)n, l->when = now;
+        memcpy(l->data, p, n);
+        off += n;
+    }
+}
+
 static uint8_t g_pbuf[2][0x4000];
 
 #if defined(FFXI_WRAP_PACKET_DECRYPT)
@@ -521,8 +539,13 @@ static void wrap_packet_decrypt(Guest* g)
     uint32_t out = rt_arg(g, 0), capacity = rt_arg(g, 1);
     rt_orig_packet_decrypt(g);
     int32_t n = (int32_t)g->eax;
-    if (n <= 0x1C || !packets_wanted(0) || (uint32_t)n > capacity || !xi_mapped(out, (uint32_t)n))
+    if (n <= 0x1C || (uint32_t)n > capacity || !xi_mapped(out, (uint32_t)n))
         return;
+    if (!packets_wanted(0))
+    {
+        record_last(0, GUEST_PTR(out), (size_t)n);
+        return;
+    }
     size_t cap = capacity < sizeof g_pbuf[0] ? capacity : sizeof g_pbuf[0];
     size_t w = process(0, GUEST_PTR(out), (size_t)n, g_pbuf[0], cap);
     memcpy(GUEST_PTR(out), g_pbuf[0], w);
@@ -536,6 +559,8 @@ static void wrap_packet_encrypt(Guest* g)
     uint32_t in = rt_arg(g, 3), size = rt_arg(g, 4);
     if (!packets_wanted(1) || size < 0x1C || size > sizeof g_pbuf[1] || !xi_mapped(in, size))
     {
+        if (size >= 0x1C && size <= sizeof g_pbuf[1] && xi_mapped(in, size))
+            record_last(1, GUEST_PTR(in), size);
         rt_orig_packet_encrypt(g);
         return;
     }
