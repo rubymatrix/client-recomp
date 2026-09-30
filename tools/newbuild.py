@@ -327,7 +327,7 @@ def carry(old_label, new_label, write, only=None):
         return b
 
     main_old, main_new = Image(image(old_label, 'FFXiMain.dll')), Image(image(new_label, 'FFXiMain.dll'))
-    entry = {'FFXiMain.dll': {}, 'FFXi.dll': {}, 'version': None, 'addresses': {}, 'hooks': {}, 'modern': {}, 'crt': {}}
+    entry = {'FFXiMain.dll': {}, 'FFXi.dll': {}, 'version': None, 'addresses': {}, 'hooks': {}, 'wraps': {}, 'modern': {}, 'crt': {}}
     if only:
         return carry_section(old_entry, new_label, only, main_old, main_new, put, report, failed, write)
     report.append('FFXiMain.dll addresses')
@@ -343,6 +343,12 @@ def carry(old_label, new_label, write, only=None):
         put('hook', k, a, b, how)
         if b:
             entry['hooks'][k] = '0x%08x' % b
+    for k, v in old_entry.get('wraps', {}).items():  # host-replaceable functions: function entries
+        a = int(v, 16)
+        b, how = map_code(main_old, main_new, a)
+        put('wrap', k, a, b, how)
+        if b:
+            entry['wraps'][k] = '0x%08x' % b
     report.append('FFXiMain.dll host/modern.c')
     entry['modern'] = map_modern(old_entry, main_old, main_new, put)
     report.append('FFXiMain.dll difftest CRT slice')

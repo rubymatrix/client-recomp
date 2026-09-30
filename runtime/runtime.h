@@ -62,3 +62,14 @@ void rt_set_yield(void (*yield)(void));
 /* Called for indirect targets with no translation (imports, mostly). Returns nonzero if handled. */
 typedef int (*RtNativeHandler)(Guest* g, uint32_t target);
 void rt_set_native_handler(RtNativeHandler h);
+
+/* recomp.py --wraps: a host wrapper runs at the wrapped function's entry, where esp holds the return
+ * address and the arguments sit above it. rt_arg reads argument n (0-based); rt_return returns for
+ * the function without running it (argbytes: what a stdcall callee pops, 0 for cdecl). To run the
+ * original, call rt_orig_<name>(g) as is: the stack is still the caller's. */
+static inline uint32_t rt_arg(Guest* g, unsigned n) { return rd32(g->esp + 4 + 4 * n); }
+static inline void rt_return(Guest* g, uint32_t value, unsigned argbytes)
+{
+    g->eax = value;
+    g->esp += 4 + argbytes;
+}

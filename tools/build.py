@@ -51,6 +51,8 @@ def write_build_h():
         lines.append('#define FFXI_%s 0x%08xu' % (k.upper(), int(v, 16)))
     for k, v in BUILD['hooks'].items():
         lines.append('#define FFXI_HOOK_%s 0x%08xu /* rt_hook_%s runs here */' % (k.upper(), int(v, 16), k))
+    for k, v in BUILD['wraps'].items():
+        lines.append('#define FFXI_WRAP_%s 0x%08xu /* rt_wrap_%s may replace this function */' % (k.upper(), int(v, 16), k))
     for k, v in BUILD['crt'].items():
         a = int(v, 16)
         lines.append('#define CRT_%s 0x%08xu' % (k.upper(), a))
@@ -128,8 +130,9 @@ def compile_stale(env, sources, objdir, extra, cflags=CFLAGS):
 
 def recomp(out, extra):
     hooks = ','.join('%s=%s' % kv for kv in BUILD['hooks'].items())  # host hook points (recomp.py --hooks)
+    wraps = ','.join('%s=%s' % kv for kv in BUILD['wraps'].items())  # host-replaceable functions (--wraps)
     run([sys.executable, 'recomp/recomp.py', '--meta', META, '--image', IMAGE, '--retail', RETAIL, '--out', out]
-        + (['--hooks', hooks] if hooks else []) + extra)
+        + (['--hooks', hooks] if hooks else []) + (['--wraps', wraps] if wraps else []) + extra)
 
 
 def difftest(env):

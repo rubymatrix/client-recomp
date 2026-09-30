@@ -113,6 +113,12 @@
         "ftol": "0x10311c2c",
         "strrchr": "0x103127c0",
         "strpbrk": "0x10322bb0"
+      },
+      "wraps": {
+        "parse_input": "0x10080dc0",
+        "write_line": "0x100767c0",
+        "packet_decrypt": "0x100dd6c0",
+        "packet_encrypt": "0x100dd590"
       }
     },
     "2025-12-26": {
@@ -194,6 +200,12 @@
         "ftol": "0x103101ec",
         "strrchr": "0x10310d80",
         "strpbrk": "0x10321170"
+      },
+      "wraps": {
+        "parse_input": "0x10080bd0",
+        "write_line": "0x100765d0",
+        "packet_decrypt": "0x100dd410",
+        "packet_encrypt": "0x100dd2e0"
       }
     }
   }
