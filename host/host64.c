@@ -63,6 +63,7 @@
 #include "signin.h"
 #include "appdefaults.h"
 #include "modern.h"
+#include "addons/addons.h"
 #if defined(_WIN32)
 #include "sampler.h"
 #endif
@@ -353,6 +354,7 @@ static int parse_aspect(const char* s, float* aspect)
 }
 
 static int g_profile_shims;
+static int g_addons_on; /* the addon host (host/addons/): off with FFXI_ADDONS=0 */
 
 static void present_hook(void)
 {
@@ -369,6 +371,8 @@ static void present_hook(void)
     fix_aspect();
     fix_draw_distance();
     modern_frame();
+    if (g_addons_on)
+        addons_frame();
     if (!g_fps_global)
         find_fps_global();
     if (g_fps_global == 0xFFFFFFFFu)
@@ -433,6 +437,7 @@ int main(int argc, char** argv)
     unsigned nregs = 0;
     const char* overlay = NULL;
     const char* data_dir = NULL;
+    const char* addon_harness = NULL; /* --addon-harness script: addons without the game (host/addons/harness.c) */
     const char* finals[8];
     unsigned nfinals = 0;
     const char* dats[8];
@@ -458,6 +463,8 @@ int main(int argc, char** argv)
             finals[nfinals++] = argv[i + 1];
         else if (!strcmp(argv[i], "--data-dir"))
             data_dir = argv[i + 1];
+        else if (!strcmp(argv[i], "--addon-harness"))
+            addon_harness = argv[i + 1];
 
         else if (!strcmp(argv[i], "--dats") && ndats < 8)
             dats[ndats++] = argv[i + 1];
@@ -575,7 +582,7 @@ int main(int argc, char** argv)
     }
     if (!lsb.password)
         lsb.password = getenv("FFXI_PASSWORD");
-    if (!(lsb.user && (lsb.password || lsb.login_token)))
+    if (!addon_harness && !(lsb.user && (lsb.password || lsb.login_token)))
     {
         /* Nothing on the command line signs in: the sign-in screen, in the game's own art. Its
          * window becomes the game's. */
@@ -800,6 +807,25 @@ int main(int argc, char** argv)
     ModernSetup ms = { game, data_dir, &g_fps_divisor, fps_given, ui_aspect_given, nfinals ? finals[nfinals - 1] : NULL };
     modern_init(&ms);
     setup_nameplates();
+    {
+        /* the addon host: Ashita v4 and Windower 4 Lua addons, and our own (docs/addon-compat-design.md) */
+        const char* off = getenv("FFXI_ADDONS");
+        if (!off || strcmp(off, "0"))
+        {
+            const char* where = data_dir;
+#ifdef __APPLE__
+            char* pref = NULL;
+            if (!where)
+                where = pref = SDL_GetPrefPath("FFXIRecompile", "FFXI");
+#endif
+            AddonsSetup as = { where ? where : ".", host_game, dats, ndats };
+            addons_init(&as);
+            g_addons_on = 1;
+#ifdef __APPLE__
+            SDL_free(pref);
+#endif
+        }
+    }
     if (getenv("FFXI_PROFILE") && getenv("FFXI_PROFILE")[0] && getenv("FFXI_PROFILE")[0] != '0')
         thunk_timer = gfx_prof_shim, g_profile_shims = 1; /* the profile splits the game's time into its code and our API calls */
     dsound_setup();
@@ -820,6 +846,9 @@ int main(int argc, char** argv)
         fprintf(stderr, "FFXi.dll's DllMain failed\n");
         return 1;
     }
+
+    if (addon_harness)
+        return addons_harness(addon_harness);
 
     /* FFXiEntry, through FFXi.dll's class factory */
     gt_lock();

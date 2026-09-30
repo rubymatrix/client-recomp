@@ -193,6 +193,8 @@ typedef struct GfxDraw
     int32_t zbias;  /* D3DRS_ZBIAS */
     uint32_t stencil_ref;
     uint32_t vp[6]; /* D3DVIEWPORT8 (MinZ, MaxZ as float bits) */
+    int32_t scissor[4]; /* x, y, width, height in the target's pixels; width 0: none (the addon
+                         * overlay's clip rectangles; D3D8 itself has no scissor) */
     /* vertices: stream s holds vertex (first + i) at data[s] + i * stride - copied per draw - or,
      * for a static buffer, at buf_off[s] + i * stride in buf[s] */
     const void* data[GFX_NSTREAMS];

@@ -1083,6 +1083,7 @@ void d3d8_screen_size(uint32_t* w, uint32_t* h)
         user32_client_size(g_dev.hwnd, w, h);
 }
 
+static void (*g_overlay)(GfxTex* backbuffer, uint32_t w, uint32_t h); /* d3d8_set_overlay */
 static void ui_present(void);
 static void apply_targets(void);
 static void (*g_after_present)(void);
@@ -1096,6 +1097,8 @@ static void IDirect3DDevice8_Present(Guest* g)
     if (g_present_hook)
         g_present_hook();
     Obj* bb = obj(g_dev.backbuffer);
+    if (g_overlay && bb && bb->gpu)
+        g_overlay(bb->gpu, bb->width, bb->height);
     gfx_present(bb ? bb->gpu : NULL);
     if (g_after_present)
         g_after_present();
@@ -1103,6 +1106,15 @@ static void IDirect3DDevice8_Present(Guest* g)
 }
 
 void d3d8_set_after_present(void (*fn)(void)) { g_after_present = fn; }
+
+void d3d8_set_overlay(void (*fn)(GfxTex* backbuffer, uint32_t w, uint32_t h)) { g_overlay = fn; }
+
+void d3d8_backbuffer_size(uint32_t* w, uint32_t* h)
+{
+    Obj* bb = obj(g_dev.backbuffer);
+    *w = bb ? bb->width : 0;
+    *h = bb ? bb->height : 0;
+}
 
 uint32_t d3d8_window(void) { return g_dev.hwnd; }
 

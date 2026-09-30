@@ -17,6 +17,8 @@ enum
     INPUT_KINDS
 };
 
+/* The DIK code (set-1 scan code, 0x80 for E0 keys) of an SDL_Scancode; 0 if none. */
+uint8_t input_dik(int sdl_scancode);
 /* Called by the pump for every SDL event (an SDL_Event*). */
 void input_sdl_event(const void* sdl_event);
 /* The window lost focus: every key and button comes up. */

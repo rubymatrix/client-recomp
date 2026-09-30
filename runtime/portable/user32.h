@@ -30,6 +30,13 @@ float user32_ui_squeeze_y(uint32_t hwnd);
 /* Set by the graphics layer: whether the interface covers this point of the window (0..1 across
  * and down), as drawn last frame. The mouse is unsqueezed only there. */
 extern int (*user32_ui_hit)(float fx, float fy);
+/* Set by the addon host: sees every SDL event (an SDL_Event*) first, with the size of the window it
+ * is for (points); returns 1 to keep a press, a wheel turn or typed text from the game (DirectInput
+ * and the window messages alike). Releases and motion always reach the game. */
+extern int (*user32_event_hook)(const void* sdl_event, int window_w, int window_h);
+/* Set by the addon host: runs once when the player quits (the window closing), before the process
+ * ends. */
+extern void (*user32_quit_hook)(void);
 /* 1 when the game was last given the cursor as it is (over the world), 0 unsqueezed */
 int user32_mouse_raw(void);
 /* where the game was last given the cursor, 0..1 of its window across and down */

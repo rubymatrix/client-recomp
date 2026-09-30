@@ -35,6 +35,9 @@ static void lock(void)
 
 static void unlock(void) { SDL_UnlockMutex(g_lock); }
 
+static uint8_t dik_of(SDL_Scancode sc);
+uint8_t input_dik(int sdl_scancode) { return dik_of((SDL_Scancode)sdl_scancode); }
+
 static uint8_t dik_of(SDL_Scancode sc)
 {
     static const char row1[] = "QWERTYUIOP", row2[] = "ASDFGHJKL", row3[] = "ZXCVBNM";

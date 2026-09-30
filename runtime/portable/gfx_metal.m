@@ -1371,6 +1371,30 @@ static void set_viewport(const uint32_t vp[6])
     [g_enc setViewport:(MTLViewport){ x, y, vw, vh, zmin, zmax }];
 }
 
+/* GfxDraw.scissor, clamped to the target (Metal rejects a rectangle outside it); none: all of it */
+static void set_scissor(const int32_t sc[4])
+{
+    uint32_t w, h;
+    color_size(&w, &h);
+    int64_t x0 = 0, y0 = 0, x1 = w, y1 = h;
+    if (sc[2] > 0)
+    {
+        x0 = sc[0] < 0 ? 0 : sc[0];
+        y0 = sc[1] < 0 ? 0 : sc[1];
+        x1 = (int64_t)sc[0] + sc[2];
+        y1 = (int64_t)sc[1] + sc[3];
+        if (x1 > w)
+            x1 = w;
+        if (y1 > h)
+            y1 = h;
+        if (x1 < x0)
+            x1 = x0;
+        if (y1 < y0)
+            y1 = y0;
+    }
+    [g_enc setScissorRect:(MTLScissorRect){ (NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0) }];
+}
+
 /* index count (Metal) for a D3D primitive count */
 static uint32_t vertex_count(uint32_t prim, uint32_t n)
 {
@@ -1471,6 +1495,7 @@ static void draw_encode(const GfxDraw* d)
         [g_enc setTriangleFillMode:d->fill == 2 ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
         [g_enc setDepthBias:-(float)d->zbias slopeScale:-(float)d->zbias * 0.5f clamp:0];
         set_viewport(d->vp);
+        set_scissor(d->scissor);
 
         id<MTLBuffer> buf;
         NSUInteger off;

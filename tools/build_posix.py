@@ -53,6 +53,10 @@ else:
 HOST_SOURCES = ['runtime/portable/user32.c', 'runtime/portable/d3d8.c', 'runtime/portable/dsound.c',
                 'runtime/portable/input.c', 'runtime/portable/dinput.c', 'runtime/portable/ws2.c', 'host/host64.c',
                 'host/lsb_login.c', 'host/datui.c', 'host/uidraw.c', 'host/modern.c', 'host/signin.c', 'host/sewave.c', 'host/ui_art.c', 'host/keychain.c', 'host/appdefaults.c'] + GFX_SOURCES
+# the addon host (host/addons/, docs/addon-compat-design.md): C, C++ (ImGui) and its embedded Lua
+ADDON_SOURCES = sorted('host/addons/' + f for f in os.listdir(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'host', 'addons'))
+                       if f.endswith('.c') or f.endswith('.cpp')) + ['generated/addons_lua.c']
+ADDON_LIBS = ('luajit', 'imgui', 'luasocket', 'lfs')
 
 
 def posix(p):
@@ -132,9 +136,13 @@ def compile_stale(sources, objdir, extra):
         full_obj = os.path.join(ROOT, obj)
         if stale(s, full_obj, headers):
             flags = CFLAGS + extra + (GEN_WARNINGS if s.startswith('generated/') else [])
+            cc = 'clang'
             if s.endswith('.m'):  # Objective-C: references counted by hand (gfx_metal.m)
                 flags = [f for f in flags if f != '-std=c11'] + ['-fno-objc-arc']
-            jobs.append(['clang', '-c'] + flags + [s, '-o', obj])
+            elif s.endswith('.cpp'):  # the addon host's ImGui side
+                flags = [f for f in flags if f != '-std=c11'] + ['-std=c++17']
+                cc = 'clang++'
+            jobs.append([cc, '-c'] + flags + [s, '-o', obj])
     if jobs:
         print('compiling %d of %d' % (len(jobs), len(sources)))
         failed = []
@@ -175,6 +183,17 @@ def boot64(game):
     run(['build/boot64', build.RETAIL, game])
 
 
+def addons():
+    """The addon host's libraries and embedded Lua: (compile flags, link flags)."""
+    run([sys.executable, 'tools/embed_lua.py'])
+    cflags, libs = ['-I', 'host/addons', '-DIMGUI_USER_CONFIG="imconfig_xi.h"'], []
+    for name in ADDON_LIBS:
+        thirdparty.build(name)
+        cflags += thirdparty.flags(name)
+        libs += thirdparty.libs(name)
+    return cflags, libs + ['-lc++'] + (['-liconv'] if sys.platform == 'darwin' else [])
+
+
 def host64(game):
     translate()
     run([sys.executable, 'recomp/recomp.py', '--meta', build.FFXI_META, '--image', GEN_FFXI_IMAGE, '--retail',
@@ -184,8 +203,9 @@ def host64(game):
     phase('compile')
     objs = compile_stale(generated('all'), 'build/all64', ['-I', 'generated/all'])
     objs += compile_stale(generated('ffxi'), 'build/ffxi64', ['-I', 'generated/ffxi'])
-    objs += compile_stale(PORTABLE + HOST_SOURCES, 'build/obj/host64', sdl_cflags + tls_cflags)
-    run(['clang', '-o', 'build/host64'] + objs + sdl_libs + tls_libs + GFX_LIBS + ['-lm', '-lpthread'])
+    addon_cflags, addon_libs = addons()
+    objs += compile_stale(PORTABLE + HOST_SOURCES + ADDON_SOURCES, 'build/obj/host64', sdl_cflags + tls_cflags + addon_cflags)
+    run(['clang', '-o', 'build/host64'] + objs + sdl_libs + tls_libs + addon_libs + GFX_LIBS + ['-lm', '-lpthread'])
     print('built build/host64; run: build/host64 --game %s --server <name>' % shlex.quote(game))
 
 

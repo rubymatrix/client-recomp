@@ -8,6 +8,7 @@
 
 static RT_TLS GThread* t_self;
 static RT_TLS int t_held;
+static RT_TLS int t_noyield;
 
 /* --- the guest lock: a FIFO ticket lock with a quantum (bridge.c has the history) ----------- */
 static volatile uint32_t g_next_ticket, g_now_serving;
@@ -51,13 +52,15 @@ int gt_holds(void)
     return t_held;
 }
 
+void gt_noyield(int on) { t_noyield += on ? 1 : -1; }
+
 /* Called at every loop's back edge. The clock is read only every 32nd call while another thread
  * waits: reading it at each was 8% of the game thread's time where the clock is slow (a virtual
  * machine's QueryPerformanceCounter), and 32 back edges are far shorter than the quantum. */
 static void yield_if_due(void)
 {
     static RT_TLS unsigned t_skip;
-    if (!t_held || !rt_lock_contended || (++t_skip & 31u) ||
+    if (!t_held || t_noyield || !rt_lock_contended || (++t_skip & 31u) ||
         rt_monotonic_ns() - g_acquired_at < (t_quantum_ns ? t_quantum_ns : QUANTUM_NS))
         return;
     gt_unlock();

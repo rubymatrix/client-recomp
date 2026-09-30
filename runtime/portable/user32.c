@@ -410,6 +410,9 @@ static uint16_t scan_of_vk(uint32_t vk)
     }
 }
 
+int (*user32_event_hook)(const void* sdl_event, int window_w, int window_h);
+void (*user32_quit_hook)(void);
+
 static uint32_t mouse_keys(SDL_MouseButtonFlags b)
 {
     return ((b & SDL_BUTTON_LMASK) ? 1u : 0) | ((b & SDL_BUTTON_RMASK) ? 2u : 0) | ((b & SDL_BUTTON_MMASK) ? 0x10u : 0) |
@@ -424,6 +427,24 @@ static void pump(void)
     SDL_Event e;
     while (SDL_PollEvent(&e))
     {
+        if (user32_event_hook && e.type != SDL_EVENT_KEY_UP && e.type != SDL_EVENT_MOUSE_BUTTON_UP &&
+            e.type != SDL_EVENT_MOUSE_MOTION)
+        {
+            int ww = 0, wh = 0;
+            SDL_Window* sw = SDL_GetWindowFromEvent(&e);
+            if (sw)
+                SDL_GetWindowSize(sw, &ww, &wh);
+            if (user32_event_hook(&e, ww, wh))
+                continue; /* the overlay's: neither DirectInput nor the game's window sees it */
+        }
+        else if (user32_event_hook)
+        {
+            int ww = 0, wh = 0;
+            SDL_Window* sw = SDL_GetWindowFromEvent(&e);
+            if (sw)
+                SDL_GetWindowSize(sw, &ww, &wh);
+            user32_event_hook(&e, ww, wh);
+        }
         input_sdl_event(&e); /* DirectInput's view of the same events */
         Wnd* w = NULL;
         switch (e.type)
@@ -510,6 +531,8 @@ static void pump(void)
              * only leaves from its own menus (its window procedure ignores WM_CLOSE), so the host
              * ends the run here; nothing is lost - the registry is saved as the game changes it. */
             rt_log("[recomp] quit\n");
+            if (user32_quit_hook)
+                user32_quit_hook();
             fflush(NULL);
             _Exit(0);
         case SDL_EVENT_WINDOW_FOCUS_GAINED:

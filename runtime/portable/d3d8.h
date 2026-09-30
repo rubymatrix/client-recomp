@@ -20,6 +20,13 @@ uint32_t d3d8_window(void);
 /* The size the frame is shown at: the device window's client area, else the back buffer's; 0x0
  * before the device exists. */
 void d3d8_screen_size(uint32_t* w, uint32_t* h);
+/* The back buffer's size (0x0 before the device exists). */
+void d3d8_backbuffer_size(uint32_t* w, uint32_t* h);
+/* Called at every Present after the present hook, with the back buffer the frame is in: where the
+ * addon host draws its overlay (gfx_draw into it; d3d8 binds its own targets again at its next
+ * draw). */
+typedef struct GfxTex GfxTex;
+void d3d8_set_overlay(void (*fn)(GfxTex* backbuffer, uint32_t w, uint32_t h));
 /* Adds a texture pack: <dir>/<hash>_<w>x<h>.dds replacements for the game's textures (see d3d8.c,
  * tools/make_texpack.py). Before the device is created. */
 void d3d8_texture_pack(const char* dir);

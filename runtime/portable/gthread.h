@@ -31,6 +31,10 @@ void gt_init(void);
 void gt_lock(void);
 void gt_unlock(void);
 int gt_holds(void);
+/* Nesting: while on, this thread keeps the lock at safepoints (translated loops don't hand it to
+ * another guest thread). For host code that must not be re-entered from another thread while it
+ * calls into the guest (the addon host's Lua states). Blocking shims still release the lock. */
+void gt_noyield(int on);
 
 /* Win32 last-error of the current guest thread (the TEB's LastErrorValue, fs:[0x34]). */
 void gt_set_error(uint32_t e);

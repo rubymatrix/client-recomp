@@ -133,6 +133,8 @@ bool SDL_GetWindowSizeInPixels(SDL_Window* w, int* width, int* height)
         *height = (int)g_view_h;
     return true;
 }
+bool SDL_GetWindowSize(SDL_Window* w, int* width, int* height) { return SDL_GetWindowSizeInPixels(w, width, height); }
+SDL_Window* SDL_GetWindowFromEvent(const SDL_Event* e) { (void)e; return g_have_window ? &g_window : NULL; }
 bool SDL_ShowWindow(SDL_Window* w) { (void)w; return true; }
 bool SDL_SetWindowTitle(SDL_Window* w, const char* title) { (void)w, (void)title; return true; } /* the app's */
 bool SDL_HideWindow(SDL_Window* w) { (void)w; return true; }

@@ -1752,6 +1752,31 @@ static void set_viewport(const uint32_t vp[6])
     ID3D12GraphicsCommandList_RSSetViewports(g_list, 1, &v);
 }
 
+/* GfxDraw.scissor, clamped to the target; none: all of it */
+static void set_scissor(const int32_t sc[4])
+{
+    uint32_t w, h;
+    color_size(&w, &h);
+    LONG x0 = 0, y0 = 0, x1 = (LONG)w, y1 = (LONG)h;
+    if (sc[2] > 0)
+    {
+        x0 = sc[0] < 0 ? 0 : sc[0];
+        y0 = sc[1] < 0 ? 0 : sc[1];
+        x1 = sc[0] + sc[2];
+        y1 = sc[1] + sc[3];
+        if (x1 > (LONG)w)
+            x1 = (LONG)w;
+        if (y1 > (LONG)h)
+            y1 = (LONG)h;
+        if (x1 < x0)
+            x1 = x0;
+        if (y1 < y0)
+            y1 = y0;
+    }
+    D3D12_RECT r = { x0, y0, x1, y1 };
+    ID3D12GraphicsCommandList_RSSetScissorRects(g_list, 1, &r);
+}
+
 /* index count for a D3D primitive count */
 static uint32_t vertex_count(uint32_t prim, uint32_t n)
 {
@@ -1842,6 +1867,7 @@ static void draw_encode(const GfxDraw* d)
     set_pso(p);
     set_topology(topology(d->prim));
     set_viewport(d->vp);
+    set_scissor(d->scissor);
     if (ds && ds->has_stencil && d->depth.stencil)
         ID3D12GraphicsCommandList_OMSetStencilRef(l, d->stencil_ref);
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(l, ROOT_BIND, 16, bind, 0);
