@@ -21,3 +21,6 @@ __pycache__/
 # Jython compiles the discovery scripts next to themselves
 *$py.class
 .DS_Store
+
+# Python environment
+.venv/

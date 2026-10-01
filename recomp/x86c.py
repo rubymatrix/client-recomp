@@ -8,6 +8,8 @@ Model (see runtime/guest.h):
     `ret` pops and returns; a jump to another function's entry is a tail call;
   * switches (`jmp [reg*4+table]`) read the table from guest memory and dispatch with a C switch
     over the targets the metadata lists;
+  * SSE/SSE2 instructions run on the XMM registers in Guest (g->xmm, runtime/sse.h): the source is
+    copied to a temporary X128 S and one helper does the lane work (sse());
   * x87 instructions are decoded from their opcode bytes (not the mnemonic: disassemblers
     disagree on FSUBP/FSUBRP naming) and run on doubles with the control word's RC and PC.
 
@@ -321,8 +323,14 @@ class FunctionTranslator:
         if mn[:4] in ('movs', 'stos', 'lods', 'scas', 'cmps') and len(mn) == 5 and mn[4] in 'bwd' \
                 and all(o.type != X.X86_OP_REG or self.ins_reg_is_gpr(ins, o) for o in ops):
             return self.string(ins, mn, prefix), True
+        if prefix in ('rep', 'repz') and mn == 'ret':
+            prefix = None  # `rep ret`: AMD's branch-predictor idiom, an ordinary ret
         if prefix is not None:
             raise Unsupported('prefix %s' % prefix)
+
+        sse = self.sse(ins, mn, ops)
+        if sse is not None:
+            return sse, True
 
         pro = self.mem_prologue(ins)
 
@@ -440,6 +448,11 @@ class FunctionTranslator:
         if mn == 'sahf':
             return ['{ uint32_t h = (eax >> 8) & 0xFFu; cf = h & 1u; pf = (h >> 2) & 1u; af = (h >> 4) & 1u; '
                     'zf = (h >> 6) & 1u; sf = (h >> 7) & 1u; }'], True
+        if mn == 'enter':
+            size, level = ops[0].imm & 0xFFFF, ops[1].imm & 31
+            if level:
+                raise Unsupported('enter with nesting level')
+            return ['esp -= 4; wr32(esp, ebp); ebp = esp; esp -= %du;' % size], True
         if mn == 'leave':
             return ['esp = ebp; ebp = rd32(esp); esp += 4;'], True
         if mn in ('clc', 'stc', 'cmc', 'cld', 'std'):
@@ -682,6 +695,154 @@ class FunctionTranslator:
         if prefix in ('repne', 'repnz') and kind in ('scas', 'cmps'):
             return ['while (ecx) { %s ecx--; if (zf) break; }' % body]
         raise Unsupported('%s %s' % (prefix, mn))
+
+    # ------------------------------------------------------------------ SSE / SSE2
+
+    def xmm(self, ins, op):
+        """The C lvalue of an XMM (X(n)) or MMX (MM(n)) register operand, or None. MMX registers
+        are modelled apart from the x87 stack they alias (code that uses them runs emms before
+        any x87), as X128s whose upper half stays zero: the lane-wise helpers then serve both."""
+        if op.type != X.X86_OP_REG:
+            return None
+        name = ins.reg_name(op.reg)
+        if name.startswith('xmm'):
+            return 'X(%d)' % int(name[3:])
+        if name.startswith('mm'):
+            return 'MM(%d)' % int(name[2:])
+        return None
+
+    def xsrc(self, ins, op):
+        """Statements loading an SSE source operand into the temporary S (a copy: helpers never
+        see their destination and source alias)."""
+        r = self.xmm(ins, op)
+        if r is not None:
+            return 'X128 S = %s;' % r
+        if op.type == X.X86_OP_MEM:
+            ld = {16: 'ld_x128', 8: 'ld_x64', 4: 'ld_x32'}.get(op.size)
+            if ld is None:
+                raise Unsupported('sse operand size %d' % op.size)
+            return 'X128 S = %s(A);' % ld
+        raise Unsupported('sse source')
+
+    SSE_BIN = {
+        # packed and scalar float arithmetic
+        **{m + t: 'x_' + m + t for m in ('add', 'sub', 'mul', 'div', 'min', 'max') for t in ('ps', 'ss', 'pd', 'sd')},
+        **{m + t: 'x_' + m + t for m in ('sqrt',) for t in ('ps', 'ss', 'pd', 'sd')},
+        'rcpps': 'x_rcpps', 'rcpss': 'x_rcpss', 'rsqrtps': 'x_rsqrtps', 'rsqrtss': 'x_rsqrtss',
+        # bitwise
+        'andps': 'x_and', 'andpd': 'x_and', 'pand': 'x_and', 'andnps': 'x_andn', 'andnpd': 'x_andn', 'pandn': 'x_andn',
+        'orps': 'x_or', 'orpd': 'x_or', 'por': 'x_or', 'xorps': 'x_xor', 'xorpd': 'x_xor', 'pxor': 'x_xor',
+        # unpacks
+        'unpcklps': 'x_unpcklps', 'unpckhps': 'x_unpckhps', 'unpcklpd': 'x_unpcklpd', 'unpckhpd': 'x_unpckhpd',
+        # conversions between XMM registers
+        **{m: 'x_' + m for m in ('cvtps2pd', 'cvtpd2ps', 'cvtss2sd', 'cvtsd2ss', 'cvtdq2ps', 'cvtdq2pd',
+                                 'cvttps2dq', 'cvttpd2dq', 'cvtps2dq', 'cvtpd2dq')},
+        # SSE2 integer
+        **{m: 'x_' + m for m in (
+            'paddb', 'paddw', 'paddd', 'paddq', 'psubb', 'psubw', 'psubd', 'psubq', 'pmullw', 'pmulhw', 'pmulhuw',
+            'pavgb', 'pavgw', 'pminub', 'pmaxub', 'pminsw', 'pmaxsw', 'pcmpeqb', 'pcmpeqw', 'pcmpeqd', 'pcmpgtb',
+            'pcmpgtw', 'pcmpgtd', 'paddsb', 'paddsw', 'paddusb', 'paddusw', 'psubsb', 'psubsw', 'psubusb', 'psubusw',
+            'pmuludq', 'pmaddwd', 'psadbw', 'packsswb', 'packuswb', 'packssdw', 'punpcklbw', 'punpckhbw', 'punpcklwd',
+            'punpckhwd', 'punpckldq', 'punpckhdq', 'punpcklqdq', 'punpckhqdq')},
+    }
+    SSE_IMM = {'shufps': 'x_shufps', 'shufpd': 'x_shufpd', 'pshufd': 'x_pshufd', 'pshuflw': 'x_pshuflw',
+               'pshufhw': 'x_pshufhw', 'cmpps': 'x_cmpps', 'cmpss': 'x_cmpss', 'cmppd': 'x_cmppd', 'cmpsd': 'x_cmpsd'}
+    SSE_CMP = ('eq', 'lt', 'le', 'unord', 'neq', 'nlt', 'nle', 'ord')
+    SSE_MOV128 = ('movaps', 'movups', 'movapd', 'movupd', 'movdqa', 'movdqu', 'lddqu', 'movntps', 'movntpd', 'movntdq')
+    SSE_GPR_ONLY = ('cvttss2si', 'cvtss2si', 'cvttsd2si', 'cvtsd2si')
+    SSE_NOP = ('prefetchnta', 'prefetcht0', 'prefetcht1', 'prefetcht2', 'prefetch', 'prefetchw',
+               'sfence', 'lfence', 'mfence', 'emms')
+
+    def sse(self, ins, mn, ops):
+        """C statements for an SSE/SSE2 instruction, or None when it is not one."""
+        if mn in self.SSE_NOP:
+            return []
+        if mn in ('ldmxcsr', 'stmxcsr'):
+            pro = self.mem_prologue(ins)
+            return pro + (['g->mxcsr = rd32(A); sse_mxcsr_apply(g->mxcsr);'] if mn == 'ldmxcsr' else ['wr32(A, g->mxcsr);'])
+        xr = [self.xmm(ins, o) for o in ops]
+        if not any(r is not None for r in xr) and mn not in self.SSE_GPR_ONLY:
+            return None
+        pro = self.mem_prologue(ins)
+        d = ops[0]
+        dx = xr[0]
+
+        # CMPccPS pseudo-mnemonics (capstone spells the predicate out)
+        pred = None
+        for k, c in enumerate(self.SSE_CMP):
+            for t in ('ps', 'ss', 'pd', 'sd'):
+                if mn == 'cmp' + c + t:
+                    pred, mn = k, 'cmp' + t
+        if mn in self.SSE_BIN and dx is not None and len(ops) == 2:
+            mx = ', g->mxcsr' if mn in ('cvtps2dq', 'cvtpd2dq') else ''  # rounding follows MXCSR.RC
+            return pro + ['{ ' + self.xsrc(ins, ops[1]), '%s(&%s, &S%s); }' % (self.SSE_BIN[mn], dx, mx)]
+        if mn in self.SSE_IMM and dx is not None:
+            imm = pred if pred is not None else ops[2].imm & 0xFF
+            return pro + ['{ ' + self.xsrc(ins, ops[1]), '%s(&%s, &S, %du); }' % (self.SSE_IMM[mn], dx, imm)]
+
+        if mn in self.SSE_MOV128:
+            if d.type == X.X86_OP_MEM:
+                return pro + ['st_x128(A, &%s);' % xr[1]]
+            return pro + ['{ ' + self.xsrc(ins, ops[1]), '%s = S; }' % dx]
+        if mn in ('movss', 'movsd'):
+            w = 32 if mn == 'movss' else 64
+            if d.type == X.X86_OP_MEM:
+                return pro + ['st_x%d(A, &%s);' % (w, xr[1])]
+            if ops[1].type == X.X86_OP_MEM:
+                return pro + ['%s = ld_x%d(A);' % (dx, w)]
+            return ['{ X128 S = %s; x_movlo%d(&%s, &S); }' % (xr[1], w, dx)]
+        if mn in ('movlps', 'movlpd', 'movhps', 'movhpd'):
+            hi = mn.startswith('movh')
+            if d.type == X.X86_OP_MEM:
+                return pro + ['st_x64%s(A, &%s);' % ('hi' if hi else '', xr[1])]
+            return pro + ['{ X128 S = ld_x64(A); x_mov%s64(&%s, &S); }' % ('hi' if hi else 'lo', dx)]
+        if mn in ('movlhps', 'movhlps'):
+            return ['{ X128 S = %s; %s(&%s, &S); }' % (xr[1], 'x_movhi64' if mn == 'movlhps' else 'x_movhl', dx)]
+        if mn == 'movd':
+            if dx is not None:
+                return pro + ['%s = x_from32(%s);' % (dx, self.rd(ins, ops[1], 32))]
+            return pro + [self.wr(ins, d, '%s.u32[0]' % xr[1])]
+        if mn == 'movq':
+            if d.type == X.X86_OP_MEM:
+                return pro + ['st_x64(A, &%s);' % xr[1]]
+            if dx is not None:
+                return pro + ['{ ' + self.xsrc(ins, ops[1]), 'x_movq(&%s, &S); }' % dx]
+        if mn in ('cvtsi2ss', 'cvtsi2sd'):
+            lane = 'f[0] = (float)' if mn == 'cvtsi2ss' else 'd[0] = (double)'
+            return pro + ['%s.%s(int32_t)%s;' % (dx, lane, self.rd(ins, ops[1], 32))]
+        if mn in ('cvttss2si', 'cvtss2si', 'cvttsd2si', 'cvtsd2si'):
+            dbl = mn.endswith('sd2si')
+            r = self.xmm(ins, ops[1])
+            src = ('%s.%s' % (r, 'd[0]' if dbl else 'f[0]')) if r is not None else ('rdf64(A)' if dbl else 'rdf32(A)')
+            conv = 'cvtt_f2i(%s)' % src if mn.startswith('cvtt') else 'cvt_f2i(g->mxcsr, %s)' % src
+            return pro + [self.wr(ins, d, '(uint32_t)' + conv)]
+        if mn in ('comiss', 'ucomiss', 'comisd', 'ucomisd'):
+            dbl = mn.endswith('sd')
+            lane = 'd[0]' if dbl else 'f[0]'
+            r = xr[1]
+            src = '%s.%s' % (r, lane) if r is not None else ('rdf64(A)' if dbl else 'rdf32(A)')
+            return pro + ['SSE_COMI(%s.%s, %s);' % (dx, lane, src)]
+        if mn in ('movmskps', 'movmskpd', 'pmovmskb'):
+            return [self.wr(ins, d, 'x_%s(&%s)' % (mn, xr[1]))]
+        if mn in ('psllw', 'pslld', 'psllq', 'psrlw', 'psrld', 'psrlq', 'psraw', 'psrad'):
+            if ops[1].type == X.X86_OP_IMM:
+                return ['x_%s(&%s, %du);' % (mn, dx, ops[1].imm & 0xFF)]
+            return pro + ['{ ' + self.xsrc(ins, ops[1]), 'x_%s(&%s, S.u64[0]); }' % (mn, dx)]
+        if mn in ('pslldq', 'psrldq'):
+            return ['x_%s(&%s, %du);' % (mn, dx, ops[1].imm & 0xFF)]
+        if mn == 'pextrw':
+            return [self.wr(ins, d, '%s.u16[%d]' % (xr[1], ops[2].imm & 7))]
+        if mn == 'pinsrw':
+            return pro + ['%s.u16[%d] = (uint16_t)%s;' % (dx, ops[2].imm & 7, self.rd(ins, ops[1], 16 if ops[1].type == X.X86_OP_MEM else 32))]
+        if mn == 'pshufw':
+            return pro + ['{ ' + self.xsrc(ins, ops[1]), 'x_pshuflw(&%s, &S, %du); %s.u64[1] = 0; }' % (dx, ops[2].imm & 0xFF, dx)]
+        if mn == 'cvtpi2ps':
+            return pro + ['{ ' + self.xsrc(ins, ops[1]), '%s.f[0] = (float)S.s32[0]; %s.f[1] = (float)S.s32[1]; }' % (dx, dx)]
+        if mn in ('cvttps2pi', 'cvtps2pi'):
+            conv = 'cvtt_f2i(S.f[%d])' if mn == 'cvttps2pi' else 'cvt_f2i(g->mxcsr, S.f[%d])'
+            return pro + ['{ ' + self.xsrc(ins, ops[1]), '%s.s32[0] = %s; %s.s32[1] = %s; %s.u64[1] = 0; }'
+                          % (dx, conv % 0, dx, conv % 1, dx)]
+        raise Unsupported(mn)
 
     # ------------------------------------------------------------------ x87
 
