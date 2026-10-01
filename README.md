@@ -1,5 +1,7 @@
 # FFXI on Mac
 
+<a href="https://discord.gg/4vUKPgyvEp"><img src="screenshots/discord_banner.webp" alt="XI on Mac: join the community on Discord"></a>
+
 FINAL FANTASY XI running natively on Apple silicon Macs, with no Wine or Rosetta. The game's
 `FFXiMain.dll` (and `FFXi.dll`) are statically recompiled from 32-bit x86 to C on your own machine,
 from your own install, and run on a platform layer written for macOS: Win32, Direct3D 8 on Metal,
