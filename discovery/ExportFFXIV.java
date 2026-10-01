@@ -49,11 +49,23 @@ public class ExportFFXIV extends GhidraScript {
         Memory mem = currentProgram.getMemory();
         MemoryBlock text = mem.getBlock(".text");
         AddressSpace space = currentProgram.getAddressFactory().getDefaultAddressSpace();
+        /* every executable block: .text, and MSSMIXER (the Miles mixer's code) after it */
+        long codeLo = text.getStart().getOffset(), codeHi = text.getEnd().getOffset() + 1;
+        java.util.List<MemoryBlock> code = new java.util.ArrayList<>();
+        for (MemoryBlock b : mem.getBlocks())
+            if (b.isExecute() && b.isInitialized())
+            {
+                code.add(b);
+                codeLo = Math.min(codeLo, b.getStart().getOffset());
+                codeHi = Math.max(codeHi, b.getEnd().getOffset() + 1);
+            }
 
         StringBuilder fn = new StringBuilder();
         int nfn = 0;
         for (Function f : currentProgram.getFunctionManager().getFunctions(true)) {
-            if (!text.contains(f.getEntryPoint())) continue;
+            boolean inCode = false;
+            for (MemoryBlock b : code) inCode |= b.contains(f.getEntryPoint());
+            if (!inCode) continue;
             if (nfn++ > 0) fn.append(',');
             fn.append("{\"entry\":").append(f.getEntryPoint().getOffset()).append(",\"ranges\":[");
             boolean first = true;
@@ -144,7 +156,7 @@ public class ExportFFXIV extends GhidraScript {
         try (PrintWriter w = new PrintWriter(new FileWriter(outPath))) {
             w.print("{\"format\":\"ffxi-recomp-meta/1\",\"module\":\"ffxivgame.exe\",\"build\":\"" + label + "\",");
             w.print("\"sha256\":\"" + sha256 + "\",\"image_base\":" + currentProgram.getImageBase().getOffset() + ",");
-            w.print("\"text\":[" + text.getStart().getOffset() + "," + (text.getEnd().getOffset() + 1) + "],");
+            w.print("\"text\":[" + codeLo + "," + codeHi + "],");
             w.print("\"functions\":[" + fn + "],\"switches\":[" + sw + "],\"tail_jumps\":[" + tj + "]}");
         }
         for (String r : report) println(r);

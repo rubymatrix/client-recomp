@@ -121,6 +121,7 @@ GThread* gt_self(void)
     t->stack_lo = stack;
     t->stack_hi = stack + GT_STACK_SIZE;
     t->teb = teb;
+    t->tls = t->tls_own;
     t->tid = plat_thread_id();
     wr32(teb + 0x00, 0xFFFFFFFFu); /* SEH chain: empty */
     wr32(teb + 0x04, t->stack_hi); /* stack base */
@@ -137,6 +138,8 @@ GThread* gt_self(void)
     t_self = t;
     return t;
 }
+
+void gt_adopt(GThread* t) { t_self = t; }
 
 void gt_exit_self(void)
 {

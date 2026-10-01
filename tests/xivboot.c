@@ -31,6 +31,10 @@ void xiv_set_documents(const char* host_dir);
 void user32_init(void);
 void d3d9_init(void);
 void d3dx9_init(void);
+void xaudio2_init(void);
+void fiber_init(void);
+void dinput_setup(void);
+void dsound_setup(void);
 void ws2_init(void);
 void dinput_init(void);
 void dsound_init(void);
@@ -95,6 +99,8 @@ int main(int argc, char** argv)
     user32_init();
     d3d9_init();
     d3dx9_init();
+    xaudio2_init();
+    fiber_init();
     dsound_init();
     dinput_init();
     ws2_init();
@@ -137,6 +143,9 @@ int main(int argc, char** argv)
     uint32_t tls_start = 0, tls_size = 0, tls_zero = 0;
     uint32_t callbacks = pe_static_tls(rt_image_base, &tls_start, &tls_size, &tls_zero);
     gt_set_static_tls(tls_start, tls_size, tls_zero);
+    /* the COM vtables of the shared shims are guest memory: built now the guest heap is up */
+    dsound_setup();
+    dinput_setup();
     gt_unlock();
     printf("static TLS: %08x + %u (+%u zero), callbacks at %08x\n", tls_start, tls_size, tls_zero, callbacks);
 

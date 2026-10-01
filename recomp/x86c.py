@@ -426,6 +426,14 @@ class FunctionTranslator:
             return ['eax = (eax & 0xFFFF0000u) | (uint16_t)(int16_t)(int8_t)eax;'], True
         if mn == 'cwd':
             return ['edx = (edx & 0xFFFF0000u) | ((eax & 0x8000u) ? 0xFFFFu : 0u);'], True
+        if mn in ('push', 'pop') and ops and ops[0].type == X.X86_OP_REG and \
+                ins.reg_name(ops[0].reg) in ('cs', 'ds', 'es', 'ss', 'fs', 'gs'):
+            # segment registers in a flat address space: the selectors Windows gives a 32-bit
+            # process, pushed for show (Miles saves ds/es around its mixer); a pop changes nothing
+            sel = {'cs': 0x1B, 'fs': 0x3B}.get(ins.reg_name(ops[0].reg), 0x23)
+            if mn == 'push':
+                return ['esp -= 4; wr32(esp, 0x%Xu);' % sel], True
+            return ['esp += 4;'], True
         if mn == 'push':
             s, = ops
             if self.bits_of(s) != 32 and s.type != X.X86_OP_IMM:

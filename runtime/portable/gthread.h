@@ -18,8 +18,13 @@ typedef struct GThread
     Guest g; /* first: a Guest* is a GThread* */
     uint32_t stack_lo, stack_hi, teb;
     uint32_t tid;
-    uint32_t tls[GT_TLS_SLOTS];
+    uint32_t* tls;                   /* TlsGetValue's slots: tls_own, or the thread's a fiber runs for */
+    uint32_t tls_own[GT_TLS_SLOTS];
 } GThread;
+
+/* Makes t this host thread's guest state (a fiber's: its own registers and stack, its thread's
+ * TEB, TLS slots and id - fiber.c). */
+void gt_adopt(GThread* t);
 
 /* The process environment block every TEB points at (fs:[0x30]): 0 until gt_set_peb. */
 void gt_set_peb(uint32_t peb);

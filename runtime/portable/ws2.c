@@ -22,6 +22,7 @@ static int host_errno(void) { return WSAGetLastError(); }
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
@@ -748,6 +749,119 @@ static int is_game_host_name(const char* name)
     return n == 7 || tail[-1] == '.';
 }
 
+/* --- the calls FINAL FANTASY XIV makes beyond FFXI's ------------------------------------------- */
+
+/* inet_addr("a.b.c.d"): network byte order, INADDR_NONE when it is not one */
+static void sh_inet_addr(Guest* g)
+{
+    struct in_addr a;
+    if (!ARG(0) || inet_pton(AF_INET, ARGS(0), &a) != 1)
+        RET(0xFFFFFFFFu, 1);
+    uint32_t v;
+    memcpy(&v, &a, 4);
+    RET(v, 1);
+}
+
+/* getsockname / getpeername(s, sockaddr*, int* len) */
+static void name_common(Guest* g, int peer)
+{
+    Sock* s = sock(ARG(0));
+    if (!s)
+    {
+        gt_set_error(10038); /* WSAENOTSOCK */
+        RET(0xFFFFFFFFu, 3);
+    }
+    struct sockaddr_in a;
+    socklen_t len = sizeof a;
+    int r = peer ? getpeername(s->h, (struct sockaddr*)&a, &len) : getsockname(s->h, (struct sockaddr*)&a, &len);
+    if (r != 0)
+    {
+        fail();
+        RET(0xFFFFFFFFu, 3);
+    }
+    to_guest_addr(&a, ARG(1), ARG(2));
+    RET(0, 3);
+}
+static void sh_getsockname(Guest* g) { name_common(g, 0); }
+static void sh_getpeername(Guest* g) { name_common(g, 1); }
+
+/* getaddrinfo(node, service, hints, ADDRINFOA** result): IPv4 answers as a guest list of
+ * ADDRINFOA (32 bytes: flags, family, socktype, protocol, addrlen, canonname, addr, next), each
+ * with its sockaddr_in right after it. */
+static void sh_getaddrinfo(Guest* g)
+{
+    char node[256] = "", service[32] = "";
+    if (ARG(0))
+        snprintf(node, sizeof node, "%s", ARGS(0));
+    if (ARG(1))
+        snprintf(service, sizeof service, "%s", ARGS(1));
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    if (ARG(2))
+    {
+        hints.ai_flags = (int)rd32(ARG(2)) & 0x1; /* AI_PASSIVE */
+        hints.ai_socktype = (int)rd32(ARG(2) + 8);
+        hints.ai_protocol = (int)rd32(ARG(2) + 12);
+    }
+    gt_unlock();
+    int r = getaddrinfo(ARG(0) ? node : NULL, ARG(1) ? service : NULL, &hints, &res);
+    gt_lock();
+    if (r != 0 || !res)
+    {
+        wr32(ARG(3), 0);
+        RET(11001, 4); /* WSAHOST_NOT_FOUND */
+    }
+    uint32_t head = 0, prev = 0;
+    for (struct addrinfo* a = res; a; a = a->ai_next)
+    {
+        if (a->ai_family != AF_INET)
+            continue;
+        uint32_t e = gheap_alloc(32 + 16, 1);
+        wr32(e, (uint32_t)a->ai_flags), wr32(e + 4, 2), wr32(e + 8, (uint32_t)a->ai_socktype);
+        wr32(e + 12, (uint32_t)a->ai_protocol), wr32(e + 16, 16), wr32(e + 20, 0), wr32(e + 24, e + 32), wr32(e + 28, 0);
+        to_guest_addr((const struct sockaddr_in*)a->ai_addr, e + 32, 0);
+        if (prev)
+            wr32(prev + 28, e);
+        else
+            head = e;
+        prev = e;
+    }
+    freeaddrinfo(res);
+    wr32(ARG(3), head);
+    RET(head ? 0 : 11001, 4);
+}
+static void sh_freeaddrinfo(Guest* g)
+{
+    for (uint32_t e = ARG(0); e;)
+    {
+        uint32_t next = rd32(e + 28);
+        gheap_free(e);
+        e = next;
+    }
+    RET(0, 1);
+}
+
+/* WSAIoctl: no extension functions or keep-alive tuning on this host */
+static void sh_WSAIoctl(Guest* g)
+{
+    gt_set_error(10045); /* WSAEOPNOTSUPP */
+    RET(0xFFFFFFFFu, 9);
+}
+
+static const ShimDef WS2_XIV[] = {
+    { "ws2_32.dll", "#11", sh_inet_addr },
+    { "ws2_32.dll", "inet_addr", sh_inet_addr },
+    { "ws2_32.dll", "#5", sh_getpeername },
+    { "ws2_32.dll", "getpeername", sh_getpeername },
+    { "ws2_32.dll", "#6", sh_getsockname },
+    { "ws2_32.dll", "getsockname", sh_getsockname },
+    { "ws2_32.dll", "getaddrinfo", sh_getaddrinfo },
+    { "ws2_32.dll", "freeaddrinfo", sh_freeaddrinfo },
+    { "ws2_32.dll", "WSAIoctl", sh_WSAIoctl },
+    { NULL, NULL, NULL },
+};
+
 /* gethostbyname(name): one hostent the guest reads before the next call, as Winsock's per-thread one */
 static void sh_gethostbyname(Guest* g)
 {
@@ -1013,6 +1127,7 @@ static const ShimDef WS2[] = {
 
 void ws2_init(void)
 {
+    thunk_register(WS2_XIV);
 #if defined(_WIN32)
     WSADATA d;
     WSAStartup(MAKEWORD(2, 2), &d);
