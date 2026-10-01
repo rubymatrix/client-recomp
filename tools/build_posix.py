@@ -52,7 +52,7 @@ else:
     GFX_LIBS = []
 HOST_SOURCES = ['runtime/portable/user32.c', 'runtime/portable/d3d8.c', 'runtime/portable/dsound.c',
                 'runtime/portable/input.c', 'runtime/portable/dinput.c', 'runtime/portable/ws2.c', 'host/host64.c',
-                'host/lsb_login.c', 'host/datui.c', 'host/uidraw.c', 'host/modern.c', 'host/signin.c', 'host/sewave.c', 'host/ui_art.c', 'host/keychain.c', 'host/appdefaults.c'] + GFX_SOURCES
+                'host/lsb_login.c', 'host/datui.c', 'host/uidraw.c', 'host/modern.c', 'host/discord.c', 'host/signin.c', 'host/sewave.c', 'host/ui_art.c', 'host/keychain.c', 'host/appdefaults.c'] + GFX_SOURCES
 # the addon host (host/addons/, docs/addon-compat-design.md): C, C++ (ImGui) and its embedded Lua
 ADDON_SOURCES = sorted('host/addons/' + f for f in os.listdir(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'host', 'addons'))
                        if f.endswith('.c') or f.endswith('.cpp')) + ['generated/addons_lua.c']

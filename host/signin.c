@@ -19,6 +19,7 @@
 #include "plat.h"
 #include "sewave.h"
 #include "signin.h"
+#include "discord.h"
 #include "uidraw.h"
 
 
@@ -1467,6 +1468,7 @@ int signin_run(const SigninSetup* setup, SigninResult* out)
     for (int done = 0; !done;)
     {
         build(u);
+        discord_signin_frame();
         SDL_Event e;
         while (SDL_PollEvent(&e))
         {

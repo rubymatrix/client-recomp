@@ -23,6 +23,8 @@ sign-in screen's Settings.
 - **A native sign-in screen** in the game's own window themes and font, with the password kept in
   the macOS Keychain.
 - **DAT overlays** for a server's own DATs, without touching the install.
+- **Discord Rich Presence**: your character, jobs and zone on your Discord profile while you play,
+  straight to the Discord app's local socket (no SDK, nothing to install).
 
 ## Screenshots
 
@@ -307,6 +309,9 @@ the log reports each one: `[recomp] dats: era-dats, 163 files`.
 | `FFXI_DATS_TRACE=1` | Log every file an overlay supplies: `[dats] <game path> -> <overlay file>`. |
 | `FFXI_PROFILE=1` | Every 2 seconds, log a frame breakdown (game code, API calls, draws, GPU time) and the most-called APIs. |
 | `FFXI_FPS=0` | Hide the frame-rate overlay. |
+| `FFXI_DISCORD=0` | No Discord Rich Presence. |
+| `FFXI_DISCORD_NAME=0` | Rich Presence without the character's name (jobs and zone only). |
+| `FFXI_DISCORD_APP_ID` | The Discord application the presence is shown as, in place of the built-in one. |
 | `FFXI_PROBE=gpu` | Read the game's 16×16 occlusion probe from the GPU. By default it answers "visible" at once, which saves 7–8 ms a frame. |
 | `FFXI_DRAWLOG=<file>` | While `<file>.go` exists, write the next frame's draws to `<file>` (return addresses on the guest stack, texture, vertex box), then remove `.go`. For finding which game code draws what. |
 | `FFXI_ASYNC_READBACK=1` | Small read-only surface locks take the newest finished copy instead of waiting for the GPU. |

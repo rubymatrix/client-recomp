@@ -185,7 +185,7 @@ GFX_SOURCES = ['runtime\\portable\\gfx_hlsl.c', 'runtime\\portable\\gfx_hlsl_sha
 GFX_LIBS = ['d3d12.lib', 'dxgi.lib', 'd3dcompiler.lib', 'dxguid.lib']
 HOST_BASE = ['runtime\\portable\\user32.c', 'runtime\\portable\\d3d8.c', 'runtime\\portable\\dsound.c',
              'runtime\\portable\\input.c', 'runtime\\portable\\dinput.c', 'runtime\\portable\\ws2.c', 'host\\host64.c',
-             'host\\lsb_login.c', 'host\\datui.c', 'host\\uidraw.c', 'host\\modern.c', 'host\\signin.c', 'host\\sewave.c', 'host\\ui_art.c',
+             'host\\lsb_login.c', 'host\\datui.c', 'host\\uidraw.c', 'host\\modern.c', 'host\\discord.c', 'host\\signin.c', 'host\\sewave.c', 'host\\ui_art.c',
              'host\\keychain.c', 'host\\appdefaults.c', 'runtime\\portable\\sampler_win.c']
 HOST_SOURCES = HOST_BASE + GFX_SOURCES
 # the sign-in screen's: stb_image

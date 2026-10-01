@@ -63,6 +63,7 @@
 #include "signin.h"
 #include "appdefaults.h"
 #include "modern.h"
+#include "discord.h"
 #include "addons/addons.h"
 #if defined(_WIN32)
 #include "sampler.h"
@@ -373,6 +374,7 @@ static void present_hook(void)
     modern_frame();
     if (g_addons_on)
         addons_frame();
+    discord_frame();
     if (!g_fps_global)
         find_fps_global();
     if (g_fps_global == 0xFFFFFFFFu)
@@ -582,6 +584,8 @@ int main(int argc, char** argv)
     }
     if (!lsb.password)
         lsb.password = getenv("FFXI_PASSWORD");
+    if (!addon_harness)
+        discord_init();
     if (!addon_harness && !(lsb.user && (lsb.password || lsb.login_token)))
     {
         /* Nothing on the command line signs in: the sign-in screen, in the game's own art. Its
@@ -825,6 +829,12 @@ int main(int argc, char** argv)
 #ifdef __APPLE__
             SDL_free(pref);
 #endif
+        }
+        else
+        {
+            /* Discord's zone names are the addon host's DAT reader's */
+            extern void xi_res_setup(const char* game_dir, const char* const* overlays, unsigned n);
+            xi_res_setup(host_game, dats, ndats);
         }
     }
     if (getenv("FFXI_PROFILE") && getenv("FFXI_PROFILE")[0] && getenv("FFXI_PROFILE")[0] != '0')
