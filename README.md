@@ -1,5 +1,3 @@
-# FFXI on Mac
-
 <a href="https://discord.gg/4vUKPgyvEp"><img src="screenshots/discord_banner.webp" alt="XI on Mac: join the community on Discord"></a>
 
 FINAL FANTASY XI running natively on Apple silicon Macs, with no Wine or Rosetta. The game's
