@@ -84,6 +84,18 @@ end
 
 windower.addon_path = slash(info.path)
 windower.windower_path = slash(info.root)
+
+-- Windower's resources (res/*.lua, read by libs/resources.lua) come from its Resources repository:
+-- without them every res.<table> is nil and addons fail deep inside. Say so once, plainly.
+do
+    local f = io.open(info.root .. 'res/items.lua', 'rb')
+    if f then
+        f:close()
+    elseif not xi.__res_warned then
+        xi.__res_warned = true
+        native.chat.write(("[%s] Windower's resources are missing (%sres/): run tools/addons_fetch.py --only windower-resources"):format(info.name, info.root), 207)
+    end
+end
 windower.ffxi_path = slash(xi.paths.game)
 windower.pol_path = windower.ffxi_path
 

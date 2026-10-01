@@ -1,6 +1,9 @@
 """Fetch Ashita's and Windower's addons, libraries and resources into the addon host's folders.
 
-  python3 tools/addons_fetch.py [--data-dir <folder>] [--only ashita|windower] [--list]
+  python3 tools/addons_fetch.py [--data-dir <folder>] [--only ashita|windower|<source>] [--list]
+
+--only takes a kind or one source by name (--only windower-resources fetches Windower's res/ alone,
+leaving the addons and libraries there as they are).
 
 The addon host (host/addons/, docs/addon-compat-design.md) runs Ashita v4 and Windower 4 addons with
 those projects' own Lua libraries, unchanged. They aren't ours, so the repository never carries them:
@@ -80,11 +83,11 @@ def fetch(name, pin, data_dir):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data-dir', default=DATA_DIR)
-    ap.add_argument('--only', choices=['ashita', 'windower'])
+    ap.add_argument('--only', choices=['ashita', 'windower'] + sorted(PINS))
     ap.add_argument('--list', action='store_true', help='print the pinned sources and stop')
     a = ap.parse_args()
     for name, pin in PINS.items():
-        if a.only and pin.get('kind', name) != a.only:
+        if a.only and a.only not in (name, pin.get('kind', name)):
             continue
         if a.list:
             print('%-20s https://github.com/%s/tree/%s' % (name, pin['repo'], pin['commit']))
