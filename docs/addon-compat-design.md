@@ -21,6 +21,7 @@ Where things are:
 | DAT resources | `host/addons/res.c`, `res_lua.c` |
 | Ashita / Windower layers | `host/addons/lua/ashita*.lua`, `lua/windower*.lua` |
 | Headless test host | `host64 --addon-harness <script>` (`host/addons/harness.c`) |
+| Config > Addons (on/off a row each, scrolling; `addons.cfg`) | `host/addons/manage.c` (list, autoload), `host/modern.c` (the page) |
 | Fetching the projects' libraries | `tools/addons_fetch.py` (run by `tools/setup.py`) |
 
 Decisions made while building, beyond the plan below: LuaJIT's ffi treats `long` as 32 bits and a

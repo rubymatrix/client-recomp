@@ -820,6 +820,7 @@ int main(int argc, char** argv)
 #endif
             AddonsSetup as = { where ? where : ".", host_game, dats, ndats };
             addons_init(&as);
+            modern_set_addons(addons_menu());
             g_addons_on = 1;
 #ifdef __APPLE__
             SDL_free(pref);

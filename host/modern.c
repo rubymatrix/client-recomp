@@ -92,6 +92,11 @@ enum
     CONFIG_GET = FFXI_MODERN_CONFIG_GET,   /* 0x10193850 cdecl (id): a setting of the game's Config */
     HELP_INST = FFXI_MODERN_HELP_INST,     /* 0x105781f8 the global holding the help line's handler ("helpwind") */
     HELP_SETRECT = FFXI_MODERN_WIN_SETRECT, /* 0x1011a5a0 thiscall window (x, y, w, h, 1, 0, 0): its frame there, at once */
+    SPRITE_DRAW = FFXI_MODERN_SPRITE_DRAW, /* 0x1011fb60 thiscall sprite (x, y, colour, 0, 0): drawn there (PAGE_MARK's) */
+    WINDOW_RECT = FFXI_MODERN_WINDOW_RECT, /* 0x10118900 thiscall window (short rect[4], item, 1, 1): where its item is,
+                                            * x and y first, in the coordinates SPRITE_DRAW takes */
+    WINDOW_CURSOR = FFXI_MODERN_WINDOW_CURSOR, /* 0x10118db0 thiscall window (item, hand): the cursor to the item; the
+                                                * window's +0x4c (16 bits) the item it is on */
     VTBL_SLOTS = 17,
     CONFIG_ITEMS = 13,          /* the Config list's own */
     EV_DOWN = 1, EV_UP = 2, EV_RIGHT = 3, EV_LEFT = 4, EV_SELECT = 5, /* a menu's input events (OnInput); the game's own sliders go up on 3 */
@@ -144,6 +149,28 @@ static void hide_apply(void);
 static int g_fx_touched, g_host_touched;
 static char g_fx_keys[32][24]; /* the scene settings changed, to write */
 static int g_nfx_keys;
+
+/* Config > Addons: a row an installed addon (host/addons/manage.c), ADDON_VIS of them at a time
+ * over the list from g_addon_top, scrolled as the inventory is: up from the top row or down from the
+ * bottom one moves the list under the cursor, past the end back round to the start. The rows are
+ * the same each time; their names, kinds and the list's place are drawn each frame (addons_draw)
+ * with a sprite a glyph, so an addon installed while the game runs shows the next time the page
+ * opens. The page's height follows the list's length up to ADDON_VIS rows: a layout for each,
+ * "menu    addonw01" to "menu    addonw10", the page's menu table entry renamed to the one that
+ * fits as it opens. */
+enum
+{
+    ADDON_VIS = 10,
+};
+#define ADDON_ROW                                                                                                      \
+    { "", "@addon", TOGGLE, 2, { "ON", "OFF" }, { 1, 0 }, 0, 0,                                                       \
+        "ON loads it now and each time the game starts. OFF unloads it." }
+static const Row ADDON_ROWS[ADDON_VIS] = { ADDON_ROW, ADDON_ROW, ADDON_ROW, ADDON_ROW, ADDON_ROW, ADDON_ROW, ADDON_ROW,
+    ADDON_ROW, ADDON_ROW, ADDON_ROW };
+static const ModernAddons* g_addons;
+static int g_addon_n, g_addon_top, g_addon_cursor;
+
+void modern_set_addons(const ModernAddons* ops) { g_addons = ops; }
 
 /* ---- the display: the game's own settings (settings.reg), read when it starts ----
  * The window's size (0001 x 0002), the background's (0003 x 0004, square) and the menus' (0037 x
@@ -223,6 +250,9 @@ static float get(const Row* r)
         return g_ui_aspect;
     if (!strncmp(r->key, "@hide", 5))
         return g_hide >> atoi(r->key + 5) & 1 ? 0.0f : 1.0f;
+    if (!strcmp(r->key, "@addon"))
+        return g_addons && g_addon_top + (r - ADDON_ROWS) < g_addon_n ? (float)g_addons->get(g_addon_top + (int)(r - ADDON_ROWS))
+                                                                      : 0.0f;
     return gfx_fx_get(r->key);
 }
 
@@ -261,6 +291,12 @@ static void set(const Row* r, float v)
         g_hide = v != 0.0f ? g_hide & ~bit : g_hide | bit;
         g_host_touched = 1;
         hide_apply();
+    }
+    else if (!strcmp(r->key, "@addon"))
+    {
+        int i = g_addon_top + (int)(r - ADDON_ROWS);
+        if (g_addons && i < g_addon_n)
+            g_addons->set(i, v != 0.0f);
     }
     else
     {
@@ -808,6 +844,23 @@ static void words(int x, int y, const char* s, int button)
     }
 }
 
+/* a panel's words in a colour of their own */
+static void words_in(int x, int y, const char* s, uint32_t col)
+{
+    for (int at = x; *s; ++s)
+    {
+        const Glyph* g = glyph(*s);
+        if (!g)
+        {
+            at += 4;
+            continue;
+        }
+        int top = y + g->v - g->top;
+        part(at, top, at + g->w, top + g->h, g->w, g->h, g->u, g->v, col, M_PANEL, g_font);
+        at += g->w - 1;
+    }
+}
+
 /* The menu pill, w wide, 16 tall. "menu/buttonto" holds it in two strips - its left end and body
  * (row 0 from u 16), its body and right end (row 16) - which the game's own 88-wide buttons put
  * side by side; at other widths their bodies meet in a seam. Here: the left end, one body stretched
@@ -901,17 +954,26 @@ static Page PAGES[] = {
     { "menu    modernwi", "Modern", "Graphics beyond the original's: effects, lighting and draw distance.",
         FFXI_MODERN_MENUS_CONF1WIN, "menu    conf1win", SPARE_DUP, 0x1c0201u, MODERN_ROWS,
         sizeof MODERN_ROWS / sizeof MODERN_ROWS[0] },
+    /* last: there only with the addon host (g_npages) */
+    { "menu    addonw10", "Addons", "Turn the installed addons (Ashita, Windower and xi) on and off.",
+        FFXI_MODERN_MENUS_ADDONS, "menu    oplev   ", SPARE_UNUSED, 0x1c0201u, ADDON_ROWS, ADDON_VIS },
 };
 enum
 {
     PAGE_DISPLAY = 0, /* the one the lobby's Config window opens */
+    PAGE_ADDONS = 3,
 };
 enum
 {
     NPAGES = sizeof PAGES / sizeof PAGES[0],
 };
 
+static int g_npages; /* the pages there are: all but Addons without the addon host */
 static int g_spr_track, g_spr_fill; /* a slider's hit area (nothing to see) and its fill */
+/* Addons': a glyph each (' ' + 1 to '~'), the kinds' words, "New", the scroll bar's track and thumb
+ * (a 4-tall piece each, drawn down its length), and the panel for each count of rows */
+static int g_spr_glyph[95], g_spr_kind[3], g_spr_new, g_spr_bar_track, g_spr_bar_thumb, g_addon_panel[ADDON_VIS + 1];
+static uint32_t g_addon_layout[ADDON_VIS + 1], g_addon_size[ADDON_VIS + 1], g_addon_str[ADDON_VIS + 1];
 static int g_spr_blank;             /* nothing to see: what a hidden item of the game's draws */
 
 static int row_top(int r) { return TITLE_H + r * ROW_H; }
@@ -959,15 +1021,15 @@ static void layout_items(Page* p)
  * title strip fading to red, a bullet a row, the buttons' shadows, the sliders' tracks), a row's
  * words apart from it (a sprite holds at most 255 parts), a row's underline, a list's values, then a
  * button an item. */
-static void page_sprites(Page* p)
+static int panel_sprite(const Page* p, int nrows)
 {
-    p->spr_panel = sprite_begin();
+    int i = sprite_begin(), h = TITLE_H + nrows * ROW_H + 8;
     const uint32_t bg[4] = { WHITE, WHITE, 0x40404040u, 0x40404040u };
-    part4(0, 0, p->w, p->h, p->w, p->h, 0, 0, bg, M_PANEL, NEWTEX);
+    part4(0, 0, p->w, h, p->w, h, 0, 0, bg, M_PANEL, NEWTEX);
     const uint32_t strip[4] = { 0x7f7f7f20u, 0x7f404010u, 0x7f7f7f20u, 0x7f404010u };
     part4(0, 4, p->w, 20, 64, 8, 0, 0, strip, M_ITEM, GAUGE);
     words(8, 6, p->title, 0);
-    for (int r = 0; r < p->nrows; ++r)
+    for (int r = 0; r < nrows; ++r)
     {
         int y = row_top(r);
         part(20, y + 4, 28, y + 12, 8, 8, 0, 8, WHITE, M_GAUGE, GAUGE);
@@ -979,10 +1041,15 @@ static void page_sprites(Page* p)
             part(tx, y, tx + TRACK_W, y + 16, 64, 8, 0, 0, SHADOW, M_ITEM, GAUGE);
         }
     }
-    for (int i = 0; i < p->nitems; ++i)
-        if (p->items[i].opt >= 0)
-            pill(p->items[i].x + 2, row_top(p->items[i].row) + 2, p->items[i].w, PILL_SHADOW, M_PANEL);
+    for (int k = 0; k < p->row_item[nrows]; ++k)
+        if (p->items[k].opt >= 0)
+            pill(p->items[k].x + 2, row_top(p->items[k].row) + 2, p->items[k].w, PILL_SHADOW, M_PANEL);
+    return i;
+}
 
+static void page_sprites(Page* p)
+{
+    p->spr_panel = panel_sprite(p, p->nrows);
     p->spr_caption = S.sprites;
     for (int r = 0; r < p->nrows; ++r)
     {
@@ -1035,6 +1102,28 @@ static int build_sheet(void)
         layout_items(&PAGES[k]);
         page_sprites(&PAGES[k]);
     }
+    const Page* ap = &PAGES[PAGE_ADDONS];
+    for (int k = 1; k < ADDON_VIS; ++k)
+        g_addon_panel[k] = panel_sprite(ap, k);
+    g_addon_panel[ADDON_VIS] = ap->spr_panel;
+    for (int c = 0; c < 95; ++c)
+    {
+        char one[2] = { (char)(' ' + 1 + c), 0 };
+        g_spr_glyph[c] = sprite_begin();
+        words(0, 0, one, 0);
+    }
+    static const char* const KINDS[3] = { "xi", "Ashita", "Windower" };
+    for (int k = 0; k < 3; ++k)
+    {
+        g_spr_kind[k] = sprite_begin();
+        words_in(0, 0, KINDS[k], 0x5a5a5a7fu);
+    }
+    g_spr_new = sprite_begin();
+    words_in(0, 0, "New", 0x7f6c207fu);
+    g_spr_bar_track = sprite_begin();
+    part(0, 0, 6, 4, 64, 8, 0, 0, 0x7f7f7f20u, M_ITEM, GAUGE);
+    g_spr_bar_thumb = sprite_begin();
+    part(0, 0, 6, 4, 64, 6, 0, 1, 0x60607f7fu, M_GAUGE, GAUGE);
     list_sprites(&g_res);
     list_sprites(&g_scale);
     S.p[count] = (uint8_t)S.sprites, S.p[count + 1] = (uint8_t)(S.sprites >> 8);
@@ -1054,24 +1143,27 @@ static int nearest(const Page* p, int r, int x)
 /* A page's layout: the panel with the cursor, a button an option and a slider a range (up and down
  * to the nearest in the next row, left and right along its own), then each row's words as a part
  * that takes no cursor (as the Config list's title tab). */
-static uint8_t* page_layout(const Page* p, size_t* out_size)
+/* ... its first nrows rows, under that panel and name; scroll: up from the top row and down from the
+ * bottom one stay (page_input scrolls) */
+static uint8_t* page_layout_rows(const Page* p, int rows, int panel, const char* name, int scroll, size_t* out_size)
 {
-    const Ref window[2] = { { 0, p->spr_panel, SHEET_NAME }, { 6, 0, "anc     anc_s   " } };
+    const Ref window[2] = { { 0, panel, SHEET_NAME }, { 6, 0, "anc     anc_s   " } };
     static const uint8_t NONE[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-    int n = p->nitems + p->nrows, rows = p->nrows;
+    int nitems = p->row_item[rows], n = nitems + rows;
     uint8_t* dst = calloc(1, 0x20 + 96 + (size_t)n * 64);
     if (!dst)
         return NULL;
-    memcpy(dst, p->name, 16);
+    memcpy(dst, name, 16);
     dst[0x10] = 1, dst[0x11] = (uint8_t)n;
     size_t to = 0x20;
-    to += block(dst + to, PAGE_X, PAGE_Y, p->w, p->h, -1, NULL, window, 2, "-1", "-1", 0);
-    for (int i = 0; i < p->nitems; ++i)
+    to += block(dst + to, PAGE_X, PAGE_Y, p->w, TITLE_H + rows * ROW_H + 8, -1, NULL, window, 2, "-1", "-1", 0);
+    for (int i = 0; i < nitems; ++i)
     {
         const Item* it = &p->items[i];
         int r = it->row, first = p->row_item[r], across = p->row_item[r + 1] - first, k = i - first;
-        uint8_t links[6] = { (uint8_t)((i + p->nitems - 1) % p->nitems + 1), (uint8_t)((i + 1) % p->nitems + 1),
-            (uint8_t)(nearest(p, (r + rows - 1) % rows, it->x) + 1), (uint8_t)(nearest(p, (r + 1) % rows, it->x) + 1),
+        uint8_t links[6] = { (uint8_t)((i + nitems - 1) % nitems + 1), (uint8_t)((i + 1) % nitems + 1),
+            (uint8_t)(scroll && r == 0 ? i + 1 : nearest(p, (r + rows - 1) % rows, it->x) + 1),
+            (uint8_t)(scroll && r == rows - 1 ? i + 1 : nearest(p, (r + 1) % rows, it->x) + 1),
             (uint8_t)(first + (k + 1) % across + 1), (uint8_t)(first + (k + across - 1) % across + 1) };
         Ref ref = { 0, it->sprite, SHEET_NAME };
         to += block(dst + to, it->x, row_top(r), it->w, 16, i + 1, links, &ref, 1, "-1", "-1", 0);
@@ -1079,10 +1171,15 @@ static uint8_t* page_layout(const Page* p, size_t* out_size)
     for (int r = 0; r < rows; ++r)
     {
         Ref ref = { 0, p->spr_caption + r, SHEET_NAME };
-        to += block(dst + to, 0, row_top(r), 16, 16, p->nitems + 1 + r, NONE, &ref, 1, "-1", "-1", 0);
+        to += block(dst + to, 0, row_top(r), 16, 16, nitems + 1 + r, NONE, &ref, 1, "-1", "-1", 0);
     }
     *out_size = to;
     return dst;
+}
+
+static uint8_t* page_layout(const Page* p, size_t* out_size)
+{
+    return page_layout_rows(p, p->nrows, p->spr_panel, p->name, 0, out_size);
 }
 
 /* The Config list with our pages after its last item: every block as it is, the window taller, ours
@@ -1094,7 +1191,7 @@ static uint8_t* config_layout(size_t* out_size)
     if (!src)
         return NULL;
     int count = src[0x11];
-    uint8_t* dst = calloc(1, size + 128 * NPAGES);
+    uint8_t* dst = calloc(1, size + 128 * g_npages);
     size_t at = 0x20, to = 0x20;
     memcpy(dst, src, 0x20);
     int last = 0, lastx = 0, lasty = -1, lastw = 0, lasth = 0, ok = 1;
@@ -1109,21 +1206,21 @@ static uint8_t* config_layout(size_t* out_size)
         if (b >= 0 && src[at + 0x15] == 0xFF)
         {
             /* the title tab: ours go in before it */
-            for (int k = 0; k < NPAGES; ++k)
+            for (int k = 0; k < g_npages; ++k)
             {
-                int id = last + 1 + k, up = id - 1, down = k + 1 < NPAGES ? id + 1 : 1;
+                int id = last + 1 + k, up = id - 1, down = k + 1 < g_npages ? id + 1 : 1;
                 uint8_t links[6] = { (uint8_t)up, (uint8_t)down, (uint8_t)up, (uint8_t)down, (uint8_t)id, (uint8_t)id };
                 Ref ref = { 0, PAGES[k].spr_config, SHEET_NAME };
                 to += block(dst + to, lastx, lasty + lasth * (k + 1), lastw, lasth, id, links, &ref, 1, "-1", "-1", 0);
             }
             memcpy(dst + to, src + at, n);
-            w16(dst + to + 0x12, last + NPAGES + 1);
+            w16(dst + to + 0x12, last + g_npages + 1);
         }
         else
         {
             memcpy(dst + to, src + at, n);
             if (b < 0)
-                w16(dst + to + 0xc, r16(dst + to + 0xc) + 16 * NPAGES); /* the window: taller */
+                w16(dst + to + 0xc, r16(dst + to + 0xc) + 16 * g_npages); /* the window: taller */
             else if (r16(src + at + 4) > lasty)
                 last = r16(src + at + 0x12), lastx = r16(src + at + 2), lasty = r16(src + at + 4),
                 lastw = r16(src + at + 0xa), lasth = r16(src + at + 0xc);
@@ -1137,16 +1234,16 @@ static uint8_t* config_layout(size_t* out_size)
         free(dst);
         return NULL;
     }
-    dst[0x11] = (uint8_t)(count + NPAGES);
+    dst[0x11] = (uint8_t)(count + g_npages);
     /* the last item leads down to ours, the first up to them */
     at = 0x20 + (size_t)r16(dst + 0x20);
-    for (int b = 0; b < count + NPAGES; ++b, at += (size_t)r16(dst + at))
+    for (int b = 0; b < count + g_npages; ++b, at += (size_t)r16(dst + at))
     {
         int id = r16(dst + at + 0x12);
         if (id == last)
             dst[at + 0x16] = dst[at + 0x18] = (uint8_t)(last + 1);
         if (id == 1)
-            dst[at + 0x15] = dst[at + 0x17] = (uint8_t)(last + NPAGES);
+            dst[at + 0x15] = dst[at + 0x17] = (uint8_t)(last + g_npages);
     }
     *out_size = to;
     return dst;
@@ -1196,12 +1293,133 @@ static Page* page_of(uint32_t handler)
     return NULL;
 }
 
+/* ---- Config > Addons ---- */
+
+/* the folders read again, the list from its start, the page as tall as it needs: its entry in the
+ * menu table named for the layout with that many rows. The name to open it by. */
+static uint32_t addons_open(void)
+{
+    Page* p = &PAGES[PAGE_ADDONS];
+    g_addon_n = g_addons->scan();
+    int rows = g_addon_n < 1 ? 1 : g_addon_n > ADDON_VIS ? ADDON_VIS : g_addon_n;
+    g_addon_top = 0, g_addon_cursor = 0;
+    p->nrows = rows, p->nitems = p->row_item[rows], p->h = TITLE_H + rows * ROW_H + 8;
+    memcpy(GUEST_PTR(p->spare), GUEST_PTR(g_addon_str[rows]), 16);
+    return g_addon_str[rows];
+}
+
+static void draw_at(uint32_t list, int spr, int x, int y)
+{
+    uint32_t s = list && spr >= 0 && spr < g_nsprites ? rd32(list + 4u * (uint32_t)spr) : 0;
+    if (s)
+        guest_thiscall(SPRITE_DRAW, s, 5, (uint32_t[]){ (uint32_t)x, (uint32_t)y, 0x80808080u, 0, 0 });
+}
+
+/* s a glyph at a time from x, no wider than w (cut short with ".."); its width */
+static int draw_text(uint32_t list, const char* s, int x, int y, int w)
+{
+    char buf[80];
+    SDL_strlcpy(buf, s, sizeof buf);
+    if (text_width(buf) > w)
+    {
+        size_t n = strlen(buf);
+        while (n && (buf[n] = 0, text_width(buf) + text_width("..") > w))
+            buf[--n] = 0;
+        SDL_strlcat(buf, "..", sizeof buf);
+    }
+    int at = x;
+    for (const char* c = buf; *c; ++c)
+    {
+        const Glyph* gl = glyph(*c);
+        if (gl && *c > ' ' && *c < 127)
+            draw_at(list, g_spr_glyph[*c - ' ' - 1], at, y);
+        at += gl ? gl->w - 1 : 4; /* as words() */
+    }
+    return at - x;
+}
+
+/* each frame: a row's addon's name, its kind (and New), the list's place in the title strip and
+ * a scroll bar when it is longer than the page */
+static void addons_draw(const Page* p, uint32_t window)
+{
+    uint32_t sheet = find_sheet(), list = sheet ? rd32(sheet) : 0;
+    if (!list || !window)
+        return;
+    guest_thiscall(WINDOW_RECT, window, 4, (uint32_t[]){ g_scratch + 48, 1, 1, 1 });
+    int ox = (int16_t)rd16(g_scratch + 48) - p->items[0].x, oy = (int16_t)rd16(g_scratch + 50) - row_top(0);
+    for (int r = 0; r < p->nrows; ++r)
+    {
+        int i = g_addon_top + r, y = oy + row_top(r) + 2;
+        if (i >= g_addon_n)
+        {
+            if (!g_addon_n)
+                draw_text(list, "No addons installed", ox + 32, y, p->cx + 200);
+            continue;
+        }
+        draw_text(list, g_addons->name(i), ox + 32, y, p->cx - 32 - 8);
+        const Item* last = &p->items[p->row_item[r + 1] - 1];
+        const char* kind = g_addons->kind(i);
+        int k = !strcmp(kind, "Ashita") ? 1 : !strcmp(kind, "Windower") ? 2 : 0, kx = ox + last->x + last->w + 12;
+        draw_at(list, g_spr_kind[k], kx, y);
+        if (g_addons->is_new(i))
+            draw_at(list, g_spr_new, kx + text_width("Windower") + 8, y);
+    }
+    if (g_addon_n > p->nrows)
+    {
+        char where[32];
+        SDL_snprintf(where, sizeof where, "%d-%d of %d", g_addon_top + 1, g_addon_top + p->nrows, g_addon_n);
+        draw_text(list, where, ox + p->w - 14 - text_width(where), oy + 6, 200);
+        int x = ox + p->w - 12, top = oy + TITLE_H, h = p->nrows * ROW_H - 6;
+        int th = h * p->nrows / g_addon_n, max = g_addon_n - p->nrows;
+        th = th < 8 ? 8 : th;
+        int ty = top + (h - th) * g_addon_top / max;
+        for (int y = top; y < top + h; y += 4)
+            draw_at(list, y >= ty && y < ty + th ? g_spr_bar_thumb : g_spr_bar_track, x, y);
+    }
+    g_addon_cursor = (int16_t)rd16(window + 0x4c);
+}
+
+/* up on the top row or down on the bottom one, with the cursor staying (as their links have it): the
+ * list moves a row under it, or past its end round to the other end, the cursor with it */
+static void addons_scroll(const Page* p, uint32_t window, int id, int ev)
+{
+    if (!window || (int16_t)rd16(window + 0x4c) != id || g_addon_cursor != id)
+        return; /* the cursor moved: not at an edge */
+    int r = p->items[id - 1].row, rows = p->nrows, max = g_addon_n > rows ? g_addon_n - rows : 0, to;
+    if (ev == EV_UP && r == 0)
+    {
+        if (g_addon_top > 0)
+        {
+            g_addon_top--;
+            return;
+        }
+        g_addon_top = max, to = rows - 1;
+    }
+    else if (ev == EV_DOWN && r == rows - 1)
+    {
+        if (g_addon_top < max)
+        {
+            g_addon_top++;
+            return;
+        }
+        g_addon_top = 0, to = 0;
+    }
+    else
+        return;
+    int item = p->row_item[to] + (id - 1 - p->row_item[r]) + 1;
+    if (item != id)
+        guest_thiscall(WINDOW_CURSOR, window, 2, (uint32_t[]){ (uint32_t)item, 1 });
+    g_addon_cursor = item;
+}
+
 /* the Config list's select: ours open their pages, the rest as the game does */
 static void config_input(Guest* g)
 {
     uint32_t self = g->ecx, ev = ARG(0), item = ARG(1);
     int k = (int16_t)item - CONFIG_ITEMS - 1;
-    if ((int16_t)ev == EV_SELECT && k >= 0 && k < NPAGES)
+    if ((int16_t)ev == EV_SELECT && k == PAGE_ADDONS && k < g_npages)
+        guest_thiscall(MENU_OPEN, MGR, 3, (uint32_t[]){ addons_open(), 1, 0 });
+    else if ((int16_t)ev == EV_SELECT && k >= 0 && k < g_npages)
         guest_thiscall(MENU_OPEN, MGR, 3, (uint32_t[]){ PAGES[k].str_name, 1, 0 });
     else
         guest_thiscall(g_config_slots[6], self, 2, (uint32_t[]){ ev, item });
@@ -1213,7 +1431,7 @@ static void config_draw(Guest* g)
 {
     uint32_t self = g->ecx;
     guest_thiscall(g_config_slots[4], self, 0, NULL);
-    for (int k = 0; k < NPAGES; ++k)
+    for (int k = 0; k < g_npages; ++k)
         help(window_of(self), CONFIG_ITEMS + 1 + k, PAGES[k].str_config_help);
     RET(0, 0);
 }
@@ -1222,6 +1440,8 @@ static void page_open(Guest* g) { RET(0, 0); }
 
 static void page_close(Guest* g)
 {
+    if (page_of(g->ecx) == &PAGES[PAGE_ADDONS] && g_addons)
+        g_addons->seen();
     save();
     RET(0, 0);
 }
@@ -1232,6 +1452,8 @@ static void page_draw(Guest* g)
 {
     uint32_t self = g->ecx, window = window_of(self), fill = sprite(g_spr_fill);
     Page* p = page_of(self);
+    if (p == &PAGES[PAGE_ADDONS] && g_addons)
+        addons_draw(p, window);
     for (int r = 0; p && r < p->nrows; ++r)
     {
         const Row* row = &p->rows[r];
@@ -1287,7 +1509,9 @@ static void page_input(Guest* g)
 {
     int ev = (int16_t)ARG(0), id = (int16_t)ARG(1);
     Page* p = page_of(g->ecx);
-    if (p && id >= 1 && id <= p->nitems)
+    if (p == &PAGES[PAGE_ADDONS] && g_addons && id >= 1 && id <= p->nitems && (ev == EV_UP || ev == EV_DOWN))
+        addons_scroll(p, window_of(g->ecx), id, ev);
+    else if (p && id >= 1 && id <= p->nitems)
     {
         const Item* it = &p->items[id - 1];
         const Row* row = &p->rows[it->row];
@@ -1745,8 +1969,14 @@ static void install(void)
             add(LAYOUT_ADD, MGR, g_config_guest);
         fprintf(stderr, "[modern] Config list: Modern added\n");
     }
-    for (int k = 0; k < NPAGES; ++k)
-        if (!find_layout(PAGES[k].name))
+    for (int k = 0; k < g_npages; ++k)
+        if (k == PAGE_ADDONS)
+        {
+            for (int r = 1; r <= ADDON_VIS; ++r)
+                if (!find_layout((const char*)GUEST_PTR(g_addon_str[r])))
+                    add(LAYOUT_ADD, MGR, g_addon_layout[r]);
+        }
+        else if (!find_layout(PAGES[k].name))
             add(LAYOUT_ADD, MGR, PAGES[k].layout);
     hide_apply();
     lobby_install();
@@ -1763,7 +1993,8 @@ static int setup(void)
     for (int i = 0; i < 7; ++i)
         if (CONFIG_KNOWN[i] && rd32(CONFIG_VTBL + 4u * i) != CONFIG_KNOWN[i])
             return 0;
-    for (int k = 0; k < NPAGES; ++k)
+    g_npages = g_addons ? NPAGES : NPAGES - 1;
+    for (int k = 0; k < g_npages; ++k)
         if (PAGES[k].spare_how == SPARE_END
                 ? !guest_is(PAGES[k].spare, NO_NAME, 16) || rd32(PAGES[k].spare + 0x20) ||
                       *GUEST_PTR(PAGES[k].spare + 0x2c)
@@ -1793,10 +2024,22 @@ static int setup(void)
     wr32(vt + 4 * 3, thunk_for("modern", "page_close"));
     wr32(vt + 4 * 4, thunk_for("modern", "page_draw"));
     wr32(vt + 4 * 6, thunk_for("modern", "page_input"));
-    for (int k = 0; k < NPAGES; ++k)
+    for (int k = 0; k < g_npages; ++k)
     {
         Page* p = &PAGES[k];
         size_t n;
+        if (k == PAGE_ADDONS)
+            for (int r = 1; r <= ADDON_VIS; ++r)
+            {
+                char name[17];
+                SDL_snprintf(name, sizeof name, "menu    addonw%02d", r);
+                uint8_t* l = page_layout_rows(p, r, g_addon_panel[r], name, 1, &n);
+                if (!l)
+                    return 0;
+                g_addon_layout[r] = gbytes(l, (uint32_t)n), g_addon_size[r] = (uint32_t)n;
+                g_addon_str[r] = gstr(name);
+                free(l);
+            }
         uint8_t* l = page_layout(p, &n);
         if (!l)
             return 0;

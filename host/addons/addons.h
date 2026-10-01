@@ -22,6 +22,8 @@ void addons_init(const AddonsSetup* s);
 void addons_frame(void);
 /* The game is ending (its own /shutdown, the window closing): every addon's unload, once. */
 void addons_shutdown(void);
+/* Config > Addons (modern.c): the installed addons, switched on and off from the game's menu. */
+const struct ModernAddons* addons_menu(void);
 /* --addon-harness: runs a script of addon loads, commands, packets and frames with the game's image
  * mapped but the game not started (no window, no GPU), printing chat lines to stdout. The exit code. */
 int addons_harness(const char* script);

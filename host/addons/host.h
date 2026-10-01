@@ -121,6 +121,8 @@ int xi_command(const char* line, int mode, int injected);
 /* Runs a script file (scripts/<name>.txt of a kind, or a path): each line as if typed. */
 int xi_exec_script(const char* name, int kind);
 void xi_cmd_frame(void); /* scripts' waits, the boot script on the first frame */
+/* Config > Addons' list (manage.c): the ones on load on the first frame; the page's switches after */
+void xi_manage_frame(void);
 /* Aliases: /alias add /foo /bar. */
 void xi_alias_set(const char* name, const char* expansion);
 

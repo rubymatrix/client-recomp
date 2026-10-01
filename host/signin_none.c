@@ -6,6 +6,7 @@
 
 void modern_init(const ModernSetup* setup) { (void)setup; }
 void modern_frame(void) {}
+void modern_set_addons(const ModernAddons* ops) { (void)ops; }
 
 int signin_run(const SigninSetup* setup, SigninResult* out)
 {

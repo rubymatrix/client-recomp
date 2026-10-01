@@ -95,7 +95,11 @@
         "log_fit": "0x10162d90",
         "config_get": "0x10193850",
         "help_inst": "0x105781f8",
-        "win_setrect": "0x1011a5a0"
+        "win_setrect": "0x1011a5a0",
+        "sprite_draw": "0x1011fb60",
+        "window_rect": "0x10118900",
+        "window_cursor": "0x10118db0",
+        "menus_addons": "0x103740ec"
       },
       "crt": {
         "strlen": "0x10317440",
@@ -266,7 +270,11 @@
         "log_fit": "0x10161850",
         "config_get": "0x10192310",
         "help_inst": "0x10576088",
-        "win_setrect": "0x1011a1a0"
+        "win_setrect": "0x1011a1a0",
+        "sprite_draw": "0x1011f760",
+        "window_rect": "0x10118500",
+        "window_cursor": "0x101189b0",
+        "menus_addons": "0x1037207c"
       },
       "crt": {
         "strlen": "0x10315a00",
