@@ -21,6 +21,13 @@ typedef struct GThread
     uint32_t tls[GT_TLS_SLOTS];
 } GThread;
 
+/* The process environment block every TEB points at (fs:[0x30]): 0 until gt_set_peb. */
+void gt_set_peb(uint32_t peb);
+/* Static TLS (__declspec(thread)) of an EXE image: its .tls template [start, start + size) plus
+ * zero_fill bytes. Every guest thread created after this gets its own copy, reached through the
+ * TEB's ThreadLocalStoragePointer (fs:[0x2C]) at slot 0 (the image's _tls_index, set to 0). */
+void gt_set_static_tls(uint32_t start, uint32_t size, uint32_t zero_fill);
+
 /* This thread's guest state, created on first use (the caller holds the guest lock). */
 GThread* gt_self(void);
 /* Frees this thread's guest state; its host thread is about to end. */

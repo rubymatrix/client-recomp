@@ -21,3 +21,7 @@ uint32_t pe_resource(uint32_t base, uint32_t type, uint32_t name, uint32_t* size
 /* FindResource's lookup: type and name as Win32 passes them (integer ids, "#n", or ANSI/UTF-16
  * strings). Returns the guest address of the IMAGE_RESOURCE_DATA_ENTRY (the HRSRC), or 0. */
 uint32_t pe_find_resource(uint32_t base, uint32_t type, uint32_t name, int wide);
+/* The image's static TLS (IMAGE_TLS_DIRECTORY): its template and zero fill, for
+ * gt_set_static_tls. Sets the image's _tls_index to 0 and returns the guest address of its
+ * NULL-terminated TLS callback array (0 if none, or no TLS directory). */
+uint32_t pe_static_tls(uint32_t base, uint32_t* start, uint32_t* size, uint32_t* zero_fill);

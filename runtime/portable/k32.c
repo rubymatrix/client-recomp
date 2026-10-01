@@ -95,9 +95,14 @@ static const char* added_module(uint32_t h)
     return NULL;
 }
 
+/* The file name of the translated image: FFXiMain.dll, or the EXE itself (k32_set_image_name). */
+static const char* g_image_name = "FFXiMain.dll";
+
+void k32_set_image_name(const char* name) { g_image_name = name; }
+
 static uint32_t module_handle(const char* name)
 {
-    if (!stricmp_(base_name(name), "FFXiMain.dll"))
+    if (!stricmp_(base_name(name), g_image_name))
         return rt_image_base;
     for (unsigned i = 0; i < g_nmods; ++i)
         if (!stricmp_(base_name(name), g_mods[i].name))
@@ -176,7 +181,7 @@ static void sh_GetModuleFileNameA(Guest* g)
     uint32_t h = ARG(0), buf = ARG(1), n = ARG(2);
     char path[700];
     if (h == rt_image_base)
-        snprintf(path, sizeof path, "%s\\FFXiMain.dll", g_game_dir);
+        snprintf(path, sizeof path, "%s\\%s", g_game_dir, g_image_name);
     else if (added_module(h))
         snprintf(path, sizeof path, "%s\\%s", g_game_dir, added_module(h));
     else if (!h || h == EXE_HANDLE)
@@ -552,12 +557,16 @@ static void sh_GetStringTypeA(Guest* g) { string_type(ARG(1), ARG(2), (int32_t)A
 /* --- process environment ------------------------------------------------------------------------ */
 static uint32_t g_cmdline, g_env_a, g_env_w;
 
+static const char* g_cmdline_args; /* after the quoted exe path (k32_set_command_line) */
+
+void k32_set_command_line(const char* args) { g_cmdline_args = args; }
+
 static void sh_GetCommandLineA(Guest* g)
 {
     if (!g_cmdline)
     {
-        char s[640];
-        snprintf(s, sizeof s, "\"%s\"", g_exe_path);
+        char s[1024];
+        snprintf(s, sizeof s, "\"%s\"%s%s", g_exe_path, g_cmdline_args ? " " : "", g_cmdline_args ? g_cmdline_args : "");
         g_cmdline = gheap_strdup(s);
     }
     RET(g_cmdline, 0);
@@ -619,7 +628,23 @@ static void sh_OutputDebugStringA(Guest* g) { plat_debug(ARGS(0)); RET(0, 1); }
 static void sh_ExitProcess(Guest* g) { rt_log("[recomp] ExitProcess(%u)\n", ARG(0)); exit((int)ARG(0)); }
 
 /* --- time --------------------------------------------------------------------------------------- */
-static void sh_GetTickCount(Guest* g) { RET((uint32_t)(rt_monotonic_ns() / 1000000u), 0); }
+/* GetTickCount starts at a value the host may choose (k32_set_tick_base): ffxivgame.exe decrypts
+ * its launch argument with a key derived from it. */
+static uint32_t g_tick_base;
+static uint64_t g_tick_start_ns;
+
+void k32_set_tick_base(uint32_t tick)
+{
+    g_tick_base = tick;
+    g_tick_start_ns = rt_monotonic_ns();
+}
+
+static void sh_GetTickCount(Guest* g)
+{
+    if (g_tick_start_ns)
+        RET(g_tick_base + (uint32_t)((rt_monotonic_ns() - g_tick_start_ns) / 1000000u), 0);
+    RET((uint32_t)(rt_monotonic_ns() / 1000000u), 0);
+}
 
 static void sh_QueryPerformanceFrequency(Guest* g)
 {

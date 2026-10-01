@@ -112,14 +112,22 @@ class FunctionTranslator:
         self.insns.sort(key=lambda i: i.address)
 
     def jump_targets(self, ins):
-        """Direct intra-procedural control transfers out of an instruction (not calls)."""
+        """Direct intra-procedural control transfers out of an instruction, and the return point of
+        a call: Ghidra ends a body after a call it believes never returns, and is sometimes wrong
+        (ffxivgame.exe 0x9e4a69 calls free(), 0x9d5c88, and its body stopped there), so the code
+        after every call is decoded as this function's unless another function starts there."""
         mn = ins.mnemonic
         out = []
+        if mn == 'call':
+            return [ins.address + ins.size]
         if mn == 'jmp' or (mn[0] == 'j' and mn[1:] in CC) or mn in ('jecxz', 'loop', 'loope', 'loopne'):
             if ins.operands and ins.operands[0].type == X.X86_OP_IMM:
                 out.append(ins.operands[0].imm & 0xFFFFFFFF)
             elif mn == 'jmp':
-                out.extend(self.ctx.switches.get(ins.address, ()))
+                sw = self.ctx.switches.get(ins.address)
+                if sw is None:
+                    sw = self.ctx.infer_switch(ins)
+                out.extend(sw or ())
         return out
 
     def inside(self, a):
@@ -526,6 +534,13 @@ class FunctionTranslator:
                 tgt = t.imm & 0xFFFFFFFF
                 if tgt == nxt:  # call $+5 ; pop r  (get EIP)
                     return ['esp -= 4; wr32(esp, %s + RD);' % hexu(nxt)], True
+                if tgt not in self.ctx.entries:
+                    # A call to code no function starts at (an SEH __finally block, or code past
+                    # a body Ghidra cut short): it becomes an entry of its own, translated too.
+                    end = self.ctx.code_until_ret(tgt)
+                    if end:
+                        self.ctx.functions[tgt] = [[tgt, end]]
+                        self.ctx.entries.add(tgt)
                 if tgt in self.ctx.entries:
                     return self.call(tgt, nxt), True
                 return ['RT_BADJUMP(%s);' % hexu(tgt)], False

@@ -27,3 +27,14 @@ int reg_get_dword(const char* path, const char* name, uint32_t* out);
 int reg_get_string(const char* path, const char* name, char* out, size_t n);
 /* Sets a string value (REG_SZ), creating the key: what the host knows better than the imported file. */
 void reg_set_string(const char* path, const char* name, const char* value);
+
+/* The translated image's file name (default FFXiMain.dll): an EXE (ffxivgame.exe) is also the
+ * process image, at EXE_HANDLE. */
+void k32_set_image_name(const char* name);
+
+/* kernel32 calls only FINAL FANTASY XIV makes (k32_xiv.c) */
+void k32_xiv_init(void);
+/* The arguments after the exe path in GetCommandLine, and the value GetTickCount starts from
+ * (ffxivgame.exe's launch argument is keyed to it: tools/xiv_args.py). */
+void k32_set_command_line(const char* args);
+void k32_set_tick_base(uint32_t tick);

@@ -40,6 +40,8 @@ static Shim find_shim(const char* dll, const char* name)
     return NULL;
 }
 
+Shim thunk_shim(const char* dll, const char* name) { return find_shim(dll, name); }
+
 uint32_t thunk_for(const char* dll, const char* name)
 {
     char full[96];

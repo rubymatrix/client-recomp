@@ -25,6 +25,9 @@ typedef struct ShimDef
 
 /* Adds a NULL-terminated table of shims (k32.c and friends call this from their init). */
 void thunk_register(const ShimDef* defs);
+/* The shim registered for dll!name, or NULL: lets one shim forward to another (the W calls of
+ * k32_xiv.c convert their strings and run the A shim). */
+Shim thunk_shim(const char* dll, const char* name);
 /* The guest address for dll!name, created on first request. */
 uint32_t thunk_for(const char* dll, const char* name);
 /* rt_call_indirect's native handler. */
