@@ -3001,6 +3001,68 @@ static struct
     struct { uint32_t frame, draws, late, targets; char why, ran, changed, cam; } trace[1200];
 } g_scene;
 
+/* The sun, by vote. FFXI lights each object with lights of its own, some tens of degrees apart, so
+ * the first lit draw's light (the old way) turned the shadows as the camera moved. Each lit draw of
+ * the world votes for each of its directional lights, in the world: its first light counts 1, the
+ * rest 0.5; lights within about 2 degrees are one light; scores fade by 0.99 a frame. Another light
+ * becomes the sun only when it has scored 1.5 times the sun's for four frames running. The winner's
+ * direction is its latest, so the sun still moves through the day. */
+static struct
+{
+    struct { float dir[3], color[4], score; } c[8];
+    int cur, chal, chal_frames; /* the sun, the light overtaking it and for how many frames; -1 none */
+} g_sunv = { .cur = -1, .chal = -1 };
+
+static void sun_vote(const float* w, const float* color, float weight)
+{
+    int at = -1, low = -1;
+    for (int i = 0; i < 8; ++i)
+    {
+        const float* d = g_sunv.c[i].dir;
+        if (g_sunv.c[i].score > 0.0f && d[0] * w[0] + d[1] * w[1] + d[2] * w[2] > 0.9995f)
+        {
+            at = i;
+            break;
+        }
+        if (i != g_sunv.cur && (low < 0 || g_sunv.c[i].score < g_sunv.c[low].score))
+            low = i;
+    }
+    if (at < 0)
+    {
+        if (low < 0)
+            return;
+        at = low, g_sunv.c[at].score = 0.0f;
+        if (g_sunv.chal == at)
+            g_sunv.chal = -1;
+    }
+    memcpy(g_sunv.c[at].dir, w, 12);
+    memcpy(g_sunv.c[at].color, color, 16);
+    g_sunv.c[at].score += weight;
+}
+
+/* the frame's sun from the votes so far */
+static int sun_pick(void)
+{
+    int top = -1;
+    for (int i = 0; i < 8; ++i)
+        if (g_sunv.c[i].score > 0.0f && (top < 0 || g_sunv.c[i].score > g_sunv.c[top].score))
+            top = i;
+    if (top < 0)
+        return g_sunv.cur;
+    if (g_sunv.cur < 0 || g_sunv.c[g_sunv.cur].score <= 0.0f)
+        g_sunv.cur = top, g_sunv.chal = -1;
+    else if (top != g_sunv.cur && g_sunv.c[top].score > 1.5f * g_sunv.c[g_sunv.cur].score)
+    {
+        g_sunv.chal_frames = g_sunv.chal == top ? g_sunv.chal_frames + 1 : 1;
+        g_sunv.chal = top;
+        if (g_sunv.chal_frames >= 4)
+            g_sunv.cur = top, g_sunv.chal = -1;
+    }
+    else
+        g_sunv.chal = -1;
+    return g_sunv.cur;
+}
+
 /* a texture going away: the scene no longer points at it */
 static void scene_forget(GfxTex* t)
 {
@@ -3036,6 +3098,23 @@ static void scene_finish(const char* why)
     if (g_scene.draws && !g_scene.done && g_scene.cam && (!g_scene.world || g_scene.rt == g_scene.world) &&
         !g_scene.world_done)
     {
+        /* the sun the votes chose, into this scene's camera space; w = 1 when lit draws voted in this
+         * scene (without, the back end holds the last sun) */
+        int sun = sun_pick();
+        GfxScene* sc = &g_scene.s;
+        sc->sun_dir[3] = 0.0f;
+        if (sun >= 0 && g_scene.sun_draw)
+        {
+            const float* w = g_sunv.c[sun].dir;
+            for (int j = 0; j < 3; ++j)
+                sc->sun_dir[j] = w[0] * sc->view[j] + w[1] * sc->view[4 + j] + w[2] * sc->view[8 + j];
+            float l = sqrtf(sc->sun_dir[0] * sc->sun_dir[0] + sc->sun_dir[1] * sc->sun_dir[1] + sc->sun_dir[2] * sc->sun_dir[2]);
+            if (l > 0.0f)
+            {
+                sc->sun_dir[0] /= l, sc->sun_dir[1] /= l, sc->sun_dir[2] /= l, sc->sun_dir[3] = 1.0f;
+                memcpy(sc->sun_color, g_sunv.c[sun].color, 16);
+            }
+        }
         gfx_scene_done(g_scene.rt, &g_scene.s);
         g_scene.world_done = 1;
         g_scene.tr_why = why[0] == 's' && why[1] == 'w' ? 'w' : why[0], g_scene.tr_draws = g_scene.draws;
@@ -3127,12 +3206,26 @@ static void scene_note(GfxDraw* d)
         sc->fog[0] = d->u.params[2], sc->fog[1] = d->u.params[3], sc->fog[2] = d->fs.fog ? 1.0f : 0.0f;
         g_scene.cam = 1;
     }
-    if (d->vs.nlights && d->vs.light_type[0] == 3 && d->depth.zwrite && !g_scene.sun_draw)
+    if (d->vs.nlights && d->depth.zwrite)
     {
-        g_scene.sun_draw = g_scene.draws;
-        memcpy(sc->sun_dir, d->u.light[0].dir, 12);
-        sc->sun_dir[3] = 1.0f;
-        memcpy(sc->sun_color, d->u.light[0].diffuse, 16);
+        /* each directional light's vote (sun_vote), back into the world through the view's rotation */
+        const float* v = s->xf[2];
+        for (int k = 0; k < d->vs.nlights; ++k)
+        {
+            if (d->vs.light_type[k] != 3)
+                continue;
+            const float* c = d->u.light[k].dir;
+            float w[3];
+            for (int i = 0; i < 3; ++i)
+                w[i] = c[0] * v[i * 4] + c[1] * v[i * 4 + 1] + c[2] * v[i * 4 + 2];
+            float l = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+            if (l <= 0.0f)
+                continue;
+            w[0] /= l, w[1] /= l, w[2] /= l;
+            sun_vote(w, d->u.light[k].diffuse, k == 0 ? 1.0f : 0.5f);
+            if (!g_scene.sun_draw)
+                g_scene.sun_draw = g_scene.draws;
+        }
     }
 }
 
@@ -3192,6 +3285,8 @@ static void scene_present(void)
             best = g_scene.tally[i].n, g_scene.world = g_scene.tally[i].t;
     scene_trace(world_before);
     g_scene.world_done = 0;
+    for (int i = 0; i < 8; ++i)
+        g_sunv.c[i].score *= 0.99f;
     for (int i = 0; i < 4; ++i)
         g_scene.tally[i].t = NULL, g_scene.tally[i].n = 0;
     if (gfx_profiling && ++g_scene.st_frames == 120)

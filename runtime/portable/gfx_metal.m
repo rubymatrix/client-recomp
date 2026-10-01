@@ -18,6 +18,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include <SDL3/SDL.h>
+#include <limits.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -119,6 +120,15 @@ static _Atomic uint64_t g_completed;  /* the last frame the GPU finished */
 static int g_frame_open;              /* the semaphore was taken for g_serial */
 static uint32_t g_cmd_draws;          /* draws in the command buffer being recorded */
 static _Atomic uint64_t g_gpu_ns;      /* GPU time of the committed command buffers (profile) */
+/* GPU time per part of the frame (profile): timestamps at the boundaries of the sun maps' passes and
+ * the effects' passes, read back when the frame completes. TS_AO1 ends the occlusion and shadow
+ * passes (through the temporal one). */
+enum { TS_SUN0, TS_SUN1, TS_FX0, TS_AO1, TS_FX1, TS_N };
+static id<MTLCounterSampleBuffer> g_ts[FRAMES];
+static int g_ts_ok = -1;               /* -1 not looked at, 0 the GPU cannot, 1 g_ts[] are there */
+static uint8_t g_ts_started;           /* this frame: 1 << TS_SUN0, 1 << TS_FX0 once the first pass marked it */
+static _Atomic uint64_t g_ts_sun_ns, g_ts_fx_ns, g_ts_ao_ns;
+static double g_ts_scale;              /* ns per GPU timestamp tick */
 
 static GfxTex* g_rt;
 static uint32_t g_rt_face, g_rt_level;
@@ -141,7 +151,7 @@ static struct
 {
     float fx, ao, radius, grade, sat, contrast, sharpen, filter, aniso, fog, fog_falloff, fog_height, fog_max, fog_sun,
         fog_g, bloom, threshold, rays, rays_decay, rays_length, light, shadow, shadow_length, sun, sun_distance, sun_soft, sun_face, sun_min, sun_direct, sun_casters, sun_near, temporal, debug, draw,
-        draw_entities, fps, aa;
+        draw_entities, fps, aa, ao_quality, sun_detail;
 } g_fxs;
 
 /* --- small hash maps (key bytes -> object) ------------------------------------------------------------- */
@@ -289,6 +299,10 @@ static void prof_frame(uint64_t present_start)
             fprintf(stderr, "%s%s %llu", any++ ? ", " : "[gfx]   skipped draws (2 s): ", WHY[i], (unsigned long long)g_prof.skips[i]);
     if (any)
         fprintf(stderr, "\n");
+    if (g_ts_ok > 0)
+        fprintf(stderr, "[gfx]   GPU per frame: sun maps %.2f ms, effects %.2f ms (occlusion and shadows %.2f)\n",
+            (double)atomic_exchange(&g_ts_sun_ns, 0) * ms, (double)atomic_exchange(&g_ts_fx_ns, 0) * ms,
+            (double)atomic_exchange(&g_ts_ao_ns, 0) * ms);
     memset(&g_prof, 0, sizeof g_prof);
     g_prof.since_ns = now;
 }
@@ -475,7 +489,15 @@ struct GfxBuf
     id<MTLBuffer> b;
     uint32_t size;
     uint64_t used; /* the last frame serial that drew from it */
+    uint64_t up_last, up_prev; /* the frames of its last two uploads (buf_volatile) */
 };
+
+/* a static buffer the game keeps rewriting (uploaded in two frames within the last 300): what is drawn
+ * from it cannot be drawn again later from it, so the sun's cache keeps a copy instead */
+static int buf_volatile(const GfxBuf* b)
+{
+    return b->up_prev && b->up_last - b->up_prev <= 300 && g_serial - b->up_last <= 300;
+}
 
 GfxBuf* gfx_buf_create(uint32_t size)
 {
@@ -505,6 +527,8 @@ void gfx_buf_upload(GfxBuf* b, const void* data, uint32_t size)
     if (size > b->size)
         size = b->size;
     sun_cache_forget(b->b); /* new contents: the cache's copy of what it drew is no longer it */
+    if (b->up_last != g_serial)
+        b->up_prev = b->up_last, b->up_last = g_serial;
     if (b->used > atomic_load(&g_completed))
     {
         /* recorded or running work still reads the old contents: rename */
@@ -1217,7 +1241,10 @@ typedef struct Caster
     uint32_t n, vstart;
     uint8_t itype; /* 0 no indices, 2 or 4 bytes each */
     uint8_t fixed; /* every vertex and index from buffers the game keeps (the zone's): cached (sun_cache) */
+    uint8_t keep;  /* not fixed, but a placed object (not a character): kept as a copy (sun_cache_update) */
+    uint8_t has_pos;
     int32_t zbias;
+    float clip0[4]; /* its first vertex in the camera's clip space (draw_clip0): where this copy stands */
 } Caster;
 
 static Caster* g_casters;
@@ -1238,6 +1265,197 @@ static void casters_clear(void)
     g_ncasters = 0;
 }
 
+/* --- a draw's first vertex through its vertex function, on the CPU ---
+ * FFXI draws every copy of a zone mesh (all the trees of one kind) from the same buffers, each placed
+ * by its vertex shader's constants: the buffers say nothing of where a copy stands. Its first
+ * vertex's clip position, through the frame's camera back into the world, does. A small vs.1.x
+ * interpreter over the draw's constants and vertex bytes, the same arithmetic gfx_msl_shaders.c
+ * writes out as MSL; fixed function is P * WVP. */
+static void vs_src(float out[4], uint32_t t, const float (*r)[4], const float (*v)[4], const float (*c)[4], const float* a0)
+{
+    uint32_t type = (t >> 28) & 7, num = t & 0x7FF, mod = (t >> 24) & 0xF, sw = (t >> 16) & 0xFF;
+    static const float zero[4] = { 0, 0, 0, 0 };
+    const float* reg = zero;
+    if (type == 0 && num < 12)
+        reg = r[num];
+    else if (type == 1 && num < GFX_NREGS)
+        reg = v[num];
+    else if (type == 2)
+    {
+        int i = (int)num + ((t & 0x2000) ? (int)a0[0] : 0);
+        reg = c[i < 0 ? 0 : i >= GFX_NVSC ? GFX_NVSC - 1 : i];
+    }
+    else if (type == 3)
+        reg = a0;
+    for (int i = 0; i < 4; ++i)
+    {
+        float x = reg[(sw >> (2 * i)) & 3];
+        switch (mod)
+        {
+        case 1: x = -x; break;
+        case 2: x = x - 0.5f; break;
+        case 3: x = 0.5f - x; break;
+        case 4: x = (x - 0.5f) * 2.0f; break;
+        case 5: x = -(x - 0.5f) * 2.0f; break;
+        case 6: x = 1.0f - x; break;
+        case 7: x = x * 2.0f; break;
+        case 8: x = -x * 2.0f; break;
+        }
+        out[i] = x;
+    }
+}
+
+/* the input registers of vertex vi as the declaration maps them */
+static int vs_fetch(const GfxDraw* d, int vi, float v[GFX_NREGS][4])
+{
+    for (int r = 0; r < GFX_NREGS; ++r)
+    {
+        v[r][0] = v[r][1] = v[r][2] = 0, v[r][3] = 1;
+        const GfxElem* e = &d->vs.el[r];
+        if (!e->used)
+            continue;
+        int s = e->stream;
+        const uint8_t* base;
+        size_t have;
+        if (d->buf[s])
+            base = (const uint8_t*)[d->buf[s]->b contents] + d->buf_off[s], have = d->buf[s]->size > d->buf_off[s] ? d->buf[s]->size - d->buf_off[s] : 0;
+        else if (d->data[s])
+            base = (const uint8_t*)d->data[s], have = d->size[s];
+        else
+            return 0;
+        long at = (long)vi * d->u.stride[s] + d->u.offset[r];
+        static const uint8_t SIZE[8] = { 4, 8, 12, 16, 4, 4, 4, 8 };
+        if (at < 0 || (size_t)at + SIZE[e->type & 7] > have)
+            return 0;
+        const uint8_t* p = base + at;
+        switch (e->type)
+        {
+        case GFX_FLOAT1: memcpy(v[r], p, 4); break;
+        case GFX_FLOAT2: memcpy(v[r], p, 8); break;
+        case GFX_FLOAT3: memcpy(v[r], p, 12); break;
+        case GFX_FLOAT4: memcpy(v[r], p, 16); break;
+        case GFX_D3DCOLOR: v[r][0] = p[2] / 255.0f, v[r][1] = p[1] / 255.0f, v[r][2] = p[0] / 255.0f, v[r][3] = p[3] / 255.0f; break;
+        case GFX_UBYTE4: for (int i = 0; i < 4; ++i) v[r][i] = p[i]; break;
+        case GFX_SHORT2: { int16_t h[2]; memcpy(h, p, 4); v[r][0] = h[0], v[r][1] = h[1]; break; }
+        default: { int16_t h[4]; memcpy(h, p, 8); for (int i = 0; i < 4; ++i) v[r][i] = h[i]; break; }
+        }
+    }
+    return 1;
+}
+
+/* clip-space position of the draw's first vertex in out; 0 when it cannot be had */
+static int draw_clip0(const GfxDraw* d, float out[4])
+{
+    if (d->vs.rhw)
+        return 0;
+    long idx = d->vertex_start;
+    if (d->indices)
+        idx = d->index_size == 2 ? ((const uint16_t*)d->indices)[0] : (long)((const uint32_t*)d->indices)[0];
+    float v[GFX_NREGS][4];
+    if (!vs_fetch(d, (int)(idx + d->u.vofs), v))
+        return 0;
+    if (!d->vs.prog)
+    {
+        const float* m = d->u.wvp;
+        for (int j = 0; j < 4; ++j)
+            out[j] = v[0][0] * m[j] + v[0][1] * m[4 + j] + v[0][2] * m[8 + j] + m[12 + j];
+        return 1;
+    }
+    const uint32_t* t = d->vs_tokens;
+    if (!t || (t[0] & 0xFFFF0000u) != 0xFFFE0000u)
+        return 0;
+    float r[12][4], a0[4] = { 0, 0, 0, 0 }, opos[4] = { 0, 0, 0, 1 };
+    memset(r, 0, sizeof r);
+    const float(*c)[4] = (const float(*)[4])d->u.vsc;
+    for (uint32_t i = 1; i < 65536;)
+    {
+        uint32_t tok = t[i], op = tok & 0xFFFF;
+        if (tok == 0x0000FFFFu)
+            break;
+        if (op == 0xFFFE)
+        {
+            i += 1 + ((tok >> 16) & 0x7FFF);
+            continue;
+        }
+        const uint32_t* p = &t[i + 1];
+        float s0[4], s1[4], s2[4], res[4] = { 0, 0, 0, 0 };
+        int np;
+        switch (op)
+        {
+        case 0: case 81: np = op ? 5 : 0; break;
+        case 1: case 6: case 7: case 14: case 15: case 16: case 19: case 78: case 79: np = 2; break;
+        case 2: case 3: case 5: case 8: case 9: case 10: case 11: case 12: case 13: case 17: np = 3; break;
+        case 20: case 21: case 22: case 23: case 24: np = 3; break;
+        case 4: case 18: np = 4; break;
+        default: return 0; /* not vs.1.x */
+        }
+        if (op == 0 || op == 81)
+        {
+            i += 1 + (uint32_t)np;
+            continue;
+        }
+        if (np >= 2)
+            vs_src(s0, p[1], r, v, c, a0);
+        if (np >= 3 && !(op >= 20 && op <= 24))
+            vs_src(s1, p[2], r, v, c, a0);
+        if (np >= 4)
+            vs_src(s2, p[3], r, v, c, a0);
+        switch (op)
+        {
+        case 1: memcpy(res, s0, 16); break;
+        case 2: for (int k = 0; k < 4; ++k) res[k] = s0[k] + s1[k]; break;
+        case 3: for (int k = 0; k < 4; ++k) res[k] = s0[k] - s1[k]; break;
+        case 4: for (int k = 0; k < 4; ++k) res[k] = s0[k] * s1[k] + s2[k]; break;
+        case 5: for (int k = 0; k < 4; ++k) res[k] = s0[k] * s1[k]; break;
+        case 6: res[0] = res[1] = res[2] = res[3] = s0[3] == 0.0f ? INFINITY : 1.0f / s0[3]; break;
+        case 7: res[0] = res[1] = res[2] = res[3] = s0[3] == 0.0f ? INFINITY : 1.0f / sqrtf(fabsf(s0[3])); break;
+        case 8: res[0] = res[1] = res[2] = res[3] = s0[0] * s1[0] + s0[1] * s1[1] + s0[2] * s1[2]; break;
+        case 9: res[0] = res[1] = res[2] = res[3] = s0[0] * s1[0] + s0[1] * s1[1] + s0[2] * s1[2] + s0[3] * s1[3]; break;
+        case 10: for (int k = 0; k < 4; ++k) res[k] = fminf(s0[k], s1[k]); break;
+        case 11: for (int k = 0; k < 4; ++k) res[k] = fmaxf(s0[k], s1[k]); break;
+        case 12: for (int k = 0; k < 4; ++k) res[k] = s0[k] < s1[k] ? 1.0f : 0.0f; break;
+        case 13: for (int k = 0; k < 4; ++k) res[k] = s0[k] >= s1[k] ? 1.0f : 0.0f; break;
+        case 14: case 78: res[0] = res[1] = res[2] = res[3] = exp2f(s0[3]); break;
+        case 15: case 79: res[0] = res[1] = res[2] = res[3] = s0[3] == 0.0f ? -INFINITY : log2f(fabsf(s0[3])); break;
+        case 16:
+            res[0] = 1.0f, res[1] = fmaxf(s0[0], 0.0f), res[3] = 1.0f;
+            res[2] = s0[0] > 0.0f && s0[1] > 0.0f ? powf(s0[1], fminf(fmaxf(s0[3], -127.9961f), 127.9961f)) : 0.0f;
+            break;
+        case 17: res[0] = 1.0f, res[1] = s0[1] * s1[1], res[2] = s0[2], res[3] = s1[3]; break;
+        case 18: for (int k = 0; k < 4; ++k) res[k] = s2[k] + (s1[k] - s2[k]) * s0[k]; break;
+        case 19: for (int k = 0; k < 4; ++k) res[k] = s0[k] - floorf(s0[k]); break;
+        default:
+        {
+            /* m4x4, m4x3, m3x4, m3x3, m3x2: dot products against consecutive constant rows */
+            int rows = op == 20 ? 4 : op == 21 ? 3 : op == 22 ? 4 : op == 23 ? 3 : 2, three = op >= 22;
+            for (int k = 0; k < rows; ++k)
+            {
+                float row[4];
+                vs_src(row, p[2] + (uint32_t)k, r, v, c, a0);
+                res[k] = s0[0] * row[0] + s0[1] * row[1] + s0[2] * row[2] + (three ? 0.0f : s0[3] * row[3]);
+            }
+            break;
+        }
+        }
+        uint32_t dt = p[0], type = (dt >> 28) & 7, num = dt & 0x7FF, mask = (dt >> 16) & 0xF;
+        if (op >= 20 && op <= 24)
+            mask = op == 20 || op == 22 ? 0xF : op == 24 ? 0x3 : 0x7;
+        if (mask == 0)
+            mask = 0xF;
+        if ((dt >> 20) & 1)
+            for (int k = 0; k < 4; ++k)
+                res[k] = fminf(fmaxf(res[k], 0.0f), 1.0f);
+        float* dst = type == 0 && num < 12 ? r[num] : type == 3 ? a0 : type == 4 && num == 0 ? opos : NULL;
+        if (dst)
+            for (int k = 0; k < 4; ++k)
+                if (mask & (1u << k))
+                    dst[k] = res[k];
+        i += 1 + (uint32_t)np;
+    }
+    memcpy(out, opos, 16);
+    return isfinite(out[0]) && isfinite(out[1]) && isfinite(out[2]) && isfinite(out[3]);
+}
+
 static Caster* caster_new(const GfxDraw* d)
 {
     if (g_ncasters == g_casters_cap)
@@ -1251,6 +1469,7 @@ static Caster* caster_new(const GfxDraw* d)
     c->vs = d->vs_tokens, c->ps = d->ps_tokens;
     c->zbias = d->zbias;
     c->fixed = d->prim != GFX_TRIANGLEFAN && (!d->indices || d->ibuf);
+    c->has_pos = (uint8_t)draw_clip0(d, c->clip0);
     return c;
 }
 
@@ -1527,7 +1746,11 @@ static void draw_encode(const GfxDraw* d)
                 [g_enc setVertexBuffer:d->buf[s]->b offset:d->buf_off[s] atIndex:(NSUInteger)s];
                 d->buf[s]->used = g_serial;
                 if (rec)
+                {
                     rec->vb[s] = [d->buf[s]->b retain], rec->voff[s] = d->buf_off[s];
+                    if (buf_volatile(d->buf[s]))
+                        rec->fixed = 0;
+                }
             }
             else if (d->data[s] && d->size[s])
             {
@@ -1603,7 +1826,11 @@ static void draw_encode(const GfxDraw* d)
         {
             d->ibuf->used = g_serial;
             if (rec)
+            {
                 rec->ib = [d->ibuf->b retain], rec->ioff = d->ibuf_off, rec->itype = (uint8_t)(d->index_size == 2 ? 2 : 4);
+                if (buf_volatile(d->ibuf))
+                    rec->fixed = 0;
+            }
             [g_enc drawIndexedPrimitives:mp indexCount:n indexType:d->index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
                              indexBuffer:d->ibuf->b indexBufferOffset:d->ibuf_off];
         }
@@ -1818,7 +2045,8 @@ static const char FX_MSL[] =
     "  float4 hist;   // 1 when the frame before is there to blend with, the pattern's turn this frame, its weight\n"
     "  float4x4 lmatn; // the near cascade: view space to its map\n"
     "  float4 smapn;  // its texel in world units, depth bias, penumbra, slope\n"
-    "  float4 smapn2; // its depth units, 1 when it is there\n"
+    "  float4 smapn2; // its depth units, 1 when it is there, 1 for hard edges (sun_soft 0)\n"
+    "  float4 aop;    // the occlusion's taps this frame\n"
     "};\n"
     "struct FO { float4 pos [[position]]; float2 uv; };\n"
     "vertex FO fx_vs(uint vid [[vertex_id]]) {\n"
@@ -1842,6 +2070,29 @@ static const char FX_MSL[] =
     "  px = clamp(px, u.vp.xy, u.vp.xy + u.vp.zw - 1.0);\n"
     "  px = floor(px) + 0.5;\n"
     "  return view_pos(u, px, view_z(u, dt.read(uint2(px))));\n"
+    "}\n"
+    /* The occlusion's depth (after McGuire, Mara and Luebke, Scalable Ambient Obscurance, 2012): the
+     * view z of the scene pixel each occlusion texel stands on (the one fx_ao takes as its centre; 0
+     * for the sky), in an R32F texture of the occlusion's size, with three smaller levels below it.
+     * A far tap reads a small level, which stays in the cache; reading the whole-size depth buffer
+     * at taps hundreds of pixels apart made the pass bound by memory. */
+    "fragment float4 fx_linz(FO in [[stage_in]], constant FxU& u [[buffer(0)]], depth2d<float> dt [[texture(0)]]) {\n"
+    "  float2 px = floor(u.vp.xy + in.uv * u.vp.zw) + 0.5;\n"
+    "  return float4(view_z(u, dt.read(uint2(px))), 0.0, 0.0, 0.0);\n"
+    "}\n"
+    /* each texel one of the 2x2 above it, picked on a rotated grid: never their average, which across
+     * a silhouette would make a surface that is not there */
+    "fragment float4 fx_zmip(FO in [[stage_in]], texture2d<float> z [[texture(0)]]) {\n"
+    "  int2 p = int2(in.pos.xy), hi = int2(z.get_width(), z.get_height()) - 1;\n"
+    "  return z.read(uint2(min(p * 2 + int2(p.y & 1, p.x & 1), hi)));\n"
+    "}\n"
+    /* the view position at screen pixel q, r pixels from the tap's centre: its z from the level whose
+     * texels are about r / 8 across */
+    "static float3 pos_lz(constant FxU& u, texture2d<float> lz, float2 q, float r) {\n"
+    "  float2 t = (q - u.vp.xy) * u.size.zw / u.vp.zw;\n"
+    "  uint lv = uint(clamp(int(floor(log2(max(r * u.size.z / u.vp.z, 1.0)))) - 3, 0, 3));\n"
+    "  uint2 p = min(uint2(max(t, 0.0)) >> lv, uint2(lz.get_width(lv), lz.get_height(lv)) - 1);\n"
+    "  return view_pos(u, q, lz.read(p, lv).r);\n"
     "}\n"
     /* in the sun (1) or not (0): a ray from P toward the sun, stepped through the depth buffer; a
      * surface in front of it (by less than the thickness: what is far nearer the camera hides the
@@ -1881,7 +2132,7 @@ static const char FX_MSL[] =
     /* one cascade: p = its texel (world units), depth bias, penumbra (map width per depth unit),
      * slope (depth units per map width); du its depth units; edge how far inside it P is (0 out) */
     "static float sun_look(depth2d<float> sm, sampler cmp, float4x4 lm, float4 p, float du, float minw, float3 P,\n"
-    "                      float3 N, float dist, float k, thread float& edge) {\n"
+    "                      float3 N, float dist, float k, bool hard, thread float& edge) {\n"
     "  float3 Q = P + N * (1.5 * p.x + 0.002 * dist);\n"
     "  float4 lc = lm * float4(Q, 1.0);\n"
     "  float2 uv = float2(lc.x * 0.5 + 0.5, 0.5 - lc.y * 0.5);\n"
@@ -1898,8 +2149,9 @@ static const char FX_MSL[] =
     "    if (d < z) bs += d, bn += 1.0;\n"
     "  }\n"
     "  if (bn == 0.0) return 1.0;\n"
-    /* the penumbra: wider the farther the caster, never narrower than 2 cm (no hard pixel edge) */
-    "  float pen = clamp((z - bs / bn) * p.z, max(1.5 * tx, 0.02 / (p.x * sz)), 32.0 * tx);\n"
+    /* the penumbra: wider the farther the caster, never narrower than 2 cm (no hard pixel edge) -
+     * unless sun_soft is 0, which asks for the hard edge: half a texel */
+    "  float pen = clamp((z - bs / bn) * p.z, hard ? 0.5 * tx : max(1.5 * tx, 0.02 / (p.x * sz)), 32.0 * tx);\n"
     /* casters nearer the surface than sun_min are its own neighbouring faces (a ledge of the same
      * rock): no shadow from them */
     "  float near = smoothstep(0.5 * minw, 1.5 * minw, (z - bs / bn) * du);\n"
@@ -1920,9 +2172,9 @@ static const char FX_MSL[] =
     "  if (use <= 0.0) return face;\n"
     "  float en = 0.0, ef = 0.0, s = 1.0;\n"
     "  if (u.smapn2.y > 0.0)\n"
-    "    s = sun_look(smn, cmp, u.lmatn, u.smapn, u.smapn2.x, u.smap2.z, P, N, dist, k, en);\n"
+    "    s = sun_look(smn, cmp, u.lmatn, u.smapn, u.smapn2.x, u.smap2.z, P, N, dist, k, u.smapn2.z > 0.0, en);\n"
     "  if (en < 1.0) {\n"
-    "    float sf = sun_look(sm, cmp, u.lmat, float4(u.smap.yzw, u.smap2.x), u.smap2.w, u.smap2.z, P, N, dist, k, ef);\n"
+    "    float sf = sun_look(sm, cmp, u.lmat, float4(u.smap.yzw, u.smap2.x), u.smap2.w, u.smap2.z, P, N, dist, k, u.smapn2.z > 0.0, ef);\n"
     "    s = mix(sf, s, en);\n"
     "  }\n"
     "  return mix(1.0, min(mix(1.0, s, use), face), max(en, ef));\n"
@@ -1930,7 +2182,8 @@ static const char FX_MSL[] =
     /* occlusion in x (1 open, 0 closed), distance in y (0: sky), the sun by the map in z and by
      * contact in w (1 lit, 0 shaded) */
     "fragment float4 fx_ao(FO in [[stage_in]], constant FxU& u [[buffer(0)]], depth2d<float> dt [[texture(0)]],\n"
-    "                      depth2d<float> sm [[texture(1)]], depth2d<float> smn [[texture(2)]], sampler cmp [[sampler(1)]]) {\n"
+    "                      depth2d<float> sm [[texture(1)]], depth2d<float> smn [[texture(2)]], texture2d<float> lz [[texture(3)]],\n"
+    "                      sampler cmp [[sampler(1)]]) {\n"
     "  float2 px = floor(u.vp.xy + in.uv * u.vp.zw) + 0.5;\n"
     "  float3 P = pos_at(u, dt, px);\n"
     "  float dist = P.z * u.hand.x;\n"
@@ -1951,8 +2204,10 @@ static const char FX_MSL[] =
     /* the spiral turned and scaled by one of 16 steps, a 4x4 ordered pattern over the pixels, the
      * same every frame; the blur averages exactly one 4x4 block (fx_blur), so each pixel ends up with
      * all 16 - even, and with no grain left to crawl as the camera moves. One pattern at every pixel
-     * instead copies each occluder at the pattern's offsets: streaks and halos around characters. */
-    "  const int NS = 20;\n"
+     * instead copies each occluder at the pattern's offsets: streaks and halos around characters.
+     * The pattern also turns each frame, and the temporal pass averages the frames: a few taps a
+     * frame (ao_quality) do what twenty did. */
+    "  const int NS = max(int(u.aop.x), 1);\n"
     "  float sum = 0.0;\n"
     "  for (int i = 0; i < NS; ++i) {\n"
     "    float a = (float(i) + k) / float(NS);\n"
@@ -1961,7 +2216,7 @@ static const char FX_MSL[] =
     /* off the screen: nothing known there (clamped to the edge, the edge's own pixels would shade
      * it, and move with the camera) */
     "    if (any(q < u.vp.xy) || any(q >= u.vp.xy + u.vp.zw)) continue;\n"
-    "    float3 Q = pos_at(u, dt, q);\n"
+    "    float3 Q = pos_lz(u, lz, q, a * rpx);\n"
     /* a surface far nearer the camera floats in front of this one (a leg before the floor or the
      * other leg): it hides it, it does not shade it */
     "    if (Q.z == 0.0 || dist - Q.z * u.hand.x > 0.5 * rad) continue;\n"
@@ -2009,7 +2264,7 @@ static const char FX_MSL[] =
     "    float4 t = a.read(uint2(clamp(p + dir * i, int2(0), hi)));\n"
     "    float k = (abs(i) == 2 ? 0.5 : 1.0) * saturate(1.0 - abs(t.y - c.y) / (0.03 * c.y));\n"
     "    s.x += t.x * k, w += k;\n"
-    "    if (abs(i) == 1) ss += t.zw * (0.5 * k), sw += 0.5 * k;\n"
+    "    if (abs(i) == 1 && u.smapn2.z == 0.0) ss += t.zw * (0.5 * k), sw += 0.5 * k;\n"
     "  }\n"
     "  return float4(s.x / w, c.y, ss / sw);\n"
     "}\n"
@@ -2030,7 +2285,20 @@ static const char FX_MSL[] =
     "  if (any(puv < 0.0) || any(puv > 1.0)) return c;\n"
     "  float4 h = hist.sample(s, puv);\n"
     "  if (!(h.y > 0.0) || abs(h.y - pc.w) > 0.04 * pc.w) return c;\n"
-    "  float3 m = mix(c.xzw, h.xzw, u.hist.z);\n"
+    /* the history held to what this frame's 3x3 neighbourhood on the same surface spans (a TAA
+     * clamp): the ground under a running character never changes depth, and without it the
+     * shadow arrived faint and left a trail. The pattern differs between neighbours, so its noise
+     * is inside the span and still averages out; the occlusion, with fewer taps a frame, gets more
+     * room than the shadows. */
+    "  int2 p = int2(in.pos.xy), hi = int2(u.size.zw) - 1;\n"
+    "  float3 lo = c.xzw, up = c.xzw;\n"
+    "  for (int dy = -1; dy <= 1; ++dy)\n"
+    "    for (int dx = -1; dx <= 1; ++dx) {\n"
+    "      float4 t = cur.read(uint2(clamp(p + int2(dx, dy), int2(0), hi)));\n"
+    "      if (t.y > 0.0 && abs(t.y - c.y) < 0.05 * c.y) lo = min(lo, t.xzw), up = max(up, t.xzw);\n"
+    "    }\n"
+    "  const float3 give = float3(0.06, 0.02, 0.02);\n"
+    "  float3 m = mix(c.xzw, clamp(h.xzw, lo - give, up + give), u.hist.z);\n"
     "  return float4(m.x, c.y, m.y, m.z);\n"
     "}\n"
     /* bloom's source: the scene at a quarter size (four bilinear taps), what is over the threshold,
@@ -2174,7 +2442,7 @@ static const char FX_MSL[] =
 typedef struct FxU
 {
     float proj[4], zp[4], vp[4], size[4], ao[4], grade[4], hand[4], up[4], sun[4], suncol[4], sunuv[4], fogc[4], fogp[4],
-        bloom[4], rays[4], shadow[4], lmat[16], smap[4], smap2[4], reproj[16], hist[4], lmatn[16], smapn[4], smapn2[4];
+        bloom[4], rays[4], shadow[4], lmat[16], smap[4], smap2[4], reproj[16], hist[4], lmatn[16], smapn[4], smapn2[4], aop[4];
 } FxU;
 
 static struct
@@ -2182,8 +2450,11 @@ static struct
     int tried;
     id<MTLLibrary> lib;
     id<MTLRenderPipelineState> ao_pipe, blur_pipe, bright_pipe, down_pipe, gauss_pipe, raymask_pipe, rays_pipe, comp_pipe,
-        temporal_pipe, aa_pipe;
+        temporal_pipe, aa_pipe, linz_pipe, zmip_pipe;
     MTLPixelFormat comp_fmt, aa_fmt;
+    /* the occlusion's depth: view z at its size and three levels below (fx_linz, fx_zmip), and a view
+     * of each level to draw into */
+    id<MTLTexture> lz, lzv[4];
     id<MTLTexture> aa_src; /* the scene as it was, for the anti-aliasing pass to read (scene_aa) */
     id<MTLTexture> src, ao0, ao1, b1a, b1b, b2a, b2b, ra, rb;
     id<MTLTexture> hist[2]; /* the occlusion and shadows after the temporal pass: this frame's and the one before */
@@ -2191,7 +2462,7 @@ static struct
     uint64_t hist_serial;   /* the frame it was written (0: none) */
     float prev_view[16], prev_proj[16], prev_cam[3];
     id<MTLSamplerState> samp, cmp;
-    id<MTLTexture> smap, smapn, scol, sdummy; /* the sun's shadow maps (far, near), their (memoryless) color, a stand-in */
+    id<MTLTexture> smap, smapn, scol, scol8, sdummy; /* the sun's shadow maps (far, near), their (memoryless) color at 4096 and 8192, a stand-in */
     id<MTLDepthStencilState> sdepth;
     /* what the fog and rays follow, eased from frame to frame (fx_ease): the game's values can
      * change between frames, and the effects should not pop with them */
@@ -2266,8 +2537,15 @@ static const struct
     { "sun_face", offsetof(__typeof__(g_fxs), sun_face), 0.0f },
     { "sun_min", offsetof(__typeof__(g_fxs), sun_min), 1.0f },
     { "sun_direct", offsetof(__typeof__(g_fxs), sun_direct), 0.3f },
+    /* who casts: 0 everything, 1 characters only (the zone's baked lighting has its shadows), 2 the
+     * zone only (characters keep the game's own blob shadows) */
     { "sun_casters", offsetof(__typeof__(g_fxs), sun_casters), 1.0f },
     { "sun_near", offsetof(__typeof__(g_fxs), sun_near), 15.0f },
+    /* the near map at 8192 rather than 4096 (1): half the texel, four times the memory (256 MB) */
+    { "sun_detail", offsetof(__typeof__(g_fxs), sun_detail), 0.0f },
+    /* the occlusion's taps a frame: 0 low (6), 1 medium (10), 2 high (16); the temporal pass gathers
+     * them over frames */
+    { "ao_quality", offsetof(__typeof__(g_fxs), ao_quality), 0.0f },
     { "temporal", offsetof(__typeof__(g_fxs), temporal), 0.85f },
     { "debug", offsetof(__typeof__(g_fxs), debug), 0.0f },
     /* not effects: the host's draw distances (host64 --draw-distance), live while tuning; 0 leaves them */
@@ -2384,6 +2662,8 @@ static int fx_init(void)
     g_fx.raymask_pipe = fx_pipeline(@"fx_raymask", MTLPixelFormatRGBA16Float);
     g_fx.rays_pipe = fx_pipeline(@"fx_rays", MTLPixelFormatRGBA16Float);
     g_fx.temporal_pipe = fx_pipeline(@"fx_temporal", MTLPixelFormatRGBA16Float);
+    g_fx.linz_pipe = fx_pipeline(@"fx_linz", MTLPixelFormatR32Float);
+    g_fx.zmip_pipe = fx_pipeline(@"fx_zmip", MTLPixelFormatR32Float);
     MTLSamplerDescriptor* sd = [[MTLSamplerDescriptor alloc] init];
     sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
     sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
@@ -2402,7 +2682,7 @@ static int fx_init(void)
     g_fx.sdepth = [g_dev newDepthStencilStateWithDescriptor:dd];
     [dd release];
     if (!g_fx.ao_pipe || !g_fx.blur_pipe || !g_fx.bright_pipe || !g_fx.down_pipe || !g_fx.gauss_pipe || !g_fx.raymask_pipe ||
-        !g_fx.rays_pipe || !g_fx.temporal_pipe)
+        !g_fx.rays_pipe || !g_fx.temporal_pipe || !g_fx.linz_pipe || !g_fx.zmip_pipe)
     {
         [g_fx.ao_pipe release], g_fx.ao_pipe = nil;
         return 0;
@@ -2424,6 +2704,102 @@ static id<MTLTexture> fx_tex(id<MTLTexture>* t, MTLPixelFormat fmt, NSUInteger w
     return *t;
 }
 
+/* --- GPU time per part of the frame (profile) ---
+ * A counter sample buffer per frame in flight, when the GPU samples timestamps at pass boundaries;
+ * ticks to ns from pairs of CPU and GPU timestamps taken at least a second apart. */
+static id<MTLCounterSampleBuffer> ts_buffer(void)
+{
+    if (!gfx_profiling)
+        return nil;
+    static MTLTimestamp gpu0;
+    static uint64_t ns0;
+    if (g_ts_ok < 0)
+    {
+        g_ts_ok = 0;
+        id<MTLCounterSet> set = nil;
+        for (id<MTLCounterSet> cs in g_dev.counterSets)
+            if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp])
+                set = cs;
+        if (set && [g_dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary])
+        {
+            MTLCounterSampleBufferDescriptor* d = [[MTLCounterSampleBufferDescriptor alloc] init];
+            d.counterSet = set;
+            d.storageMode = MTLStorageModeShared;
+            d.sampleCount = TS_N;
+            g_ts_ok = 1;
+            for (int i = 0; i < FRAMES; ++i)
+                if (!(g_ts[i] = [g_dev newCounterSampleBufferWithDescriptor:d error:NULL]))
+                    g_ts_ok = 0;
+            [d release];
+        }
+        if (!g_ts_ok)
+            fprintf(stderr, "[recomp] gfx: no GPU timestamps at pass boundaries: no time per pass in the profile\n");
+    }
+    if (g_ts_ok <= 0)
+        return nil;
+    uint64_t now = gfx_now_ns();
+    if (!ns0 || now - ns0 > 1000000000ull)
+    {
+        MTLTimestamp cpu, gpu;
+        [g_dev sampleTimestamps:&cpu gpuTimestamp:&gpu];
+        now = gfx_now_ns();
+        if (ns0 && gpu > gpu0)
+            g_ts_scale = (double)(now - ns0) / (double)(gpu - gpu0);
+        gpu0 = gpu, ns0 = now;
+    }
+    return g_ts_scale > 0.0 ? g_ts[g_frame] : nil;
+}
+
+/* a pass marks its start as `start` (the frame's first such pass only) and its end as `end` (the
+ * last one's stands); -1 for neither */
+static void ts_mark(MTLRenderPassDescriptor* rp, int start, int end)
+{
+    id<MTLCounterSampleBuffer> b = ts_buffer();
+    if (!b)
+        return;
+    MTLRenderPassSampleBufferAttachmentDescriptor* a = rp.sampleBufferAttachments[0];
+    a.sampleBuffer = b;
+    a.startOfVertexSampleIndex = MTLCounterDontSample;
+    a.endOfVertexSampleIndex = MTLCounterDontSample;
+    a.startOfFragmentSampleIndex = MTLCounterDontSample;
+    a.endOfFragmentSampleIndex = end >= 0 ? (NSUInteger)end : MTLCounterDontSample;
+    if (start >= 0 && !(g_ts_started & (1u << start)))
+        a.startOfVertexSampleIndex = (NSUInteger)start, g_ts_started |= (uint8_t)(1u << start);
+    if (end >= 0)
+        g_ts_started |= (uint8_t)(1u << end);
+}
+
+/* at the frame's end: when it completes, its marks into the profile's sums */
+static void ts_frame_end(id<MTLCommandBuffer> c)
+{
+    if (!gfx_profiling || g_ts_ok <= 0 || !g_ts_started)
+    {
+        g_ts_started = 0;
+        return;
+    }
+    id<MTLCounterSampleBuffer> b = g_ts[g_frame];
+    uint8_t got = g_ts_started;
+    double scale = g_ts_scale;
+    g_ts_started = 0;
+    [c addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        NSData* d = [b resolveCounterRange:NSMakeRange(0, TS_N)];
+        if (!d || d.length < TS_N * sizeof(MTLCounterResultTimestamp))
+            return;
+        const MTLCounterResultTimestamp* t = (const MTLCounterResultTimestamp*)d.bytes;
+#define TS_SPAN(a, z, sum) \
+    if ((got >> (a) & 1) && (got >> (z) & 1) && t[a].timestamp != MTLCounterErrorValue && t[z].timestamp != MTLCounterErrorValue && \
+        t[z].timestamp > t[a].timestamp) \
+        atomic_fetch_add(&(sum), (uint64_t)((double)(t[z].timestamp - t[a].timestamp) * scale));
+        TS_SPAN(TS_SUN0, TS_SUN1, g_ts_sun_ns)
+        TS_SPAN(TS_FX0, TS_FX1, g_ts_fx_ns)
+        TS_SPAN(TS_FX0, TS_AO1, g_ts_ao_ns)
+#undef TS_SPAN
+    }];
+}
+
+static int g_ts_fx_end = TS_FX1; /* the end mark the effects' passes set (TS_AO1 for the occlusion's) */
+
 /* one full-screen triangle into target, reading tex[0..n) */
 static void fx_pass(id<MTLTexture> target, MTLLoadAction load, id<MTLRenderPipelineState> p, MTLViewport vp, const FxU* u,
     id<MTLTexture> const* tex, int n, const int32_t* dir)
@@ -2432,6 +2808,7 @@ static void fx_pass(id<MTLTexture> target, MTLLoadAction load, id<MTLRenderPipel
     rp.colorAttachments[0].texture = target;
     rp.colorAttachments[0].loadAction = load;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    ts_mark(rp, TS_FX0, g_ts_fx_end);
     id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:rp];
     [e setRenderPipelineState:p];
     [e setViewport:vp];
@@ -2447,6 +2824,27 @@ static void fx_pass(id<MTLTexture> target, MTLLoadAction load, id<MTLRenderPipel
 }
 
 static MTLViewport fx_full(id<MTLTexture> t) { return (MTLViewport){ 0, 0, (double)t.width, (double)t.height, 0, 1 }; }
+
+/* the occlusion's depth texture at w x h, four levels, with a view of each; made again when the size changes */
+static id<MTLTexture> fx_lz(NSUInteger w, NSUInteger h)
+{
+    if (g_fx.lz && g_fx.lz.width == w && g_fx.lz.height == h)
+        return g_fx.lz;
+    [g_fx.lz release], g_fx.lz = nil;
+    for (int i = 0; i < 4; ++i)
+        [g_fx.lzv[i] release], g_fx.lzv[i] = nil;
+    MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:w height:h mipmapped:YES];
+    d.mipmapLevelCount = 4;
+    d.storageMode = MTLStorageModePrivate;
+    d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+    g_fx.lz = [g_dev newTextureWithDescriptor:d];
+    if (!g_fx.lz || g_fx.lz.mipmapLevelCount < 4)
+        return [g_fx.lz release], g_fx.lz = nil;
+    for (NSUInteger i = 0; i < 4; ++i)
+        g_fx.lzv[i] = [g_fx.lz newTextureViewWithPixelFormat:MTLPixelFormatR32Float textureType:MTLTextureType2D
+                                                      levels:NSMakeRange(i, 1) slices:NSMakeRange(0, 1)];
+    return g_fx.lz;
+}
 
 /* the inverse of a 4x4 matrix (row-major); 0 when it has none */
 static int mat_inverse(float* out, const float* m)
@@ -2486,19 +2884,29 @@ static void mat_mul(float* o, const float* a, const float* b)
 }
 
 enum { SUN_MAP = 4096, SUN_CACHE_FRAMES = 60 * 30 };
+#define SUN_CACHE_NEAR 40.0f                  /* what was seen within this of the camera stays past SUN_CACHE_FRAMES */
+#define SUN_COPY_BYTES (48u * 1024 * 1024)    /* the copies' vertices and indices, all told */
 
 /* The zone's casters, kept after they leave the view: the game draws only what the camera sees, but
  * a low sun throws the shadows of what is behind and beside the camera into it. Each caster drawn
  * from buffers the game keeps is kept with a copy of its uniforms and that frame's camera (clip
  * space back to the world), and drawn into the map from there while it is out of view - for 30
- * seconds, or until the camera jumps (a new zone). */
+ * seconds after it was last seen, longer while the camera stays within 40 units of where it was then,
+ * and until the camera jumps (a new zone).
+ *
+ * Copies of one mesh (FFXI draws every tree of a kind from the same buffers, each placed by its vertex
+ * shader's constants) share a key; each copy is told apart by where its first vertex stands
+ * (draw_clip0), and entries of one key are chained. What the game draws from buffers it rewrites (a
+ * swaying tree, a prop) is kept as a copy of its vertices and indices as last drawn. An entry in
+ * plain view the game did not draw this frame has gone (moved, swapped for another level of detail,
+ * no longer drawn) and is dropped. */
 typedef struct CacheKey
 {
     void* vb[GFX_NSTREAMS];
     NSUInteger voff[GFX_NSTREAMS];
     void* ib;
     NSUInteger ioff;
-    uint32_t n, vstart;
+    uint32_t n, vstart, copy;
     LibKey lib;
 } CacheKey;
 
@@ -2506,21 +2914,29 @@ typedef struct Cached
 {
     Caster c; /* retains its buffers; c.ub is the cache's own copy of the uniforms */
     float clip_world[16];
+    float pos[3], cam[3]; /* where it stood and where the camera was, when last seen */
     uint64_t seen, replayed;
+    int32_t next;         /* the next entry with its key, -1 none */
+    uint32_t copy_bytes;  /* a copy's vertices and indices (c.vb[] and c.ib are the copy) */
     int dead; /* a buffer it draws from was destroyed (the game let go of it: a zone left behind) */
 } Cached;
 
 static Cached* g_cache;
-static uint32_t g_ncache, g_cache_cap;
-static Map g_cache_map; /* CacheKey -> index + 1 */
+static uint32_t g_ncache, g_cache_cap, g_copy_bytes;
+static Map g_cache_map; /* CacheKey -> the first entry's index + 1 */
 static float g_cache_cam[3];
 
-static void cache_key(CacheKey* k, const Caster* c)
+static void cache_key(CacheKey* k, const Caster* c, int copy)
 {
     memset(k, 0, sizeof *k);
-    for (int s = 0; s < GFX_NSTREAMS; ++s)
-        k->vb[s] = (void*)c->vb[s], k->voff[s] = c->voff[s];
-    k->ib = (void*)c->ib, k->ioff = c->ioff, k->n = c->n, k->vstart = c->vstart, k->lib = c->lib;
+    if (!copy)
+    {
+        for (int s = 0; s < GFX_NSTREAMS; ++s)
+            k->vb[s] = (void*)c->vb[s], k->voff[s] = c->voff[s];
+        k->ib = (void*)c->ib, k->ioff = c->ioff;
+    }
+    k->n = c->n, k->vstart = copy ? 0 : c->vstart, k->copy = (uint32_t)copy | (uint32_t)c->itype << 8 | (uint32_t)c->prim << 16;
+    k->lib = c->lib;
 }
 
 static void cache_map_free(void)
@@ -2536,11 +2952,12 @@ static void cached_release(Cached* ce)
 {
     Caster* c = &ce->c;
     for (int s = 0; s < GFX_NSTREAMS; ++s)
-        [c->vb[s] release];
-    [c->ub release];
-    [c->ib release];
+        [c->vb[s] release], c->vb[s] = nil;
+    [c->ub release], c->ub = nil;
+    [c->ib release], c->ib = nil;
     for (int t = 0; t < 8; ++t)
-        [c->tex[t] release];
+        [c->tex[t] release], c->tex[t] = nil;
+    g_copy_bytes -= ce->copy_bytes, ce->copy_bytes = 0;
 }
 
 /* a buffer the game destroyed: what the cache draws from it goes */
@@ -2551,6 +2968,8 @@ static void sun_cache_forget(id<MTLBuffer> buf)
     for (uint32_t i = 0; i < g_ncache; ++i)
     {
         Caster* c = &g_cache[i].c;
+        if (g_cache[i].copy_bytes)
+            continue; /* its own buffers */
         int hit = c->ib == buf;
         for (int s = 0; s < GFX_NSTREAMS; ++s)
             hit |= c->vb[s] == buf;
@@ -2559,13 +2978,22 @@ static void sun_cache_forget(id<MTLBuffer> buf)
     }
 }
 
-/* drops what has not been seen for SUN_CACHE_FRAMES (all of it when all is true) and rebuilds the map */
+/* gone from the cache's view: not seen for SUN_CACHE_FRAMES, and the camera has moved on from where it was */
+static int cached_expired(const Cached* ce)
+{
+    if (ce->seen + SUN_CACHE_FRAMES >= g_serial)
+        return 0;
+    float dx = g_cache_cam[0] - ce->cam[0], dy = g_cache_cam[1] - ce->cam[1], dz = g_cache_cam[2] - ce->cam[2];
+    return dx * dx + dy * dy + dz * dz > SUN_CACHE_NEAR * SUN_CACHE_NEAR;
+}
+
+/* drops what is dead or expired (all of it when all is true) and rebuilds the map and its chains */
 static void sun_cache_trim(int all)
 {
     uint32_t n = 0;
     for (uint32_t i = 0; i < g_ncache; ++i)
     {
-        if (all || g_cache[i].dead || g_cache[i].seen + SUN_CACHE_FRAMES < g_serial)
+        if (all || g_cache[i].dead || cached_expired(&g_cache[i]))
             cached_release(&g_cache[i]);
         else
             g_cache[n++] = g_cache[i];
@@ -2575,13 +3003,177 @@ static void sun_cache_trim(int all)
     for (uint32_t i = 0; i < n; ++i)
     {
         CacheKey k;
-        cache_key(&k, &g_cache[i].c);
-        map_put(&g_cache_map, &k, sizeof k, (id)(uintptr_t)(i + 1));
+        cache_key(&k, &g_cache[i].c, g_cache[i].copy_bytes != 0);
+        uintptr_t at = (uintptr_t)map_get(&g_cache_map, &k, sizeof k);
+        g_cache[i].next = -1;
+        if (!at)
+            map_put(&g_cache_map, &k, sizeof k, (id)(uintptr_t)(i + 1));
+        else /* after the first */
+            g_cache[i].next = g_cache[at - 1].next, g_cache[at - 1].next = (int32_t)i;
     }
 }
 
-/* this frame's fixed casters into the cache (new ones added, seen ones brought up to date) */
-static void sun_cache_update(const float* clip_world, const float* cam)
+/* row vector p (x, y, z, w) through a row-major matrix */
+static void xform4(float* o, const float* p, const float* m)
+{
+    float t[4];
+    for (int j = 0; j < 4; ++j)
+        t[j] = p[0] * m[j] + p[1] * m[4 + j] + p[2] * m[8 + j] + p[3] * m[12 + j];
+    memcpy(o, t, 16);
+}
+
+/* the entry for caster c (its key k) this frame: the nearest of its key within a unit not yet updated
+ * this frame, else one at the very same place (the same thing drawn twice), else a new one */
+static Cached* cache_slot(const CacheKey* k, const Caster* c, const float* pos, int* fresh)
+{
+    uintptr_t head = (uintptr_t)map_get(&g_cache_map, k, sizeof *k);
+    int32_t best = -1, same = -1;
+    float bd = 1.0f;
+    for (int32_t i = head ? (int32_t)head - 1 : -1; i >= 0; i = g_cache[i].next)
+    {
+        Cached* ce = &g_cache[i];
+        if (ce->dead)
+            continue;
+        if (!c->has_pos || !ce->c.has_pos) /* nowhere to tell copies apart: one entry for the key */
+        {
+            best = i;
+            break;
+        }
+        float dx = pos[0] - ce->pos[0], dy = pos[1] - ce->pos[1], dz = pos[2] - ce->pos[2], d2 = dx * dx + dy * dy + dz * dz;
+        if (ce->seen != g_serial && d2 < bd)
+            bd = d2, best = i;
+        if (d2 < 1e-6f)
+            same = i;
+    }
+    *fresh = 0;
+    if (best >= 0 || same >= 0)
+        return &g_cache[best >= 0 ? best : same];
+    if (g_ncache == g_cache_cap)
+    {
+        g_cache_cap = g_cache_cap ? g_cache_cap * 2 : 1024;
+        g_cache = (Cached*)realloc(g_cache, g_cache_cap * sizeof(Cached));
+    }
+    int32_t at = (int32_t)g_ncache++;
+    Cached* ce = &g_cache[at];
+    memset(ce, 0, sizeof *ce);
+    ce->next = -1;
+    if (!head)
+        map_put(&g_cache_map, k, sizeof *k, (id)(uintptr_t)(at + 1));
+    else
+        ce->next = g_cache[head - 1].next, g_cache[head - 1].next = at;
+    *fresh = 1;
+    return ce;
+}
+
+/* makes room for a copy of `need` bytes: the copies seen longest ago go (not `keep`'s) */
+static int copy_room(uint32_t need, const Cached* keep)
+{
+    if (need > SUN_COPY_BYTES / 4)
+        return 0;
+    while (g_copy_bytes + need > SUN_COPY_BYTES)
+    {
+        Cached* old = NULL;
+        for (uint32_t i = 0; i < g_ncache; ++i)
+            if (&g_cache[i] != keep && g_cache[i].copy_bytes && !g_cache[i].dead && g_cache[i].seen != g_serial &&
+                (!old || g_cache[i].seen < old->seen))
+                old = &g_cache[i];
+        if (!old)
+            return 0;
+        old->dead = 1;
+        cached_release(old);
+    }
+    return 1;
+}
+
+/* the vertices and indices caster c draws, copied into ce's own buffer: only the vertices its indices
+ * reach, with the uniforms' vertex offset (ub, the cache's copy) moved to match. 0 if it cannot be. */
+static int cache_copy(Cached* ce, const Caster* c, GfxU* ub)
+{
+    long lo = c->vstart, hi = (long)c->vstart + (long)c->n - 1;
+    if (c->ib)
+    {
+        const uint8_t* ip = (const uint8_t*)[c->ib contents] + c->ioff;
+        if ((size_t)c->ioff + (size_t)c->n * c->itype > [c->ib length])
+            return 0;
+        lo = LONG_MAX, hi = -1;
+        for (uint32_t i = 0; i < c->n; ++i)
+        {
+            long x = c->itype == 2 ? ((const uint16_t*)ip)[i] : (long)((const uint32_t*)ip)[i];
+            lo = x < lo ? x : lo, hi = x > hi ? x : hi;
+        }
+    }
+    lo += ub->vofs, hi += ub->vofs;
+    if (lo < 0 || hi < lo)
+        return 0;
+    uint32_t off[GFX_NSTREAMS], len[GFX_NSTREAMS], total = 0;
+    for (int s = 0; s < GFX_NSTREAMS; ++s)
+    {
+        off[s] = total, len[s] = 0;
+        if (!c->vb[s] || c->vb[s] == g_dummy)
+            continue;
+        long stride = ub->stride[s], from = lo * stride, n = (hi - lo + 1) * stride;
+        if (!stride)
+            from = 0, n = 64;
+        long have = (long)[c->vb[s] length] - (long)c->voff[s] - from;
+        if (have <= 0)
+            return 0;
+        len[s] = (uint32_t)(n < have ? n : have);
+        total += (len[s] + 15) & ~15u;
+    }
+    uint32_t ioff = total, ilen = c->ib ? c->n * c->itype : 0;
+    total += (ilen + 15) & ~15u;
+    if (!total)
+        return 0;
+    /* the copy's buffer again when it fits and no frame in flight reads it */
+    id<MTLBuffer> buf = nil;
+    if (ce->copy_bytes == total && ce->replayed + FRAMES < g_serial)
+        for (int s = 0; s < GFX_NSTREAMS && !buf; ++s)
+            if (ce->c.vb[s] && ce->c.vb[s] != g_dummy)
+                buf = ce->c.vb[s];
+    if (!buf)
+    {
+        if (!copy_room(total, ce))
+            return 0;
+        buf = [g_dev newBufferWithLength:total options:MTLResourceStorageModeShared];
+        if (!buf)
+            return 0;
+    }
+    else
+        [buf retain];
+    uint8_t* dst = (uint8_t*)[buf contents];
+    for (int s = 0; s < GFX_NSTREAMS; ++s)
+        if (len[s])
+            memcpy(dst + off[s], (const uint8_t*)[c->vb[s] contents] + c->voff[s] + (ub->stride[s] ? lo * ub->stride[s] : 0), len[s]);
+    if (ilen)
+        memcpy(dst + ioff, (const uint8_t*)[c->ib contents] + c->ioff, ilen);
+    /* the copy's own buffers in place of the caster's */
+    g_copy_bytes -= ce->copy_bytes;
+    for (int s = 0; s < GFX_NSTREAMS; ++s)
+    {
+        [ce->c.vb[s] release];
+        ce->c.vb[s] = len[s] ? [buf retain] : [g_dummy retain];
+        ce->c.voff[s] = len[s] ? off[s] : 0;
+    }
+    [ce->c.ib release];
+    ce->c.ib = ilen ? [buf retain] : nil, ce->c.ioff = ioff;
+    [buf release];
+    ce->copy_bytes = total, g_copy_bytes += total;
+    ub->vofs -= (int32_t)lo;
+    return 1;
+}
+
+/* is a world point in plain view of this frame's camera (w >= 1, within 90% of the frustum)? */
+static int in_plain_view(const float* p, const float* vp)
+{
+    float q[4] = { p[0], p[1], p[2], 1.0f }, c[4];
+    xform4(c, q, vp);
+    return c[3] >= 1.0f && fabsf(c[0]) <= 0.9f * c[3] && fabsf(c[1]) <= 0.9f * c[3];
+}
+
+/* this frame's casters into the cache (new ones added, seen ones brought up to date), then those in
+ * plain view the game did not draw dropped. clip_world: the camera's clip space to the world; view:
+ * its view matrix; vp: the world to its clip space; cam: where it is. */
+static void sun_cache_update(const float* clip_world, const float* view, const float* vp, const float* cam)
 {
     float dx = cam[0] - g_cache_cam[0], dy = cam[1] - g_cache_cam[1], dz = cam[2] - g_cache_cam[2];
     if (dx * dx + dy * dy + dz * dz > 50.0f * 50.0f)
@@ -2595,38 +3187,71 @@ static void sun_cache_update(const float* clip_world, const float* cam)
     memcpy(g_cache_cam, cam, 12);
     if (!(g_serial & 255))
         sun_cache_trim(0);
+    /* what is not drawn from the zone's own buffers: a placed object (keep: kept as a copy) or a
+     * character (not kept: its vertices are in the world already, and it moves). A fixed-function
+     * draw whose world matrix is the identity is a character; a vertex shader's draw is the zone's. */
+    float invView[16];
+    int have_iv = mat_inverse(invView, view);
     for (uint32_t i = 0; i < g_ncasters; ++i)
     {
-        const Caster* c = &g_casters[i];
-        if (!c->fixed)
+        Caster* c = &g_casters[i];
+        if (c->fixed)
             continue;
-        CacheKey k;
-        cache_key(&k, c);
-        uintptr_t at = (uintptr_t)map_get(&g_cache_map, &k, sizeof k);
-        Cached* ce;
-        if (!at)
+        c->keep = (uint8_t)(c->lib.vs.prog != 0);
+        if (!c->lib.vs.prog && have_iv)
         {
-            if (g_ncache == g_cache_cap)
-            {
-                g_cache_cap = g_cache_cap ? g_cache_cap * 2 : 1024;
-                g_cache = (Cached*)realloc(g_cache, g_cache_cap * sizeof(Cached));
-            }
-            ce = &g_cache[g_ncache++];
-            memset(ce, 0, sizeof *ce);
+            const GfxU* src = (const GfxU*)((const uint8_t*)[c->ub contents] + c->uoff);
+            float w[16], off = 0.0f;
+            mat_mul(w, src->wv, invView);
+            for (int j = 0; j < 16; ++j)
+                off = fmaxf(off, fabsf(w[j] - ((j % 5) == 0 ? 1.0f : 0.0f)));
+            c->keep = off > 1e-3f;
+        }
+    }
+    if (g_fxs.sun_casters == 1.0f) /* characters alone cast: the cache is not drawn */
+        return;
+    for (uint32_t i = 0; i < g_ncasters; ++i)
+    {
+        Caster* c = &g_casters[i];
+        const GfxU* src = (const GfxU*)((const uint8_t*)[c->ub contents] + c->uoff);
+        if (!c->fixed && (!c->keep || !c->has_pos))
+            continue;
+        float pos[3] = { 0, 0, 0 };
+        if (c->has_pos)
+        {
+            float h[4];
+            xform4(h, c->clip0, clip_world);
+            if (fabsf(h[3]) < 1e-6f)
+                continue;
+            pos[0] = h[0] / h[3], pos[1] = h[1] / h[3], pos[2] = h[2] / h[3];
+        }
+        CacheKey k;
+        int copy = !c->fixed, fresh;
+        cache_key(&k, c, copy);
+        Cached* ce = cache_slot(&k, c, pos, &fresh);
+        if (fresh)
+        {
             ce->c = *c;
             for (int s = 0; s < GFX_NSTREAMS; ++s)
-                [ce->c.vb[s] retain];
-            [ce->c.ib retain];
+                ce->c.vb[s] = copy ? nil : [ce->c.vb[s] retain];
+            ce->c.ib = copy ? nil : [ce->c.ib retain];
             for (int t = 0; t < 8; ++t)
                 [ce->c.tex[t] retain];
             ce->c.ub = nil;
-            map_put(&g_cache_map, &k, sizeof k, (id)(uintptr_t)g_ncache);
         }
-        else
-            ce = &g_cache[at - 1];
+        else if (copy)
+        {
+            /* the textures as of this frame (an alpha test's) */
+            for (int t = 0; t < 8; ++t)
+            {
+                [c->tex[t] retain];
+                [ce->c.tex[t] release];
+                ce->c.tex[t] = c->tex[t], ce->c.samp[t] = c->samp[t];
+            }
+            ce->c.n = c->n, ce->c.vstart = c->vstart, ce->c.prim = c->prim, ce->c.itype = c->itype;
+        }
         /* the uniforms as of this frame: in place, unless a frame the GPU may still be drawing
          * read them */
-        const void* src = (const uint8_t*)[c->ub contents] + c->uoff;
         if (ce->c.ub && ce->replayed + FRAMES < g_serial)
             memcpy([ce->c.ub contents], src, sizeof(GfxU));
         else
@@ -2635,8 +3260,29 @@ static void sun_cache_update(const float* clip_world, const float* cam)
             ce->c.ub = [g_dev newBufferWithBytes:src length:sizeof(GfxU) options:MTLResourceStorageModeShared];
         }
         ce->c.uoff = 0;
+        if (copy && !cache_copy(ce, c, (GfxU*)[ce->c.ub contents]))
+        {
+            ce->dead = 1;
+            continue;
+        }
+        ce->c.has_pos = c->has_pos;
+        memcpy(ce->c.clip0, c->clip0, 16);
+        memcpy(ce->pos, pos, 12);
+        memcpy(ce->cam, cam, 12);
         memcpy(ce->clip_world, clip_world, 64);
         ce->seen = g_serial;
+    }
+    /* in plain view, and the game did not draw it: it has gone (moved, another level of detail, no
+     * longer drawn) */
+    for (uint32_t i = 0; i < g_ncache; ++i)
+    {
+        Cached* ce = &g_cache[i];
+        if (!ce->dead && ce->seen != g_serial && ce->c.has_pos && in_plain_view(ce->pos, vp))
+        {
+            ce->dead = 1;
+            if (ce->copy_bytes)
+                cached_release(ce);
+        }
     }
 }
 
@@ -2652,9 +3298,10 @@ typedef struct SunCascade
     float S[16];    /* the world to the map */
     float lmat[16]; /* view space to the map: x, y -1..1, z 0..1 */
     float texel, bias, soft, slope, range, across;
+    int size; /* the map's texels across */
 } SunCascade;
 
-static void sun_fit(const GfxScene* s, const float* invV, const float* L, float t0, float t1, SunCascade* k)
+static void sun_fit(const GfxScene* s, const float* invV, const float* L, float t0, float t1, int size, SunCascade* k)
 {
     float hand = s->proj[11] < 0.0f ? -1.0f : 1.0f, p[8][3], c[3] = { 0, 0, 0 };
     for (int i = 0; i < 8; ++i)
@@ -2678,7 +3325,8 @@ static void sun_fit(const GfxScene* s, const float* invV, const float* L, float 
     float r[3] = { up[1] * f[2] - up[2] * f[1], up[2] * f[0] - up[0] * f[2], up[0] * f[1] - up[1] * f[0] };
     normalize3(r);
     float u[3] = { f[1] * r[2] - f[2] * r[1], f[2] * r[0] - f[0] * r[2], f[0] * r[1] - f[1] * r[0] };
-    float tx = 2.0f * R / SUN_MAP;
+    float tx = 2.0f * R / (float)size;
+    k->size = size;
     float cx = floorf((c[0] * r[0] + c[1] * r[1] + c[2] * r[2]) / tx) * tx;
     float cy = floorf((c[0] * u[0] + c[1] * u[1] + c[2] * u[2]) / tx) * tx;
     float cz = c[0] * f[0] + c[1] * f[1] + c[2] * f[2];
@@ -2699,25 +3347,28 @@ static void sun_fit(const GfxScene* s, const float* invV, const float* L, float 
     k->slope = 2.0f * R / range;
 }
 
-static id<MTLTexture> sun_target(id<MTLTexture>* t)
+static id<MTLTexture> sun_target(id<MTLTexture>* t, int size)
 {
+    if (*t && (*t).width != (NSUInteger)size)
+        [*t release], *t = nil;
     if (!*t)
     {
         MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                                                      width:SUN_MAP height:SUN_MAP mipmapped:NO];
+                                                                                      width:size height:size mipmapped:NO];
         td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
         td.storageMode = MTLStorageModePrivate;
         *t = [g_dev newTextureWithDescriptor:td];
     }
-    if (!g_fx.scol)
+    id<MTLTexture>* col = size > SUN_MAP ? &g_fx.scol8 : &g_fx.scol;
+    if (!*col)
     {
         MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
-                                                                                      width:SUN_MAP height:SUN_MAP mipmapped:NO];
+                                                                                      width:size height:size mipmapped:NO];
         td.usage = MTLTextureUsageRenderTarget;
         td.storageMode = MTLStorageModeMemoryless;
-        g_fx.scol = [g_dev newTextureWithDescriptor:td];
+        *col = [g_dev newTextureWithDescriptor:td];
     }
-    return *t && g_fx.scol ? *t : nil;
+    return *t && *col ? *t : nil;
 }
 
 /* the casters into one cascade's map: this frame's, and the zone's kept from before (cache) */
@@ -2731,11 +3382,12 @@ static uint32_t sun_draw(id<MTLTexture> target, const float* invP, const float* 
     rp.depthAttachment.loadAction = MTLLoadActionClear;
     rp.depthAttachment.clearDepth = 1.0;
     rp.depthAttachment.storeAction = MTLStoreActionStore;
-    rp.colorAttachments[0].texture = g_fx.scol;
+    rp.colorAttachments[0].texture = k->size > SUN_MAP ? g_fx.scol8 : g_fx.scol;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+    ts_mark(rp, TS_SUN0, TS_SUN1);
     id<MTLRenderCommandEncoder> e = [cmd() renderCommandEncoderWithDescriptor:rp];
-    [e setViewport:(MTLViewport){ 0, 0, SUN_MAP, SUN_MAP, 0, 1 }];
+    [e setViewport:(MTLViewport){ 0, 0, (double)k->size, (double)k->size, 0, 1 }];
     [e setDepthStencilState:g_fx.sdepth];
     [e setCullMode:MTLCullModeNone];
     [e setDepthBias:0 slopeScale:1.5f clamp:0];
@@ -2750,7 +3402,7 @@ static uint32_t sun_draw(id<MTLTexture> target, const float* invP, const float* 
                 [e setVertexBytes:M length:64 atIndex:5];
             /* sun_casters 1: characters alone cast - the zone's shadows are baked into its colours
              * already, and the game tints them for the hour and the weather */
-            if (g_fxs.sun_casters == 1.0f && cs->fixed)
+            if ((g_fxs.sun_casters == 1.0f && (cs->fixed || cs->keep)) || (g_fxs.sun_casters == 2.0f && !cs->fixed && !cs->keep))
                 continue;
         }
         else
@@ -2759,7 +3411,7 @@ static uint32_t sun_draw(id<MTLTexture> target, const float* invP, const float* 
                 break;
             /* the zone out of view: as it was drawn when last seen, through that frame's camera */
             Cached* ce = &g_cache[i - g_ncasters];
-            if (ce->dead || ce->seen == g_serial || ce->seen + SUN_CACHE_FRAMES < g_serial)
+            if (ce->dead || ce->seen == g_serial || cached_expired(ce))
                 continue;
             float m[16];
             mat_mul(m, ce->clip_world, k->S);
@@ -2832,22 +3484,24 @@ static int sun_map(const GfxScene* s, const float* L, FxU* u)
     float invP[16], invV[16];
     if (!mat_inverse(invP, s->proj) || !mat_inverse(invV, s->view))
         return 0;
-    float clip_world[16];
+    float clip_world[16], vp[16];
     mat_mul(clip_world, invP, invV);
-    sun_cache_update(clip_world, invV + 12);
+    mat_mul(vp, s->view, s->proj);
+    sun_cache_update(clip_world, s->view, vp, invV + 12);
     float dfar = fmaxf(g_fxs.sun_distance, 4.0f), dnear = fminf(fmaxf(g_fxs.sun_near, 0.0f), dfar);
     SunCascade far, near;
-    sun_fit(s, invV, L, 0.5f, dfar, &far);
-    if (!sun_target(&g_fx.smap))
+    sun_fit(s, invV, L, 0.5f, dfar, SUN_MAP, &far);
+    if (!sun_target(&g_fx.smap, SUN_MAP))
         return 0;
     uint32_t drawn = sun_draw(g_fx.smap, invP, invV, &far, 1);
     memcpy(u->lmat, far.lmat, 64);
     u->smap[1] = far.texel, u->smap[2] = far.bias, u->smap[3] = far.soft;
     u->smap2[0] = far.slope, u->smap2[3] = far.range;
     u->smapn2[1] = 0.0f;
-    if (dnear >= 2.0f && dnear < dfar && sun_target(&g_fx.smapn))
+    int nsize = g_fxs.sun_detail >= 0.5f ? 2 * SUN_MAP : SUN_MAP;
+    if (dnear >= 2.0f && dnear < dfar && sun_target(&g_fx.smapn, nsize))
     {
-        sun_fit(s, invV, L, 0.5f, dnear, &near);
+        sun_fit(s, invV, L, 0.5f, dnear, nsize, &near);
         sun_draw(g_fx.smapn, invP, invV, &near, 1);
         memcpy(u->lmatn, near.lmat, 64);
         u->smapn[0] = near.texel, u->smapn[1] = near.bias, u->smapn[2] = near.soft, u->smapn[3] = near.slope;
@@ -2953,6 +3607,8 @@ static void scene_fx(GfxTex* color, const GfxScene* s)
                 { g_fxs.grade, g_fxs.sat, g_fxs.contrast, g_fxs.debug },
                 { hand, 0, 0, 0 },
             };
+            u.aop[0] = g_fxs.ao_quality >= 1.5f ? 16.0f : g_fxs.ao_quality >= 0.5f ? 10.0f : 6.0f;
+            u.smapn2[2] = g_fxs.sun_soft <= 0.0f ? 1.0f : 0.0f;
             /* world up in view space: the world's y axis through the inverse view matrix, pointing
              * the way the camera's own up does (FFXI's world y points down) */
             g_fx.eased = g_fx.eased_serial && g_fx.eased_serial + 1 == g_serial;
@@ -3095,9 +3751,19 @@ static void scene_fx(GfxTex* color, const GfxScene* s)
                     id<MTLTexture> ao_out = g_fx.ao0;
                     if (u.ao[1] > 0.0f || u.shadow[0] > 0.0f || u.smap[0] > 0.0f)
                     {
-                        id<MTLTexture> ao_in[3] = { depth, u.smap[0] > 0.0f ? g_fx.smap : g_fx.sdummy,
-                            u.smap[0] > 0.0f && u.smapn2[1] > 0.0f ? g_fx.smapn : g_fx.sdummy };
-                        fx_pass(g_fx.ao0, MTLLoadActionDontCare, g_fx.ao_pipe, q, &u, ao_in, 3, NULL);
+                        g_ts_fx_end = TS_AO1;
+                        id<MTLTexture> lz = fx_lz(aw, ah);
+                        if (lz)
+                        {
+                            fx_pass(g_fx.lzv[0], MTLLoadActionDontCare, g_fx.linz_pipe, q, &u, &depth, 1, NULL);
+                            for (int l = 1; l < 4; ++l)
+                                fx_pass(g_fx.lzv[l], MTLLoadActionDontCare, g_fx.zmip_pipe, fx_full(g_fx.lzv[l]), &u, &g_fx.lzv[l - 1], 1, NULL);
+                        }
+                        else
+                            u.ao[1] = 0.0f;
+                        id<MTLTexture> ao_in[4] = { depth, u.smap[0] > 0.0f ? g_fx.smap : g_fx.sdummy,
+                            u.smap[0] > 0.0f && u.smapn2[1] > 0.0f ? g_fx.smapn : g_fx.sdummy, lz ? lz : g_fx.sdummy };
+                        fx_pass(g_fx.ao0, MTLLoadActionDontCare, g_fx.ao_pipe, q, &u, ao_in, 4, NULL);
                         fx_pass(g_fx.ao1, MTLLoadActionDontCare, g_fx.blur_pipe, q, &u, &g_fx.ao0, 1, across);
                         fx_pass(g_fx.ao0, MTLLoadActionDontCare, g_fx.blur_pipe, q, &u, &g_fx.ao1, 1, down);
                         if (g_fxs.temporal > 0.0f && fx_tex(&g_fx.hist[0], MTLPixelFormatRGBA16Float, aw, ah) &&
@@ -3109,6 +3775,7 @@ static void scene_fx(GfxTex* color, const GfxScene* s)
                             ao_out = g_fx.hist[to];
                             g_fx.hist_at = to, g_fx.hist_serial = g_serial;
                         }
+                        g_ts_fx_end = TS_FX1;
                     }
                     if (u.bloom[1] > 0.0f)
                     {
@@ -3177,6 +3844,7 @@ static void frame_end(void)
     id<MTLCommandBuffer> c = cmd();
     uint64_t serial = g_serial;
     dispatch_semaphore_t sem = g_frames_sem;
+    ts_frame_end(c);
     [c addCompletedHandler:^(id<MTLCommandBuffer> done) {
         (void)done;
         atomic_store(&g_completed, serial);

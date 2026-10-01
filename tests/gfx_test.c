@@ -486,6 +486,7 @@ static void scene_quad(float q[4][3], uint32_t color)
     GfxDraw d;
     defaults(&d);
     memcpy(d.u.wvp, g_sproj, 64);
+    identity(d.u.wv); /* the world matrix the identity, as a character's is */
     d.u.vp[2] = d.u.vp[3] = SS;
     memcpy(d.vp, SVP, sizeof SVP);
     d.vs.el[0] = (GfxElem){ 1, 0, GFX_FLOAT3, 0 };
@@ -535,16 +536,23 @@ static void wall_and_floor(uint32_t color)
     scene_quad(floor, color);
 }
 
-/* Occlusion darkens the wall where it meets the floor and leaves the open wall as it was. */
+/* Occlusion darkens the wall where it meets the floor and leaves the open wall as it was: at each
+ * quality (its taps a frame), by 20 levels or more in a single frame. */
 static void test_scene_ao(int rh)
 {
-    fx_only("ao", 0.8f);
-    scene_begin(rh, 0xFF000000u);
-    wall_and_floor(0xFFFFFFFFu);
-    scene_end(NULL, 0);
-    uint32_t open = spx(64, 30, 0), corner = spx(64, 94, 0);
-    CHECK(open >= 245, "occlusion (%s): open wall %u (want about 255)", rh ? "RH" : "LH", open);
-    CHECK(corner <= 225, "occlusion (%s): wall at the floor %u (want darker)", rh ? "RH" : "LH", corner);
+    for (int q = 0; q < 3; ++q)
+    {
+        fx_only("ao", 0.8f);
+        gfx_fx_set("ao_quality", (float)q);
+        scene_begin(rh, 0xFF000000u);
+        wall_and_floor(0xFFFFFFFFu);
+        scene_end(NULL, 0);
+        uint32_t open = spx(64, 30, 0), corner = spx(64, 94, 0);
+        CHECK(open >= 245, "occlusion (%s, quality %d): open wall %u (want about 255)", rh ? "RH" : "LH", q, open);
+        CHECK(corner + 20 <= open, "occlusion (%s, quality %d): wall at the floor %u (want 20 darker than %u)", rh ? "RH" : "LH",
+            q, corner, open);
+    }
+    gfx_fx_set("ao_quality", 0.0f);
 }
 
 /* A block floating 0.7 before a wall (inside the occlusion's reach, but far nearer the camera than
@@ -687,102 +695,135 @@ static void test_scene_sun_map(void)
     }
 }
 
-/* The zone out of view still casts: a post drawn from a buffer the game keeps shades the floor in
- * the frame it is drawn and in the next one, where the game (out of view) no longer draws it. */
+/* a card from buffer b (x -1..1, y -3..0 at z 0: strip order) placed at t (view space, right-handed)
+ * by its own world matrix, as the zone's copies of one mesh are */
+static void scene_card(GfxBuf* b, float tx, float ty, float tz)
+{
+    float w[16];
+    identity(w);
+    w[12] = tx, w[13] = ty, w[14] = tz;
+    GfxDraw d;
+    defaults(&d);
+    memcpy(d.u.wv, w, 64);
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            d.u.wvp[i * 4 + j] = w[i * 4] * g_sproj[j] + w[i * 4 + 1] * g_sproj[4 + j] + w[i * 4 + 2] * g_sproj[8 + j] + w[i * 4 + 3] * g_sproj[12 + j];
+    d.u.vp[2] = d.u.vp[3] = SS;
+    memcpy(d.vp, SVP, sizeof SVP);
+    d.vs.el[0] = (GfxElem){ 1, 0, GFX_FLOAT3, 0 };
+    d.u.stride[0] = 12;
+    d.fs.st[0] = (GfxStage){ 2, 3, 1, 1, 2, 3, 1, 1, 1, 0, 0, 2 };
+    d.depth.zenable = 1, d.depth.zwrite = 1, d.depth.zfunc = 4;
+    d.caster = 1;
+    d.buf[0] = b, d.size[0] = 48;
+    d.prim = GFX_TRIANGLESTRIP, d.count = 2;
+    gfx_draw(&d);
+}
+
+static void scene_floor(void)
+{
+    float floor[4][3] = { { -8, -3, 30 }, { 8, -3, 30 }, { -8, -3, 0.6f }, { 8, -3, 0.6f } };
+    scene_quad(floor, 0xFFFFFFFFu);
+}
+
+/* The zone out of view still casts, and copies of one mesh are told apart. Three cards from one
+ * buffer, each placed by its own matrix: A a unit behind the camera, B and C 10 ahead. The sun is
+ * behind the camera, so A's shadow falls forward onto the floor in view. Frame 1 draws all three,
+ * frame 2 only C: A (out of view) must still cast, and B (in plain view, not drawn: it went) must
+ * not. With one entry per buffer, C overwrites A and A's shadow is lost. */
 static void test_scene_sun_cache(void)
 {
-    const float beyond[3] = { 0, 0.5f, 1 };
-    float post[4][3] = { { -1, 0, -10 }, { 1, 0, -10 }, { -1, -3, -10 }, { 1, -3, -10 } }; /* right-handed: z ahead is negative */
-    GfxBuf* b = gfx_buf_create(sizeof post);
-    gfx_buf_upload(b, post, sizeof post);
+    const float behind[3] = { 0, 0.5f, -1 };
+    float card[4][3] = { { -1, 0, 0 }, { 1, 0, 0 }, { -1, -3, 0 }, { 1, -3, 0 } };
+    GfxBuf* b = gfx_buf_create(sizeof card);
+    gfx_buf_upload(b, card, sizeof card);
     gfx_fx_set("sun_casters", 0.0f); /* the zone casts too */
+    gfx_fx_set("temporal", 0.0f);
     for (int frame = 0; frame < 2; ++frame)
     {
         fx_only("sun", 1.0f);
         scene_begin(1, 0xFF000000u);
-        float floor[4][3] = { { -8, -3, 30 }, { 8, -3, 30 }, { -8, -3, 0.6f }, { 8, -3, 0.6f } };
-        scene_quad(floor, 0xFFFFFFFFu);
+        scene_floor();
         if (frame == 0)
-        {
-            GfxDraw d;
-            defaults(&d);
-            memcpy(d.u.wvp, g_sproj, 64);
-            d.u.vp[2] = d.u.vp[3] = SS;
-            memcpy(d.vp, SVP, sizeof SVP);
-            d.vs.el[0] = (GfxElem){ 1, 0, GFX_FLOAT3, 0 };
-            d.u.stride[0] = 12;
-            d.fs.st[0] = (GfxStage){ 2, 3, 1, 1, 2, 3, 1, 1, 1, 0, 0, 2 };
-            d.depth.zenable = 1, d.depth.zwrite = 1, d.depth.zfunc = 4;
-            d.caster = 1;
-            d.buf[0] = b, d.size[0] = sizeof post;
-            d.prim = GFX_TRIANGLESTRIP, d.count = 2;
-            gfx_draw(&d);
-        }
-        scene_end(beyond, 0);
-        uint32_t before = spx(64, 91, 0), beside = spx(100, 91, 0);
-        CHECK(beside >= 245, "sun cache (frame %d): open floor %u (want lit)", frame, beside);
-        CHECK(before <= 160, "sun cache (frame %d): floor in the post's shadow %u (want shaded%s)", frame, before,
-            frame ? ", from the post kept after the game stopped drawing it" : "");
+            scene_card(b, 0, 0, 1), scene_card(b, 0, 0, -10);
+        scene_card(b, 4, 0, -10);
+        scene_end(behind, 0);
+        /* A's shadow: the floor 4 ahead (row 112); B's: 13 ahead (row 79), hidden behind B in frame 1 */
+        uint32_t a_sh = spx(64, 112, 0), b_sh = spx(64, 79, 0), open = spx(20, 112, 0);
+        CHECK(open >= 245, "sun cache (frame %d): open floor %u (want lit)", frame, open);
+        CHECK(a_sh <= 160, "sun cache (frame %d): floor in the shadow of the card behind the camera %u (want shaded%s)", frame,
+            a_sh, frame ? ", from the copy kept out of view" : "");
+        if (frame)
+            CHECK(b_sh >= 245, "sun cache: floor behind the card in view the game stopped drawing %u (want lit: it went)", b_sh);
         gfx_present(NULL);
     }
-    /* characters alone cast (sun_casters 1, the default): the zone's post, drawn again, does not */
+    /* characters alone cast (sun_casters 1, the default): the zone's cards, drawn again, do not */
     gfx_fx_set("sun_casters", 1.0f);
-    gfx_fx_set("temporal", 0.0f); /* not the frame before's shadow */
     fx_only("sun", 1.0f);
     scene_begin(1, 0xFF000000u);
-    {
-        float floor[4][3] = { { -8, -3, 30 }, { 8, -3, 30 }, { -8, -3, 0.6f }, { 8, -3, 0.6f } };
-        scene_quad(floor, 0xFFFFFFFFu);
-        GfxDraw d;
-        defaults(&d);
-        memcpy(d.u.wvp, g_sproj, 64);
-        d.u.vp[2] = d.u.vp[3] = SS;
-        memcpy(d.vp, SVP, sizeof SVP);
-        d.vs.el[0] = (GfxElem){ 1, 0, GFX_FLOAT3, 0 };
-        d.u.stride[0] = 12;
-        d.fs.st[0] = (GfxStage){ 2, 3, 1, 1, 2, 3, 1, 1, 1, 0, 0, 2 };
-        d.depth.zenable = 1, d.depth.zwrite = 1, d.depth.zfunc = 4;
-        d.caster = 1;
-        d.buf[0] = b, d.size[0] = sizeof post;
-        d.prim = GFX_TRIANGLESTRIP, d.count = 2;
-        gfx_draw(&d);
-    }
-    scene_end(beyond, 0);
-    CHECK(spx(64, 91, 0) >= 245, "sun casters 1: the floor before the zone's post %u (want lit: the zone does not cast)", spx(64, 91, 0));
+    scene_floor();
+    scene_card(b, 0, 0, 1);
+    scene_end(behind, 0);
+    CHECK(spx(64, 112, 0) >= 245, "sun casters 1: the floor in the zone's card's shadow %u (want lit: the zone does not cast)",
+        spx(64, 112, 0));
     gfx_present(NULL);
     gfx_fx_set("temporal", 0.85f);
     gfx_buf_destroy(b);
 }
 
-/* Over time: a post's shadow in one frame, the post gone the next (a frame gone wrong) - the shadow
- * fades rather than blinks out, blended with the frame before at the same world point; with the
- * temporal pass off it is gone at once. */
+/* Over time: a post (a character) stands for three frames, then steps sideways. Its shadow is at full
+ * strength at once where it now falls and gone where it was: the history is held to what this frame
+ * sees around each point (without that: faint at the new spot, a trail at the old). */
 static void test_scene_temporal(void)
 {
     const float beyond[3] = { 0, 0.5f, 1 };
-    for (int pass = 0; pass < 2; ++pass)
+    uint32_t now = 0, was = 0;
+    for (int frame = 0; frame < 4; ++frame)
     {
-        uint32_t before = 0;
-        for (int frame = 0; frame < 2; ++frame)
-        {
-            fx_only("sun", 1.0f);
-            gfx_fx_set("temporal", pass ? 0.0f : 0.85f);
-            scene_begin(1, 0xFF000000u);
-            float floor[4][3] = { { -8, -3, 30 }, { 8, -3, 30 }, { -8, -3, 0.6f }, { 8, -3, 0.6f } };
-            float post[4][3] = { { -1, 0, 10 }, { 1, 0, 10 }, { -1, -3, 10 }, { 1, -3, 10 } };
-            scene_quad(floor, 0xFFFFFFFFu);
-            if (frame == 0)
-                scene_quad(post, 0xFFFFFFFFu);
-            scene_end(beyond, 0);
-            before = spx(64, 91, 0);
-            gfx_present(NULL);
-        }
-        if (pass == 0)
-            CHECK(before <= 100, "temporal: the floor a frame after its caster went %u (want still mostly shaded)", before);
-        else
-            CHECK(before >= 245, "temporal off: the floor a frame after its caster went %u (want lit)", before);
+        fx_only("sun", 1.0f);
+        gfx_fx_set("temporal", 0.85f);
+        scene_begin(1, 0xFF000000u);
+        scene_floor();
+        float x = frame < 3 ? 0.0f : -3.0f;
+        float post[4][3] = { { x - 1, 0, 10 }, { x + 1, 0, 10 }, { x - 1, -3, 10 }, { x + 1, -3, 10 } };
+        scene_quad(post, 0xFFFFFFFFu);
+        scene_end(beyond, 0);
+        /* the floor 7 ahead (row 91): under x -3 (column 37) and x 0 (column 64) */
+        now = spx(37, 91, 0), was = spx(64, 91, 0);
+        gfx_present(NULL);
     }
-    gfx_fx_set("temporal", 0.85f);
+    CHECK(now <= 160, "temporal: the post's shadow where it stepped to %u (want shaded at once)", now);
+    CHECK(was >= 245, "temporal: where the post's shadow was %u (want lit: no trail)", was);
+}
+
+/* Hard edges: with sun_soft 0 a post's shadow edge has at most 2 partly lit pixels along a row, fewer
+ * than with the default softness. */
+static void test_scene_sun_hard(void)
+{
+    const float beyond[3] = { 0, 0.5f, 1 };
+    int partial[2];
+    for (int k = 0; k < 2; ++k)
+    {
+        fx_only("sun", 1.0f);
+        gfx_fx_set("temporal", 0.0f);
+        gfx_fx_set("sun_soft", k ? 0.0f : 0.03f);
+        gfx_fx_set("sun_detail", k ? 1.0f : 0.0f);
+        scene_begin(1, 0xFF000000u);
+        scene_floor();
+        float post[4][3] = { { -1, 0, 10 }, { 1, 0, 10 }, { -1, -3, 10 }, { 1, -3, 10 } };
+        scene_quad(post, 0xFFFFFFFFu);
+        scene_end(beyond, 0);
+        partial[k] = 0;
+        for (int x = 64; x < 100; ++x)
+        {
+            uint32_t v = spx(x, 91, 0);
+            partial[k] += v > 70 && v < 245;
+        }
+        gfx_present(NULL);
+    }
+    CHECK(partial[1] <= 2 && partial[1] <= partial[0], "hard shadows: %d partly lit pixels at the edge (soft: %d; want 2 or fewer)",
+        partial[1], partial[0]);
+    gfx_fx_set("sun_soft", 0.03f), gfx_fx_set("sun_detail", 0.0f), gfx_fx_set("temporal", 0.85f);
 }
 
 /* Resolution: a pole 0.2 wide casts a thin shadow, dark in its middle and gone a few pixels beside
@@ -896,6 +937,7 @@ static void test_scene_effects(void)
     test_scene_sun_map();
     test_scene_sun_cache();
     test_scene_temporal();
+    test_scene_sun_hard();
     test_scene_sun_sharp();
     CHECK(gfx_failures() == 0, "scene effects: %u failures", gfx_failures());
     gfx_set_targets(g_rt, 0, 0, g_ds);

@@ -145,8 +145,8 @@ void gfx_msl_vs_params(Sb* b, const GfxVsKey* k)
 
 void gfx_msl_vs_return(Sb* b, const GfxVsKey* k)
 {
-    if (k->shadow)
-        sb_printf(b, "  o.pos = sm * o.pos;\n");
+    if (k->shadow) /* D3D's pixel-centre fixup undone (the map has pixels of its own), then on into the map */
+        sb_printf(b, "  o.pos.x -= o.pos.w / u.vp.z;\n  o.pos.y += o.pos.w / u.vp.w;\n  o.pos = sm * o.pos;\n");
     sb_printf(b, "  return o;\n}\n");
 }
 
