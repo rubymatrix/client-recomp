@@ -292,7 +292,16 @@ static void sh_ImmAssociateContext(Guest* g) { RET(0, 2); }
 static void sh_ImmGetCandidateListW(Guest* g) { RET(0, 4); }
 static void sh_ImmGetCompositionStringW(Guest* g) { RET(0, 4); }
 
+/* CoGetClassObject(clsid, context, server info, iid, out): no COM servers beyond ole.c's */
+static void sh_CoGetClassObject(Guest* g)
+{
+    if (ARG(4))
+        wr32(ARG(4), 0);
+    RET(0x80040154u, 5); /* REGDB_E_CLASSNOTREG */
+}
+
 static const ShimDef XIV_MISC[] = {
+    { "ole32.dll", "CoGetClassObject", sh_CoGetClassObject },
     { "imm32.dll", "ImmDisableTextFrameService", sh_ImmDisableTextFrameService },
     { "imm32.dll", "ImmAssociateContext", sh_ImmAssociateContext },
     { "imm32.dll", "ImmGetCandidateListW", sh_ImmGetCandidateListW },

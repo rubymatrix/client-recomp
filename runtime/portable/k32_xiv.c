@@ -338,6 +338,48 @@ static void sh_SleepEx(Guest* g)
     RET(0, 2);
 }
 static void sh_IsDebuggerPresent(Guest* g) { RET(0, 0); }
+static void sh_GetNativeSystemInfo(Guest* g) { forward(g, "GetSystemInfo"); }
+
+/* GetLogicalProcessorInformation(SYSTEM_LOGICAL_PROCESSOR_INFORMATION*, DWORD* length): the same
+ * four cores GetSystemInfo reports, one package. Entries are 24 bytes on a 32-bit process. */
+static void sh_GetLogicalProcessorInformation(Guest* g)
+{
+    uint32_t buf = ARG(0), lenp = ARG(1), n = 5, need = 24 * n;
+    if (!buf || rd32(lenp) < need)
+    {
+        wr32(lenp, need);
+        gt_set_error(122); /* ERROR_INSUFFICIENT_BUFFER */
+        RET(0, 2);
+    }
+    memset(GUEST_PTR(buf), 0, need);
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        wr32(buf + 24 * i, 1u << i); /* ProcessorMask */
+        wr32(buf + 24 * i + 4, 0);   /* RelationProcessorCore */
+    }
+    wr32(buf + 24 * 4, 0xF);
+    wr32(buf + 24 * 4 + 4, 3);       /* RelationProcessorPackage */
+    wr32(lenp, need);
+    RET(1, 2);
+}
+
+/* GlobalMemoryStatusEx(MEMORYSTATUSEX*): what a 32-bit process on a 64-bit Windows sees */
+static void sh_GlobalMemoryStatusEx(Guest* g)
+{
+    uint32_t p = ARG(0);
+    uint64_t total = 0, avail = 0;
+    plat_memory(&total, &avail);
+    uint64_t vtotal = 0xFFFE0000ull, vavail = 0xC0000000ull;
+    wr32(p + 4, total ? (uint32_t)(100 - avail * 100 / total) : 50);
+    memcpy(GUEST_PTR(p + 8), &total, 8);
+    memcpy(GUEST_PTR(p + 16), &avail, 8);
+    memcpy(GUEST_PTR(p + 24), &total, 8);
+    memcpy(GUEST_PTR(p + 32), &avail, 8);
+    memcpy(GUEST_PTR(p + 40), &vtotal, 8);
+    memcpy(GUEST_PTR(p + 48), &vavail, 8);
+    memset(GUEST_PTR(p + 56), 0, 8);
+    RET(1, 1);
+}
 static void sh_GetExitCodeProcess(Guest* g) { if (ARG(1)) wr32(ARG(1), 259 /* STILL_ACTIVE */); RET(1, 2); }
 static void sh_GlobalFree(Guest* g) { if (ARG(0)) gheap_free(ARG(0)); RET(0, 1); }
 static void sh_GetUserDefaultLangID(Guest* g) { RET(0x0409, 0); }
@@ -476,6 +518,9 @@ static const ShimDef K32_XIV[] = {
     { "kernel32.dll", "SwitchToThread", sh_SwitchToThread },
     { "kernel32.dll", "SleepEx", sh_SleepEx },
     { "kernel32.dll", "IsDebuggerPresent", sh_IsDebuggerPresent },
+    { "kernel32.dll", "GetNativeSystemInfo", sh_GetNativeSystemInfo },
+    { "kernel32.dll", "GetLogicalProcessorInformation", sh_GetLogicalProcessorInformation },
+    { "kernel32.dll", "GlobalMemoryStatusEx", sh_GlobalMemoryStatusEx },
     { "kernel32.dll", "GetExitCodeProcess", sh_GetExitCodeProcess },
     { "kernel32.dll", "GlobalFree", sh_GlobalFree },
     { "kernel32.dll", "GetUserDefaultLangID", sh_GetUserDefaultLangID },

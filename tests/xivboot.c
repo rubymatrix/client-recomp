@@ -22,11 +22,15 @@
 #include "thunk.h"
 #include "vfs.h"
 
+#include <SDL3/SDL.h>
+
 #define GAME_DIR_GUEST "C:\\Program Files\\SquareEnix\\FINAL FANTASY XIV"
 
 void xiv_misc_init(void);
 void xiv_set_documents(const char* host_dir);
 void user32_init(void);
+void d3d9_init(void);
+void d3dx9_init(void);
 void ws2_init(void);
 void dinput_init(void);
 void dsound_init(void);
@@ -40,6 +44,13 @@ static char* dir_of(const char* path)
     else
         strcpy(d, ".");
     return d;
+}
+
+static void game_thread(void* arg)
+{
+    uint32_t code = guest_call(rt_image_oep, 0, NULL);
+    printf("entry point returned %u\n", code);
+    *(volatile int*)arg = 1;
 }
 
 int main(int argc, char** argv)
@@ -82,6 +93,8 @@ int main(int argc, char** argv)
     xiv_misc_init();
     ole_init();
     user32_init();
+    d3d9_init();
+    d3dx9_init();
     dsound_init();
     dinput_init();
     ws2_init();
@@ -96,6 +109,20 @@ int main(int argc, char** argv)
     rt_set_native_handler(thunk_dispatch);
     if (!pe_load(argv[1]))
         return 1;
+
+    /* The lobby server's host name, in the slot Garlemald Client patches (VA 0x00F90110, 0x14 bytes):
+     * XIV_LOBBY, default 127.0.0.1. */
+    {
+        const char* lobby = getenv("XIV_LOBBY") ? getenv("XIV_LOBBY") : "127.0.0.1";
+        size_t n = strlen(lobby);
+        if (n + 1 > 0x14)
+        {
+            printf("XIV_LOBBY is longer than the game's 19-character slot\n");
+            return 2;
+        }
+        memcpy(GUEST_PTR(0x00F90110u), lobby, n + 1);
+        printf("lobby server: %s\n", lobby);
+    }
 
     /* The PEB: what MSVC 2005's CRT and the game may read through fs:[0x30]. */
     gt_lock();
@@ -125,7 +152,17 @@ int main(int argc, char** argv)
 
     printf("entering ffxivgame.exe at %08x\n", rt_image_oep);
     fflush(stdout);
-    uint32_t code = guest_call(rt_image_oep, 0, NULL);
-    printf("entry point returned %u\n", code);
+    /* The game runs on a thread of its own: the main thread is SDL's (macOS lets only it touch
+     * windows), pumping events and running the window calls the game's threads hand it
+     * (runtime/portable/sdl_main.h). */
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD))
+        printf("SDL_Init: %s\n", SDL_GetError());
+    static volatile int done;
+    plat_thread_start(game_thread, (void*)&done);
+    while (!done)
+    {
+        SDL_PumpEvents();
+        SDL_Delay(1);
+    }
     return 0;
 }
