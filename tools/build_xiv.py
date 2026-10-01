@@ -25,6 +25,7 @@ import thirdparty  # noqa: E402  (vendored SDL3, as tools/build_posix.py builds 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 META = 'meta/ffxivgame.1.23b.meta.json'
+APPLY = 'meta/ffxivgame.1.23b.apply.json'  # Garlemald Client's code patches, translated in
 GEN = 'generated/ffxivgame'
 CFLAGS = ['-O2', '-std=c11', '-g', '-DRT_GUEST_WINDOW', '-fno-strict-aliasing', '-I', 'runtime', '-I',
           'runtime/portable', '-I', GEN]
@@ -40,7 +41,9 @@ PORTABLE = ['runtime/runtime.c', 'runtime/portable/plat_posix.c', 'runtime/porta
 
 # Win32 shims on SDL3 (windowing, input, timers, sockets, audio) shared with FFXI.
 HOST = ['runtime/portable/user32.c', 'runtime/portable/input.c', 'runtime/portable/ws2.c',
-        'runtime/portable/dinput.c', 'runtime/portable/dsound.c']
+        'runtime/portable/dinput.c', 'runtime/portable/dsound.c', 'runtime/portable/d3d9.c', 'runtime/portable/d3dx9.c',
+        'runtime/portable/sm_msl.c', 'runtime/portable/gfx9_metal.m']
+GFX_LIBS = ['-framework', 'Metal', '-framework', 'QuartzCore', '-framework', 'Foundation']
 
 
 def run(cmd):
@@ -68,6 +71,8 @@ def compile_stale(sources, objdir, extra=()):
         src_time = max(os.path.getmtime(os.path.join(ROOT, s)), headers)
         if not os.path.exists(full) or os.path.getmtime(full) < src_time:
             flags = CFLAGS + list(extra) + (GEN_FLAGS if s.startswith('generated/') else [])
+            if s.endswith('.m'):  # Objective-C, references counted by hand
+                flags = [f for f in flags if f != '-std=c11'] + ['-fno-objc-arc']
             jobs.append(['clang', '-c'] + flags + [s, '-o', obj])
     if jobs:
         print('compiling %d of %d' % (len(jobs), len(sources)), flush=True)
@@ -98,7 +103,8 @@ def meta(exe, ghidra):
 
 
 def translate(exe):
-    run([sys.executable, 'recomp/recomp.py', '--meta', META, '--image', exe, '--retail', exe, '--out', GEN, '--all'])
+    run([sys.executable, 'recomp/recomp.py', '--meta', META, '--apply', APPLY, '--image', exe, '--retail', exe, '--out',
+         GEN, '--all'])
 
 
 def xivboot(exe, run_it, extra):
@@ -108,7 +114,7 @@ def xivboot(exe, run_it, extra):
     objs = compile_stale(gen, 'build/xiv/gen')
     thirdparty.build('sdl3')
     objs += compile_stale(PORTABLE + HOST + ['tests/xivboot.c'], 'build/xiv/obj', thirdparty.flags('sdl3'))
-    run(['clang', '-o', 'build/xivboot'] + objs + thirdparty.libs('sdl3') + ['-lm', '-lpthread'])
+    run(['clang', '-o', 'build/xivboot'] + objs + thirdparty.libs('sdl3') + GFX_LIBS + ['-lm', '-lpthread'])
     if run_it:
         run(['build/xivboot', exe] + extra)
 

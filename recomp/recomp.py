@@ -58,6 +58,11 @@ class Program:
         if self.base != meta['image_base']:
             raise SystemExit('image base %#x does not match metadata %#x' % (self.base, meta['image_base']))
         self.image = pe.get_memory_mapped_image()
+        for va, data in meta.get('apply', {}).items():
+            # code patches made part of the image before anything is decoded (--apply)
+            img = bytearray(self.image)
+            img[va - self.base:va - self.base + len(data)] = data
+            self.image = bytes(img)
         self.md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
         self.md.detail = True
         self.functions = {f['entry']: f['ranges'] for f in meta['functions']}
@@ -508,6 +513,7 @@ def main():
     ap.add_argument('--retail', help='the retail (packed) DLL; default: FFXiMain.dll from the registry')
     ap.add_argument('--hooks', default='', help='name=0xADDR,...: host hook points (see above)')
     ap.add_argument('--wraps', default='', help='name=0xADDR,...: functions the host may replace (see above)')
+    ap.add_argument('--apply', default='', help='a JSON file of code patches always translated in (see main)')
     ap.add_argument('--patches', default='', help='a JSON file of addon code patches (see above)')
     ap.add_argument('--module', default='',
                     help='a second module (e.g. ffxi for FFXi.dll): functions are named <module>_XXXXXXXX, the '
@@ -516,6 +522,15 @@ def main():
     args = ap.parse_args()
 
     meta = json.load(open(args.meta))
+    if args.apply:
+        # {"group": {"0xVA": "hex bytes", ...}, ...}; keys starting with "_" are comments
+        meta['apply'] = {}
+        for group, spots in json.load(open(args.apply)).items():
+            if group.startswith('_'):
+                continue
+            for addr, hexbytes in spots.items():
+                if not addr.startswith('_'):
+                    meta['apply'][int(addr, 16)] = bytes.fromhex(hexbytes)
     prog = Program(meta, args.image)
     prog.prefix = args.module + '_' if args.module else 'f_'
     for h in filter(None, args.hooks.split(',')):

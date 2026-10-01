@@ -9,6 +9,7 @@
  * the main thread, which is where GameStart runs FFXiMain's window code). Messages posted from
  * other guest threads go through a per-thread queue. */
 #include <SDL3/SDL.h>
+#include "sdl_main.h" /* window calls on the main thread (FINAL FANTASY XIV makes them on its render thread) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
