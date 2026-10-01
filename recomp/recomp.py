@@ -125,9 +125,37 @@ class Program:
                     end = self.code_until_ret(target)
                     if end:
                         self.functions[target] = [[target, end]]
+        if not self.has_reloc:
+            # Unaligned pointers in data: the CRT's x87 dispatch tables pack code addresses at odd
+            # offsets (ffxivgame.exe 0x12ebeaa holds 0x9ee8b1). Only code outside every known body
+            # that decodes cleanly to a ret is taken; inside a body they are left alone (a random
+            # unaligned dword would otherwise become an inner entry, a whole function's copy).
+            for target in self.unaligned_data_pointers(pe):
+                i = bisect.bisect_right(starts, target) - 1
+                if target in self.functions or (i >= 0 and spans[i][0] <= target < spans[i][1]):
+                    continue
+                end = self.code_until_ret(target)
+                if end and end - target >= 4:
+                    self.functions[target] = [[target, end]]
         self.add_code_pointer_entries(spans, starts)
         self.entries = set(self.functions)
         return inner
+
+    def unaligned_data_pointers(self, pe):
+        """Code addresses at unaligned offsets of the data sections."""
+        import struct
+        text_lo, text_hi = self.meta['text']
+        out = set()
+        for sec in pe.sections:
+            if sec.Name.rstrip(b'\0') not in (b'.data', b'.rdata'):
+                continue
+            lo = sec.VirtualAddress
+            data = self.image[lo:lo + min(sec.Misc_VirtualSize, sec.SizeOfRawData)]
+            for k in (1, 2, 3):
+                for v in struct.unpack_from('<%dI' % ((len(data) - k) // 4), data, k):
+                    if text_lo <= v < text_hi:
+                        out.add(v)
+        return sorted(out)
 
     def add_code_pointer_entries(self, spans, starts):
         """The same for code that takes a function's address as an immediate - a callback stored
@@ -206,7 +234,8 @@ class Program:
                 continue
             for p in reversed(seq[-10:]):
                 if p.mnemonic in ('movzx', 'mov') and idx_table is None and len(p.operands) == 2 \
-                        and p.operands[1].type == X.X86_OP_MEM and p.operands[1].size == 1 and p.operands[1].mem.index:
+                        and p.operands[1].type == X.X86_OP_MEM and p.operands[1].size == 1 \
+                        and (p.operands[1].mem.index or p.operands[1].mem.base) and p.operands[1].mem.disp:
                     idx_table = p.operands[1].mem.disp & 0xFFFFFFFF
                 if p.mnemonic == 'cmp' and len(p.operands) == 2 and p.operands[1].type == X.X86_OP_IMM:
                     n = p.operands[1].imm & 0xFFFFFFFF

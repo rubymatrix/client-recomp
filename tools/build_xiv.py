@@ -36,12 +36,12 @@ PORTABLE = ['runtime/runtime.c', 'runtime/portable/plat_posix.c', 'runtime/porta
             'runtime/portable/kobj.c', 'runtime/portable/k32_io.c',
             'runtime/portable/reg.c', 'runtime/portable/ole.c',
             'runtime/portable/k32_misc.c', 'runtime/portable/k32_xiv.c',
-            'runtime/portable/xiv_misc.c']
+            'runtime/portable/xiv_misc.c', 'runtime/portable/fiber.c']
 
 
 # Win32 shims on SDL3 (windowing, input, timers, sockets, audio) shared with FFXI.
 HOST = ['runtime/portable/user32.c', 'runtime/portable/input.c', 'runtime/portable/ws2.c',
-        'runtime/portable/dinput.c', 'runtime/portable/dsound.c', 'runtime/portable/d3d9.c', 'runtime/portable/d3dx9.c',
+        'runtime/portable/dinput.c', 'runtime/portable/dsound.c', 'runtime/portable/d3d9.c', 'runtime/portable/d3dx9.c', 'runtime/portable/xaudio2.c',
         'runtime/portable/sm_msl.c', 'runtime/portable/gfx9_metal.m']
 GFX_LIBS = ['-framework', 'Metal', '-framework', 'QuartzCore', '-framework', 'Foundation']
 

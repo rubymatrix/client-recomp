@@ -55,11 +55,21 @@ static const uint8_t CLSID_WbemLocator[16] = { 0x11, 0xF8, 0x90, 0x45, 0x3A, 0x1
 static uint32_t wmi_locator(void); /* below: the WMI IsXInputDevice asks */
 
 /* CoCreateInstance(rclsid, outer, clsctx, riid, ppv) */
+/* Other files' COM classes (xaudio2.c): 1 and the new object if the class is theirs. */
+int (*ole_class_hook)(uint32_t clsid, uint32_t riid, uint32_t* obj);
+
 static void sh_CoCreateInstance(Guest* g)
 {
     uint32_t clsid = ARG(0), riid = ARG(3), ppv = ARG(4);
     if (ppv)
         wr32(ppv, 0);
+    uint32_t made = 0;
+    if (ole_class_hook && ole_class_hook(clsid, riid, &made))
+    {
+        if (ppv)
+            wr32(ppv, made);
+        RET(made ? S_OK : 0x80004002u /* E_NOINTERFACE */, 5);
+    }
     if (!memcmp(GUEST_PTR(clsid), CLSID_WbemLocator, 16))
     {
         if (ppv)
