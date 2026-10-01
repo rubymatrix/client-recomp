@@ -61,6 +61,7 @@ class Program:
         self.md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
         self.md.detail = True
         self.functions = {f['entry']: f['ranges'] for f in meta['functions']}
+        self.meta_entries = set(self.functions)
         self.entries = set(self.functions)
         self.switches = {s['at']: s['targets'] for s in meta['switches'] if s['targets']}
         self.referenced = set()
@@ -72,6 +73,20 @@ class Program:
         self.relocs = self.text_relocations(pe)
         self.inner = self.add_data_entries(pe)
         self.inner |= self.add_branch_entries()
+        if not self.has_reloc:
+            # No relocation table: the code pointers in each newly found function's operands can
+            # lead to more functions (an initializer reached through the .CRT$XC table pushes
+            # its destructor stub for atexit: 0xf3c2f0). Repeat until nothing new turns up.
+            scanned = set(self.functions_scanned)
+            while True:
+                new = [e for e in self.functions if e not in scanned]
+                if not new:
+                    break
+                scanned |= set(new)
+                self.relocs |= self.operand_addresses(pe, new)
+                spans = sorted((lo, hi, entry) for entry, ranges in self.functions.items() for lo, hi in ranges)
+                self.add_code_pointer_entries(spans, [lo for lo, _, _ in spans])
+                self.inner |= self.add_branch_entries()
 
     def add_data_entries(self, pe):
         """Code the image's data points at (vtables, callbacks, exception handlers) is called
@@ -133,7 +148,15 @@ class Program:
             if not host:
                 continue  # a table in a gap, not an instruction
             target = struct.unpack_from('<I', self.image, site - self.base)[0]
-            if not text_lo <= target < text_hi or target in self.functions or target in tables or span_of(target):
+            if not text_lo <= target < text_hi or target in self.functions or target in tables:
+                continue
+            inside = span_of(target)
+            if inside and not self.has_reloc_or_ghidra(inside[2]) and self.on_boundary(inside[2], target):
+                # inside a range discovery guessed (code_until_ret), on one of its instruction
+                # boundaries: an entry of its own, as add_data_entries does
+                self.functions[target] = [list(r) for r in self.functions[inside[2]]]
+                continue
+            if inside:
                 continue
             entry = host[2]
             if entry not in decoded:
@@ -150,6 +173,65 @@ class Program:
             end = self.code_until_ret(target)
             if end:
                 self.functions[target] = [[target, end]]
+
+    def infer_switch(self, ins):
+        """Case targets of a `jmp [reg*4 + table]` the metadata does not list (code Ghidra never
+        made a function: the CRT's printf core at 0x9e5e11 in ffxivgame.exe), or None.
+
+        The count comes from the MSVC guard when one decodes in the instructions just before the
+        jump (cmp reg, N ; ja default ; [movzx reg, byte [reg + index_table]]), as
+        discovery/Switches.py reads it; failing that, entries are read while each is a code
+        address near the jump. Cached in self.switches."""
+        if ins.address in self.switches:
+            return self.switches[ins.address]
+        from capstone import x86_const as X
+        if len(ins.operands) != 1 or ins.operands[0].type != X.X86_OP_MEM:
+            return None
+        m = ins.operands[0].mem
+        text_lo, text_hi = self.meta['text']
+        if m.base or not m.index or m.scale != 4 or not text_lo <= (m.disp & 0xFFFFFFFF) < self.base + len(self.image):
+            return None
+        table = m.disp & 0xFFFFFFFF
+        index = ins.reg_name(m.index)
+        count, idx_table = None, None
+        # the guard: the longest run of instructions that decodes up to the jump exactly
+        for back in range(48, 1, -1):
+            seq = list(self.md.disasm(self.read(ins.address - back, back), ins.address - back))
+            if not seq or seq[-1].address + seq[-1].size != ins.address:
+                continue
+            for p in reversed(seq[-10:]):
+                if p.mnemonic in ('movzx', 'mov') and idx_table is None and len(p.operands) == 2 \
+                        and p.operands[1].type == X.X86_OP_MEM and p.operands[1].size == 1 and p.operands[1].mem.index:
+                    idx_table = p.operands[1].mem.disp & 0xFFFFFFFF
+                if p.mnemonic == 'cmp' and len(p.operands) == 2 and p.operands[1].type == X.X86_OP_IMM:
+                    n = p.operands[1].imm & 0xFFFFFFFF
+                    if n < 4096:
+                        count = n + 1
+                    break
+            break
+        if count is not None and idx_table is not None:
+            count = max(self.image[idx_table - self.base + i] for i in range(count)) + 1
+        targets = []
+        limit = count if count is not None else 1024
+        for i in range(limit):
+            off = table - self.base + 4 * i
+            if off + 4 > len(self.image):
+                break
+            v = int.from_bytes(self.image[off:off + 4], 'little')
+            if not text_lo <= v < text_hi or abs(v - ins.address) > 0x10000:
+                if count is not None:
+                    return None  # the guard was not this switch's
+                break
+            targets.append(v)
+        if not targets:
+            return None
+        targets = sorted(set(targets))
+        self.switches[ins.address] = targets
+        return targets
+
+    def has_reloc_or_ghidra(self, entry):
+        """Whether the function at entry came from the metadata (Ghidra), not discovery."""
+        return entry in self.meta_entries
 
     def add_branch_entries(self):
         """The same for direct branches: a call to an address that is not an entry, or a jump
@@ -215,8 +297,12 @@ class Program:
                 return 0
             if ins.mnemonic in ('push', 'pop') and ins.op_str in ('cs', 'ds', 'es', 'ss', 'fs', 'gs'):
                 return 0
-            if ins.mnemonic.startswith('ret'):
+            if ins.mnemonic.startswith('ret') or ins.mnemonic == 'jmp':
+                # the end of straight-line code: the translation follows jumps itself (x86c.py
+                # decode), so a range must not run on through padding into the next function
                 return ins.address + ins.size
+            if ins.mnemonic == 'int3':
+                return ins.address  # padding: the code ended in a call that does not return
         return 0
 
     def data_relocations(self, pe):
@@ -253,8 +339,10 @@ class Program:
         base-relocation block format, ending at the first block past .text or of size 0.
         """
         import struct
-        if not any(s.Name.rstrip(b'\0') == b'.reloc' for s in pe.sections):
-            return self.operand_addresses(pe)
+        self.has_reloc = any(s.Name.rstrip(b'\0') == b'.reloc' for s in pe.sections)
+        if not self.has_reloc:
+            self.functions_scanned = set(self.functions)
+            return self.operand_addresses(pe, list(self.functions))
         reloc = next(s for s in pe.sections if s.Name.rstrip(b'\0') == b'.reloc')
         text = next(s for s in pe.sections if s.Name.rstrip(b'\0') == b'.text')
         text_end = text.VirtualAddress + text.Misc_VirtualSize
@@ -271,15 +359,15 @@ class Program:
             off += size
         return out
 
-    def operand_addresses(self, pe):
+    def operand_addresses(self, pe, entries):
         """Sites in .text (immediate or displacement fields) holding an address inside the image:
-        what a relocation table would list, read from the decoded functions."""
+        what a relocation table would list, read from the given functions' code."""
         md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
         md.detail = True
         lo_img, hi_img = self.base, self.base + pe.OPTIONAL_HEADER.SizeOfImage
         out = set()
-        for entry, ranges in self.functions.items():
-            for lo, hi in ranges:
+        for entry in entries:
+            for lo, hi in self.functions[entry]:
                 for ins in md.disasm(self.read(lo, hi - lo), lo):
                     for off, size in ((ins.imm_offset, ins.imm_size), (ins.disp_offset, ins.disp_size)):
                         if off and size == 4:
@@ -467,6 +555,7 @@ def main():
             if e not in prog.entries:
                 raise SystemExit('%#x is not a function entry in the metadata' % e)
 
+    prog.functions_at_start = set(prog.functions)
     done = {}
     unimpl = collections.Counter()
     unimpl_funcs = set()
@@ -489,8 +578,9 @@ def main():
         for addr, mn, why in t.unimpl:
             unimpl[why if why.startswith('x87') else mn] += 1
             unimpl_funcs.add(e)
-        if closure:
-            queue.extend(r for r in prog.referenced if r not in done)
+        # entries found while translating (x86c.py: calls to code no function starts at) are
+        # translated too, in --all as well as for a closure
+        queue.extend(r for r in prog.referenced if r not in done and (closure or r not in prog.functions_at_start))
 
     os.makedirs(args.out, exist_ok=True)
     entries = sorted(done)

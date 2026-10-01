@@ -75,6 +75,37 @@ void gt_init(void)
 
 /* --- threads ----------------------------------------------------------------------------------- */
 
+static uint32_t g_peb, g_tls_start, g_tls_size, g_tls_zero;
+
+/* This thread's copy of the image's static TLS, at ThreadLocalStoragePointer[0]. */
+static void give_static_tls(uint32_t teb)
+{
+    if (!(g_tls_size + g_tls_zero) || rd32(teb + 0x2C))
+        return;
+    uint32_t block = gheap_alloc(g_tls_size + g_tls_zero, 1), slots = gheap_alloc(64 * 4, 1);
+    memcpy(GUEST_PTR(block), GUEST_PTR(g_tls_start), g_tls_size);
+    wr32(slots, block);
+    wr32(teb + 0x2C, slots);
+}
+
+/* Both also apply to the calling thread when its guest state already exists (the host's main
+ * thread may have run the runtime's own startup before the image was mapped). */
+void gt_set_peb(uint32_t peb)
+{
+    g_peb = peb;
+    if (t_self)
+        wr32(t_self->teb + 0x30, peb);
+}
+
+void gt_set_static_tls(uint32_t start, uint32_t size, uint32_t zero_fill)
+{
+    g_tls_start = start;
+    g_tls_size = size;
+    g_tls_zero = zero_fill;
+    if (t_self)
+        give_static_tls(t_self->teb);
+}
+
 GThread* gt_self(void)
 {
     if (t_self)
@@ -100,6 +131,9 @@ GThread* gt_self(void)
     t->g.esp = t->stack_hi - 64;
     t->g.fs_base = teb;
     t->g.fcw = 0x027F; /* the Win32 default: 53-bit precision, round to nearest, all masked */
+    t->g.mxcsr = 0x1F80; /* SSE: all exceptions masked, round to nearest */
+    wr32(teb + 0x30, g_peb);
+    give_static_tls(teb);
     t_self = t;
     return t;
 }

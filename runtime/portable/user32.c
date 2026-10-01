@@ -71,6 +71,7 @@ typedef struct Wnd
     int x, y, w, h, visible;
     int fullscreen; /* a full-screen D3D device is on it */
     SDL_Window* sdl;
+    uint32_t exstyle, userdata; /* GWL_EXSTYLE, GWL_USERDATA (SetWindowLongA) */
 } Wnd;
 static Wnd g_wnds[MAX_WINDOWS];
 static uint32_t g_focus;
@@ -1740,6 +1741,274 @@ static void sh_ImmGetConversionStatus(Guest* g)
     RET(1, 3);
 }
 
+/* --- the window calls FINAL FANTASY XIV makes beyond FFXI's -------------------------------------- */
+
+static void forward_a(Guest* g, Shim s) { s(g); }
+
+/* UTF-16 to a temporary guest string in code page 1252 (characters past 0xFF become '?'). */
+static uint32_t narrow_w(uint32_t w)
+{
+    if (!w || w < 0x10000u) /* an atom, not a string */
+        return w;
+    uint32_t n = 0;
+    while (rd16(w + 2 * n))
+        n++;
+    uint32_t a = gheap_alloc(n + 1, 0);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        uint16_t c = rd16(w + 2 * i);
+        wr8(a + i, c > 0xFF ? '?' : (uint8_t)c);
+    }
+    wr8(a + n, 0);
+    return a;
+}
+
+/* RegisterClassExA(WNDCLASSEXA*): lpfnWndProc at +8, lpszClassName at +40 */
+static void register_class(Guest* g, uint32_t name)
+{
+    uint32_t wc = ARG(0);
+    for (int i = 0; i < MAX_CLASSES; ++i)
+        if (!g_classes[i].name[0])
+        {
+            snprintf(g_classes[i].name, sizeof g_classes[i].name, "%s", (const char*)GUEST_PTR(name));
+            g_classes[i].wndproc = rd32(wc + 8);
+            RET(0xC000u + (uint32_t)i, 1);
+        }
+    RET(0, 1);
+}
+static void sh_RegisterClassExA(Guest* g) { register_class(g, rd32(ARG(0) + 40)); }
+static void sh_RegisterClassExW(Guest* g)
+{
+    uint32_t name = narrow_w(rd32(ARG(0) + 40));
+    register_class(g, name);
+    if (name >= 0x10000u)
+        gheap_free(name);
+}
+
+static void sh_DefWindowProcW(Guest* g) { forward_a(g, sh_DefWindowProcA); }
+static void sh_DispatchMessageW(Guest* g) { forward_a(g, sh_DispatchMessageA); }
+static void sh_PeekMessageW(Guest* g) { forward_a(g, sh_PeekMessageA); }
+
+/* SetWindowLongA(hwnd, index, value): returns the previous value */
+static void sh_SetWindowLongA(Guest* g)
+{
+    Wnd* w = wnd(ARG(0));
+    uint32_t v = ARG(2), old = 0;
+    if (!w)
+        RET(0, 3);
+    switch ((int32_t)ARG(1))
+    {
+    case -4: old = w->wndproc; w->wndproc = v; break; /* GWL_WNDPROC */
+    case -16: old = w->style; w->style = v; apply_frame(w); break; /* GWL_STYLE */
+    case -20: old = w->exstyle; w->exstyle = v; break; /* GWL_EXSTYLE */
+    case -21: old = w->userdata; w->userdata = v; break; /* GWL_USERDATA */
+    default: break;
+    }
+    RET(old, 3);
+}
+
+/* SetWindowPos(hwnd, after, x, y, cx, cy, flags) */
+static void sh_SetWindowPos(Guest* g)
+{
+    Wnd* w = wnd(ARG(0));
+    uint32_t flags = ARG(6);
+    if (!w)
+        RET(0, 7);
+    if (!(flags & 0x0002u)) /* SWP_NOMOVE */
+    {
+        w->x = (int32_t)ARG(2), w->y = (int32_t)ARG(3);
+        if (w->sdl)
+            SDL_SetWindowPosition(w->sdl, w->x, w->y);
+        call_wndproc(w, WM_MOVE, 0, ((uint32_t)(uint16_t)w->y << 16) | (uint16_t)w->x);
+    }
+    if (!(flags & 0x0001u) && (int32_t)ARG(4) > 0 && (int32_t)ARG(5) > 0) /* SWP_NOSIZE */
+    {
+        w->w = (int32_t)ARG(4), w->h = (int32_t)ARG(5);
+        if (w->sdl)
+            SDL_SetWindowSize(w->sdl, w->w, w->h);
+        apply_frame(w);
+        call_wndproc(w, WM_SIZE, 0, ((uint32_t)(uint16_t)w->h << 16) | (uint16_t)w->w);
+    }
+    if (flags & 0x0040u) /* SWP_SHOWWINDOW */
+        show_window(w, 1);
+    else if (flags & 0x0080u) /* SWP_HIDEWINDOW */
+        show_window(w, 0);
+    RET(1, 7);
+}
+
+static void sh_SetWindowTextW(Guest* g)
+{
+    Wnd* w = wnd(ARG(0));
+    uint32_t t = narrow_w(ARG(1));
+    if (w && w->sdl && t)
+        SDL_SetWindowTitle(w->sdl, (const char*)GUEST_PTR(t));
+    if (t >= 0x10000u)
+        gheap_free(t);
+    RET(w != NULL, 2);
+}
+
+static void sh_GetDC(Guest* g) { RET(gdi_new(GDI_DC), 1); }
+static void sh_ReleaseDC(Guest* g)
+{
+    GdiObj* d = gdi(ARG(1), GDI_DC);
+    if (d)
+        d->kind = GDI_FREE;
+    RET(d != NULL, 2);
+}
+
+static uint32_t g_capture;
+static void sh_SetCapture(Guest* g) { uint32_t old = g_capture; g_capture = ARG(0); RET(old, 1); }
+static void sh_ReleaseCapture(Guest* g) { g_capture = 0; RET(1, 0); }
+
+/* ToAscii(vk, scan, keystate, out, flags): letters, digits and space, shifted from the state */
+static void sh_ToAscii(Guest* g)
+{
+    uint32_t vk = ARG(0) & 0xFF, state = ARG(2), out = ARG(3);
+    int shift = state && (rd8(state + 0x10) & 0x80);
+    uint8_t c = 0;
+    if (vk >= 'A' && vk <= 'Z')
+        c = (uint8_t)(shift ? vk : vk + 32);
+    else if ((vk >= '0' && vk <= '9') || vk == ' ')
+        c = (uint8_t)vk;
+    if (!c)
+        RET(0, 5);
+    wr16(out, c);
+    RET(1, 5);
+}
+
+static void sh_EnumWindows(Guest* g) { RET(1, 2); }
+static void sh_GetProcessWindowStation(Guest* g) { RET(0x000A0001u, 0); }
+static void sh_GetUserObjectInformationW(Guest* g) { gt_set_error(50); RET(0, 5); }
+static void sh_GetDesktopWindow(Guest* g) { RET(0x00010010u, 0); }
+static void sh_GetActiveWindow(Guest* g) { RET(g_focus, 0); }
+static void sh_SetActiveWindow(Guest* g) { uint32_t old = g_focus; g_focus = ARG(0); RET(old, 1); }
+static void sh_GetClipboardData(Guest* g) { RET(0, 1); }
+static void sh_SetDlgItemTextW(Guest* g) { RET(1, 3); }
+static void sh_GetMenu(Guest* g) { RET(0, 1); }
+static void sh_CreateMenu(Guest* g) { RET(0x00090001u, 0); }
+static void sh_ClipCursor(Guest* g) { RET(1, 1); }
+
+/* SetTimer(hwnd, id, ms, proc) / KillTimer(hwnd, id): the game's timers are not driven yet (logged) */
+static void sh_SetTimer(Guest* g)
+{
+    rt_log("[recomp] SetTimer(%08x, %u, %u ms, %08x): not delivered\n", ARG(0), ARG(1), ARG(2), ARG(3));
+    RET(ARG(1) ? ARG(1) : 1, 4);
+}
+static void sh_KillTimer(Guest* g) { RET(1, 2); }
+
+static void message_box(Guest* g, uint32_t text, uint32_t caption)
+{
+    rt_log("[recomp] MessageBox \"%s\": %s\n", caption ? (const char*)GUEST_PTR(caption) : "",
+        text ? (const char*)GUEST_PTR(text) : "");
+    RET(1, 4); /* IDOK */
+}
+static void sh_MessageBoxA(Guest* g) { message_box(g, ARG(1), ARG(2)); }
+static void sh_MessageBoxW(Guest* g)
+{
+    uint32_t t = narrow_w(ARG(1)), c = narrow_w(ARG(2));
+    rt_log("[recomp] MessageBox \"%s\": %s\n", c ? (const char*)GUEST_PTR(c) : "", t ? (const char*)GUEST_PTR(t) : "");
+    if (t >= 0x10000u) gheap_free(t);
+    if (c >= 0x10000u) gheap_free(c);
+    RET(1, 4);
+}
+
+/* GDI: stock objects, pens and the debug drawing calls draw nothing; text metrics are the font's
+ * height, at half that per character. */
+static void sh_GetStockObject(Guest* g) { RET(0x00080000u | (ARG(0) & 0xFFu), 1); }
+static void sh_CreatePen(Guest* g) { RET(0x00080100u, 3); }
+static void sh_MoveToEx(Guest* g) { if (ARG(3)) { wr32(ARG(3), 0); wr32(ARG(3) + 4, 0); } RET(1, 4); }
+static void sh_LineTo(Guest* g) { RET(1, 3); }
+static void sh_Ellipse(Guest* g) { RET(1, 5); }
+static void sh_TextOutA(Guest* g) { RET(1, 5); }
+
+/* CreateFontW(height, width, escapement, orientation, weight, italic, underline, strikeout,
+ * charset, outprecision, clipprecision, quality, pitch, face) */
+static void sh_CreateFontW(Guest* g)
+{
+    uint32_t h = gdi_new(GDI_FONT);
+    GdiObj* f = gdi(h, GDI_FONT);
+    if (f)
+        f->font_height = (int32_t)ARG(0);
+    RET(h, 14);
+}
+
+static int32_t dc_font_height(uint32_t dc)
+{
+    GdiObj* d = gdi(dc, GDI_DC);
+    GdiObj* f = d ? gdi(d->font, GDI_FONT) : NULL;
+    int32_t h = f ? f->font_height : 16;
+    return h < 0 ? -h : h ? h : 16;
+}
+
+/* GetTextMetricsA(dc, TEXTMETRICA*) */
+static void sh_GetTextMetricsA(Guest* g)
+{
+    int32_t h = dc_font_height(ARG(0));
+    uint32_t tm = ARG(1);
+    memset(GUEST_PTR(tm), 0, 56);
+    wr32(tm + 0, (uint32_t)h);                 /* tmHeight */
+    wr32(tm + 4, (uint32_t)(h * 4 / 5));       /* tmAscent */
+    wr32(tm + 8, (uint32_t)(h - h * 4 / 5));   /* tmDescent */
+    wr32(tm + 20, (uint32_t)(h / 2));          /* tmAveCharWidth */
+    wr32(tm + 24, (uint32_t)h);                /* tmMaxCharWidth */
+    wr32(tm + 28, 400);                        /* tmWeight */
+    RET(1, 2);
+}
+
+/* GetTextExtentPoint32A(dc, text, count, SIZE*) */
+static void sh_GetTextExtentPoint32A(Guest* g)
+{
+    int32_t h = dc_font_height(ARG(0));
+    wr32(ARG(3), (uint32_t)((int32_t)ARG(2) * h / 2));
+    wr32(ARG(3) + 4, (uint32_t)h);
+    RET(1, 4);
+}
+
+/* GetGlyphOutlineW: no outlines from this GDI (GDI_ERROR) */
+static void sh_GetGlyphOutlineW(Guest* g) { RET(0xFFFFFFFFu, 7); }
+
+static const ShimDef USER32_XIV[] = {
+    { "user32.dll", "RegisterClassExA", sh_RegisterClassExA },
+    { "user32.dll", "RegisterClassExW", sh_RegisterClassExW },
+    { "user32.dll", "DefWindowProcW", sh_DefWindowProcW },
+    { "user32.dll", "DispatchMessageW", sh_DispatchMessageW },
+    { "user32.dll", "PeekMessageW", sh_PeekMessageW },
+    { "user32.dll", "SetWindowLongA", sh_SetWindowLongA },
+    { "user32.dll", "SetWindowPos", sh_SetWindowPos },
+    { "user32.dll", "SetWindowTextW", sh_SetWindowTextW },
+    { "user32.dll", "GetDC", sh_GetDC },
+    { "user32.dll", "ReleaseDC", sh_ReleaseDC },
+    { "user32.dll", "SetCapture", sh_SetCapture },
+    { "user32.dll", "ReleaseCapture", sh_ReleaseCapture },
+    { "user32.dll", "ToAscii", sh_ToAscii },
+    { "user32.dll", "EnumWindows", sh_EnumWindows },
+    { "user32.dll", "GetProcessWindowStation", sh_GetProcessWindowStation },
+    { "user32.dll", "GetUserObjectInformationW", sh_GetUserObjectInformationW },
+    { "user32.dll", "GetDesktopWindow", sh_GetDesktopWindow },
+    { "user32.dll", "GetActiveWindow", sh_GetActiveWindow },
+    { "user32.dll", "SetActiveWindow", sh_SetActiveWindow },
+    { "user32.dll", "GetClipboardData", sh_GetClipboardData },
+    { "user32.dll", "SetDlgItemTextW", sh_SetDlgItemTextW },
+    { "user32.dll", "GetMenu", sh_GetMenu },
+    { "user32.dll", "CreateMenu", sh_CreateMenu },
+    { "user32.dll", "ClipCursor", sh_ClipCursor },
+    { "user32.dll", "SetTimer", sh_SetTimer },
+    { "user32.dll", "KillTimer", sh_KillTimer },
+    { "user32.dll", "MessageBoxA", sh_MessageBoxA },
+    { "user32.dll", "MessageBoxW", sh_MessageBoxW },
+    { "gdi32.dll", "GetStockObject", sh_GetStockObject },
+    { "gdi32.dll", "CreatePen", sh_CreatePen },
+    { "gdi32.dll", "MoveToEx", sh_MoveToEx },
+    { "gdi32.dll", "LineTo", sh_LineTo },
+    { "gdi32.dll", "Ellipse", sh_Ellipse },
+    { "gdi32.dll", "TextOutA", sh_TextOutA },
+    { "gdi32.dll", "CreateFontW", sh_CreateFontW },
+    { "gdi32.dll", "GetTextMetricsA", sh_GetTextMetricsA },
+    { "gdi32.dll", "GetTextExtentPoint32A", sh_GetTextExtentPoint32A },
+    { "gdi32.dll", "GetGlyphOutlineW", sh_GetGlyphOutlineW },
+    { NULL, NULL, NULL },
+};
+
 static const ShimDef USER32[] = {
     { "user32.dll", "RegisterClassA", sh_RegisterClassA },
     { "user32.dll", "UnregisterClassA", sh_UnregisterClassA },
@@ -1845,6 +2114,7 @@ static const ShimDef USER32[] = {
 void user32_init(void)
 {
     thunk_register(USER32);
+    thunk_register(USER32_XIV);
 }
 
 void* user32_sdl_window(uint32_t hwnd)

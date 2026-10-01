@@ -118,8 +118,9 @@ static int map_build(const char* path, const Build* b, uint32_t load_base)
     }
     free(f);
 
-    uint32_t got = unpack_text(GUEST_PTR(load_base + b->packed_rva), b->packed_len, GUEST_PTR(load_base + b->text_rva),
-        b->text_size);
+    /* FFXiMain's .text is packed; an image that is not (ffxivgame.exe) has packed_len 0 */
+    uint32_t got = b->packed_len ? unpack_text(GUEST_PTR(load_base + b->packed_rva), b->packed_len,
+                                               GUEST_PTR(load_base + b->text_rva), b->text_size) : b->text_size;
     if (got != b->text_size)
     {
         rt_log("[recomp] %s: packed section decompressed %u bytes, expected %u\n", b->name, got, b->text_size);
@@ -294,4 +295,18 @@ uint32_t pe_resource(uint32_t base, uint32_t type, uint32_t name, uint32_t* size
     if (size)
         *size = rd32(data + 4);
     return base + rd32(data);
+}
+
+uint32_t pe_static_tls(uint32_t base, uint32_t* start, uint32_t* size, uint32_t* zero_fill)
+{
+    uint32_t opt = base + rd32(base + 0x3C) + 24;
+    uint32_t dir = rd32(opt + 96 + 8 * 9); /* IMAGE_DIRECTORY_ENTRY_TLS */
+    if (!dir)
+        return 0;
+    uint32_t t = base + dir; /* IMAGE_TLS_DIRECTORY32: addresses are absolute (VAs) */
+    *start = rd32(t + 0);
+    *size = rd32(t + 4) - rd32(t + 0);
+    *zero_fill = rd32(t + 16);
+    wr32(rd32(t + 8), 0); /* _tls_index: the image's block is slot 0 */
+    return rd32(t + 12);  /* the callback array (NULL-terminated), or 0 */
 }
