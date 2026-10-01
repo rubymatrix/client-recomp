@@ -47,6 +47,8 @@ RT_INLINE double rdf64(uint32_t a) { double v; memcpy(&v, GUEST_PTR(a), 8); retu
 RT_INLINE void wrf32(uint32_t a, float v) { memcpy(GUEST_PTR(a), &v, 4); }
 RT_INLINE void wrf64(uint32_t a, double v) { memcpy(GUEST_PTR(a), &v, 8); }
 
+#include "sse.h"
+
 typedef struct Guest
 {
     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
@@ -59,6 +61,11 @@ typedef struct Guest
     uint32_t top;
     uint16_t fcw;
     uint8_t c0, c1, c2, c3;
+
+    /* SSE/SSE2 (runtime/sse.h): MXCSR is kept as written (0x1F80 at thread start). */
+    X128 xmm[8];
+    uint32_t mxcsr;
+    X128 mm[8]; /* MMX, upper halves zero (recomp/x86c.py xmm()) */
 } Guest;
 
 typedef void (*GuestFn)(Guest*);

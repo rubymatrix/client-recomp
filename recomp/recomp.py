@@ -39,6 +39,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from x86c import FunctionTranslator  # noqa: E402
 
 
+# Instructions a 32-bit C/C++ compiler never emits: a run of bytes that decodes to one of them is a
+# table or padding, not code (ffxivgame.exe keeps pointer tables in .text's gaps: 0x0057ce35
+# repeated decodes as `into`).
+NOT_COMPILED = {
+    'in', 'out', 'insb', 'insw', 'insd', 'outsb', 'outsw', 'outsd', 'hlt', 'cli', 'sti', 'into', 'int1',
+    'aaa', 'aad', 'aam', 'aas', 'daa', 'das', 'salc', 'les', 'lds', 'lss', 'retf', 'iret', 'iretd', 'bound',
+    'arpl', 'ljmp', 'lcall', 'icebp', 'sldt', 'sgdt', 'sidt', 'lgdt', 'lidt', 'clts',
+}
+
+
 class Program:
     def __init__(self, meta, image_path):
         self.meta = meta
@@ -76,14 +86,13 @@ class Program:
         import struct
         pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_BASERELOC']])
         text_lo, text_hi = self.meta['text']
+        data_sites = self.data_relocations(pe)
         spans = sorted((lo, hi, entry) for entry, ranges in self.functions.items() for lo, hi in ranges)
         starts = [lo for lo, _, _ in spans]
         inner = set()
-        for block in getattr(pe, 'DIRECTORY_ENTRY_BASERELOC', ()):
-            for e in block.entries:
-                if e.type != 3:  # IMAGE_REL_BASED_HIGHLOW
-                    continue
-                target = struct.unpack_from('<I', self.image, e.rva)[0]
+        for rva in data_sites:
+            if True:
+                target = struct.unpack_from('<I', self.image, rva)[0]
                 if not text_lo <= target < text_hi or target in self.functions:
                     continue
                 i = bisect.bisect_right(starts, target) - 1
@@ -202,20 +211,50 @@ class Program:
         """The end of straight-line code from va to its first ret, or 0 if it does not look like
         code (it runs out, or reads ports: data tables inside .text decode as in/ins)."""
         for ins in self.md.disasm(self.read(va, limit), va):
-            if ins.mnemonic in ('in', 'out', 'insb', 'insd', 'outsb', 'outsd', 'hlt', 'cli', 'sti'):
+            if ins.mnemonic in NOT_COMPILED or ins.mnemonic.split(' ')[-1] in NOT_COMPILED:
+                return 0
+            if ins.mnemonic in ('push', 'pop') and ins.op_str in ('cs', 'ds', 'es', 'ss', 'fs', 'gs'):
                 return 0
             if ins.mnemonic.startswith('ret'):
                 return ins.address + ins.size
         return 0
 
+    def data_relocations(self, pe):
+        """The RVAs outside .text that hold an absolute address of code: the image's own
+        relocations when it has them (FFXiMain); else, for an EXE linked at a fixed base without a
+        relocation table (ffxivgame.exe), every aligned dword in the data sections whose value lies
+        in .text. A false hit is harmless here: it only becomes an entry when it starts an
+        instruction (on_boundary) or decodes as code up to a ret."""
+        import struct
+        blocks = getattr(pe, 'DIRECTORY_ENTRY_BASERELOC', None)
+        if blocks:
+            return [e.rva for b in blocks for e in b.entries if e.type == 3]  # IMAGE_REL_BASED_HIGHLOW
+        text_lo, text_hi = self.meta['text']
+        out = []
+        for sec in pe.sections:
+            if sec.Name.rstrip(b'\0') in (b'.text', b'.rsrc', b'.reloc'):
+                continue
+            lo = sec.VirtualAddress
+            hi = lo + min(sec.Misc_VirtualSize, sec.SizeOfRawData)
+            for rva in range(lo, hi - 3, 4):
+                if text_lo <= struct.unpack_from('<I', self.image, rva)[0] < text_hi:
+                    out.append(rva)
+        return out
+
     def text_relocations(self, pe):
         """Every location in .text that holds an absolute image address.
+
+        An EXE without a .reloc section (ffxivgame.exe) always loads at its preferred base, so
+        nothing needs relocating (RD is 0); its code pointers are found from the instructions
+        themselves: every immediate and displacement whose value lies inside the image.
 
         They are not in the PE relocation directory (which covers .rdata/.data only): the packer's
         stub applies them itself from a private table at the start of .reloc, in the ordinary
         base-relocation block format, ending at the first block past .text or of size 0.
         """
         import struct
+        if not any(s.Name.rstrip(b'\0') == b'.reloc' for s in pe.sections):
+            return self.operand_addresses(pe)
         reloc = next(s for s in pe.sections if s.Name.rstrip(b'\0') == b'.reloc')
         text = next(s for s in pe.sections if s.Name.rstrip(b'\0') == b'.text')
         text_end = text.VirtualAddress + text.Misc_VirtualSize
@@ -230,6 +269,23 @@ class Program:
                 if e >> 12 == 3:  # IMAGE_REL_BASED_HIGHLOW
                     out.add(self.base + page + (e & 0xFFF))
             off += size
+        return out
+
+    def operand_addresses(self, pe):
+        """Sites in .text (immediate or displacement fields) holding an address inside the image:
+        what a relocation table would list, read from the decoded functions."""
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+        md.detail = True
+        lo_img, hi_img = self.base, self.base + pe.OPTIONAL_HEADER.SizeOfImage
+        out = set()
+        for entry, ranges in self.functions.items():
+            for lo, hi in ranges:
+                for ins in md.disasm(self.read(lo, hi - lo), lo):
+                    for off, size in ((ins.imm_offset, ins.imm_size), (ins.disp_offset, ins.disp_size)):
+                        if off and size == 4:
+                            v = int.from_bytes(ins.bytes[off:off + 4], 'little')
+                            if lo_img <= v < hi_img:
+                                out.add(ins.address + off)
         return out
 
     def read(self, va, n):
@@ -297,6 +353,14 @@ def image_constants(prog, image_path):
     import unpack  # the static unpacker (tools/unpack.py)
     pe = pefile.PE(image_path, fast_load=True)
     text = next(s for s in pe.sections if s.Name.rstrip(b'\0') == b'.text')
+    if not any(s.Name.rstrip(b'\0') == b'.reloc' for s in pe.sections):
+        # An EXE at its fixed base, not packed (ffxivgame.exe): .text is the file's own.
+        return {
+            'base': prog.base, 'reloc_rva': 0, 'timestamp': pe.FILE_HEADER.TimeDateStamp,
+            'size': pe.OPTIONAL_HEADER.SizeOfImage, 'text_rva': text.VirtualAddress,
+            'text_size': text.Misc_VirtualSize, 'packed_rva': 0, 'packed_len': 0,
+            'oep': prog.base + pe.OPTIONAL_HEADER.AddressOfEntryPoint,
+        }
     packed = unpack.packed_section(pe)
     src_len, dst_len, oep = unpack.parse_stub(pe)
     reloc = next(s for s in pe.sections if s.Name.rstrip(b'\0') == b'.reloc')
