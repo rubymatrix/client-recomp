@@ -1176,13 +1176,19 @@ extern "C" int xi_gui_mouse(int msg, int x, int y, int delta)
         return 0;
     ImGuiIO& io = ImGui::GetIO();
     io.AddMousePosEvent((float)x, (float)y);
+    /* WantCaptureMouse is from the last frame's mouse position: a press or a wheel turn right after
+     * moving onto a window would go to the game, so the point is also tested against the windows */
+    ImGuiWindow *over = NULL, *under_moving = NULL;
+    if (msg != 0x200)
+        ImGui::FindHoveredWindowEx(ImVec2((float)x, (float)y), true, &over, &under_moving);
+    int want = io.WantCaptureMouse || over != NULL;
     int taken = 0;
     switch (msg)
     {
-    case 0x201: case 0x202: io.AddMouseButtonEvent(0, msg == 0x201); taken = io.WantCaptureMouse; break;
-    case 0x204: case 0x205: io.AddMouseButtonEvent(1, msg == 0x204); taken = io.WantCaptureMouse; break;
-    case 0x207: case 0x208: io.AddMouseButtonEvent(2, msg == 0x207); taken = io.WantCaptureMouse; break;
-    case 0x20A: io.AddMouseWheelEvent(0, delta / 120.0f); taken = io.WantCaptureMouse; break;
+    case 0x201: case 0x202: io.AddMouseButtonEvent(0, msg == 0x201); taken = want; break;
+    case 0x204: case 0x205: io.AddMouseButtonEvent(1, msg == 0x204); taken = want; break;
+    case 0x207: case 0x208: io.AddMouseButtonEvent(2, msg == 0x207); taken = want; break;
+    case 0x20A: io.AddMouseWheelEvent(0, delta / 120.0f); taken = want; break;
     default: break;
     }
     if (drag(msg, x, y))

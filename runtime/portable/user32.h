@@ -37,7 +37,8 @@ extern int (*user32_event_hook)(const void* sdl_event, int window_w, int window_
 /* Set by the addon host: runs once when the player quits (the window closing), before the process
  * ends. */
 extern void (*user32_quit_hook)(void);
-/* 1 when the game was last given the cursor as it is (over the world), 0 unsqueezed */
-int user32_mouse_raw(void);
-/* where the game was last given the cursor, 0..1 of its window across and down */
-void user32_mouse_given(float* fx, float* fy);
+/* where the game was given the cursor, 0..1 of its window across and down: i = 0 the latest, up to
+ * USER32_MOUSE_GIVEN back. Returns 1 when it was given as it is (over the world), 0 unsqueezed (over
+ * the interface), -1 when there is no such point. */
+#define USER32_MOUSE_GIVEN 8
+int user32_mouse_given(int i, float* fx, float* fy);

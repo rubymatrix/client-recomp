@@ -109,16 +109,39 @@ static float ui_squeeze_y(const Wnd* w)
  * (where d3d8.c drew it last frame: user32_ui_hit) the cursor's client x goes to the game as the x
  * the game drew there before its draws were squeezed toward the middle, so its hit tests line up;
  * over the world it goes as it is, so picking and the target arrow do. A press keeps its mode until
- * the buttons are up (dragging a window out over the world). The game's own cursor is drawn to
- * match (user32_mouse_raw). */
+ * the buttons are up (dragging a window out over the world); so does a press the addon overlay took,
+ * raw, as the overlay is drawn. The game's own cursor is drawn to match (user32_mouse_given). */
 int (*user32_ui_hit)(float fx, float fy);
 static int g_mouse_raw = 1, g_mouse_held;
 
-static float g_mouse_fx, g_mouse_fy; /* where the game was last told the cursor is: 0..1 of the client */
+/* where the game was told the cursor is, 0..1 of the client, and whether raw: newest at g_given_at.
+ * Several, as the game may draw its cursor at a point given before the latest (a frame behind, the
+ * mode flipping as the mouse leaves the interface). */
+static struct
+{
+    float fx, fy;
+    int raw;
+} g_given[USER32_MOUSE_GIVEN];
+static int g_given_at, g_given_n;
 
-int user32_mouse_raw(void) { return g_mouse_raw; }
+int user32_mouse_given(int i, float* fx, float* fy)
+{
+    if (i < 0 || i >= g_given_n)
+        return -1;
+    int k = (g_given_at - i + USER32_MOUSE_GIVEN) % USER32_MOUSE_GIVEN;
+    *fx = g_given[k].fx, *fy = g_given[k].fy;
+    return g_given[k].raw;
+}
 
-void user32_mouse_given(float* fx, float* fy) { *fx = g_mouse_fx, *fy = g_mouse_fy; }
+static void mouse_give(const Wnd* w, int x, int y)
+{
+    float fx = ((float)x + 0.5f) / (float)w->w, fy = ((float)y + 0.5f) / (float)w->h;
+    if (g_given_n && g_given[g_given_at].fx == fx && g_given[g_given_at].fy == fy && g_given[g_given_at].raw == g_mouse_raw)
+        return;
+    g_given_at = (g_given_at + 1) % USER32_MOUSE_GIVEN;
+    g_given[g_given_at].fx = fx, g_given[g_given_at].fy = fy, g_given[g_given_at].raw = g_mouse_raw;
+    g_given_n += g_given_n < USER32_MOUSE_GIVEN;
+}
 
 /* The client point (*x, *y) made the one to give the game: unsqueezed across in a wider window, down
  * in a taller one, over the interface; as it is over the world. */
@@ -128,6 +151,7 @@ static void ui_unsqueeze(const Wnd* w, int* x, int* y)
     if (s >= 1.0f && t >= 1.0f)
     {
         g_mouse_raw = 1;
+        mouse_give(w, *x, *y);
         return;
     }
     if (!g_mouse_held)
@@ -142,8 +166,22 @@ static void ui_unsqueeze(const Wnd* w, int* x, int* y)
         float c = (float)w->h * 0.5f, gy = c + ((float)*y - c) / t;
         *y = gy < 0 ? 0 : gy > (float)(w->h - 1) ? w->h - 1 : (int)(gy + 0.5f);
     }
-    g_mouse_fx = ((float)*x + 0.5f) / (float)w->w;
-    g_mouse_fy = ((float)*y + 0.5f) / (float)w->h;
+    mouse_give(w, *x, *y);
+}
+
+/* The reverse, for the game putting the cursor somewhere (SetCursorPos: its menus put it on the item
+ * they select, the log window on itself): its point is one of the interface the game drew there,
+ * which is now squeezed toward the middle. */
+static void ui_squeeze_point(const Wnd* w, int* x, int* y)
+{
+    float s = ui_squeeze(w), t = ui_squeeze_y(w);
+    if (s >= 1.0f && t >= 1.0f)
+        return;
+    float cx = (float)w->w * 0.5f, cy = (float)w->h * 0.5f;
+    *x = (int)(cx + ((float)*x - cx) * s + 0.5f);
+    *y = (int)(cy + ((float)*y - cy) * t + 0.5f);
+    if (!g_mouse_held)
+        g_mouse_raw = 0;
 }
 
 static Wnd* wnd_of_sdl(SDL_WindowID id)
@@ -419,6 +457,10 @@ static uint32_t mouse_keys(SDL_MouseButtonFlags b)
         (g_keys[0x10] ? 4u : 0) | (g_keys[0x11] ? 8u : 0);
 }
 
+/* The mouse buttons (SDL_BUTTON_MASK bits) the overlay took the press of: their release is the
+ * overlay's too, and the game's window is not told they are down while they are. */
+static SDL_MouseButtonFlags g_overlay_buttons;
+
 /* Pumps SDL on the window's thread and turns its events into queued messages. */
 static void pump(void)
 {
@@ -435,7 +477,13 @@ static void pump(void)
             if (sw)
                 SDL_GetWindowSize(sw, &ww, &wh);
             if (user32_event_hook(&e, ww, wh))
-                continue; /* the overlay's: neither DirectInput nor the game's window sees it */
+            {
+                /* the overlay's: neither DirectInput nor the game's window sees it. A press it took
+                 * keeps the mouse raw (where the overlay is drawn) until the buttons are up. */
+                if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN)
+                    g_overlay_buttons |= SDL_BUTTON_MASK(e.button.button), g_mouse_held = 1, g_mouse_raw = 1;
+                continue;
+            }
         }
         else if (user32_event_hook)
         {
@@ -444,6 +492,14 @@ static void pump(void)
             if (sw)
                 SDL_GetWindowSize(sw, &ww, &wh);
             user32_event_hook(&e, ww, wh);
+        }
+        /* the release of a press the overlay took: the game never saw the press (FFXI acts on the
+         * release: targeting, its menus) */
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && (g_overlay_buttons & SDL_BUTTON_MASK(e.button.button)))
+        {
+            g_overlay_buttons &= ~SDL_BUTTON_MASK(e.button.button);
+            g_mouse_held = SDL_GetMouseState(NULL, NULL) != 0;
+            continue;
         }
         input_sdl_event(&e); /* DirectInput's view of the same events */
         Wnd* w = NULL;
@@ -496,7 +552,8 @@ static void pump(void)
             {
                 int mx = (int)e.motion.x, my = (int)e.motion.y;
                 ui_unsqueeze(w, &mx, &my);
-                post(w->tid, w->hwnd, WM_MOUSEMOVE, mouse_keys(e.motion.state), ((uint32_t)(uint16_t)my << 16) | (uint16_t)mx);
+                post(w->tid, w->hwnd, WM_MOUSEMOVE, mouse_keys(e.motion.state & ~g_overlay_buttons),
+                    ((uint32_t)(uint16_t)my << 16) | (uint16_t)mx);
             }
             break;
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -516,7 +573,7 @@ static void pump(void)
             ui_unsqueeze(w, &bx, &by);
             uint32_t lp = ((uint32_t)(uint16_t)by << 16) | (uint16_t)bx;
             g_mouse_held = SDL_GetMouseState(NULL, NULL) != 0;
-            post(w->tid, w->hwnd, msg, mouse_keys(SDL_GetMouseState(NULL, NULL)), lp);
+            post(w->tid, w->hwnd, msg, mouse_keys(SDL_GetMouseState(NULL, NULL) & ~g_overlay_buttons), lp);
             break;
         }
         case SDL_EVENT_MOUSE_WHEEL:
@@ -1349,8 +1406,16 @@ static void sh_AttachThreadInput(Guest* g) { RET(1, 3); }
 
 static void sh_SetCursorPos(Guest* g)
 {
+    float x = (float)(int32_t)ARG(0), y = (float)(int32_t)ARG(1);
+    Wnd* w = wnd(g_focus);
+    if (w && x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h)
+    {
+        int cx = (int)x - w->x, cy = (int)y - w->y;
+        ui_squeeze_point(w, &cx, &cy);
+        x = (float)(w->x + cx), y = (float)(w->y + cy);
+    }
     if (g_sdl_up)
-        SDL_WarpMouseGlobal((float)(int32_t)ARG(0), (float)(int32_t)ARG(1));
+        SDL_WarpMouseGlobal(x, y);
     RET(1, 2);
 }
 
