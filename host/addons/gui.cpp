@@ -416,6 +416,53 @@ static std::string font_file(const std::string& family, int bold, int italic)
     return std::string();
 }
 
+/* A Windows font file by name (consola.ttf, tahomabd.ttf: what addons open from C:\Windows\Fonts\):
+ * the real file if the player put it in <data dir>/fonts/, else the family's own file on this
+ * system, else a stand-in (font_file's: Consolas -> Menlo, Segoe UI -> Helvetica, ...). */
+extern "C" int xi_gui_windows_font(const char* file, char* out, size_t n)
+{
+    static const struct
+    {
+        const char* file;
+        const char* family;
+        int bold, italic;
+    } FILES[] = {
+        { "arial.ttf", "Arial", 0, 0 }, { "arialbd.ttf", "Arial", 1, 0 }, { "ariali.ttf", "Arial", 0, 1 },
+        { "arialbi.ttf", "Arial", 1, 1 }, { "calibri.ttf", "Calibri", 0, 0 }, { "calibrib.ttf", "Calibri", 1, 0 },
+        { "consola.ttf", "Consolas", 0, 0 }, { "consolab.ttf", "Consolas", 1, 0 }, { "consolai.ttf", "Consolas", 0, 1 },
+        { "consolaz.ttf", "Consolas", 1, 1 }, { "cour.ttf", "Courier New", 0, 0 }, { "courbd.ttf", "Courier New", 1, 0 },
+        { "georgia.ttf", "Georgia", 0, 0 }, { "georgiab.ttf", "Georgia", 1, 0 }, { "lucon.ttf", "Lucida Console", 0, 0 },
+        { "micross.ttf", "Microsoft Sans Serif", 0, 0 }, { "segoeui.ttf", "Segoe UI", 0, 0 },
+        { "segoeuib.ttf", "Segoe UI", 1, 0 }, { "tahoma.ttf", "Tahoma", 0, 0 }, { "tahomabd.ttf", "Tahoma", 1, 0 },
+        { "times.ttf", "Times New Roman", 0, 0 }, { "timesbd.ttf", "Times New Roman", 1, 0 },
+        { "trebuc.ttf", "Trebuchet MS", 0, 0 }, { "trebucbd.ttf", "Trebuchet MS", 1, 0 }, { "verdana.ttf", "Verdana", 0, 0 },
+        { "verdanab.ttf", "Verdana", 1, 0 }, { "msgothic.ttc", "MS Gothic", 0, 0 }, { "meiryo.ttc", "Meiryo", 0, 0 },
+        { "impact.ttf", "Impact", 0, 0 }, { "comic.ttf", "Comic Sans MS", 0, 0 },
+    };
+    std::string low = file;
+    for (char& c : low)
+        c = (char)tolower((unsigned char)c);
+    /* the real one, if the player has it */
+    std::string mine = std::string(xi_data_dir()) + "fonts/" + low;
+    if (file_exists(mine.c_str()))
+        return snprintf(out, n, "%s", mine.c_str()), 1;
+    std::string family = low.substr(0, low.find_last_of('.'));
+    int bold = 0, italic = 0;
+    for (auto& f : FILES)
+        if (low == f.file)
+            family = f.family, bold = f.bold, italic = f.italic;
+    std::string path = font_file(family, bold, italic);
+    if (path.empty())
+        path = font_file("Arial", bold, italic);
+    if (path.empty())
+        return 0;
+    char key[200];
+    snprintf(key, sizeof key, "winfont %s", low.c_str());
+    xi_log_once(key, "Windows font %s: %s", file, path.c_str());
+    snprintf(out, n, "%s", path.c_str());
+    return 1;
+}
+
 static ImFont* font_for(const std::string& family, int bold, int italic)
 {
     std::string key = family + (bold ? "|b" : "|") + (italic ? "i" : "");

@@ -241,6 +241,16 @@ char* xi_host_path(const char* in, char* out, size_t n)
 {
     if (!n)
         return out;
+    {
+        /* C:\Windows\Fonts\<file>: a font of this system's that stands in (gui.cpp) */
+        extern int xi_gui_windows_font(const char* file, char* out, size_t n);
+        const char* p = in;
+        for (; *p; ++p)
+            if (!strncasecmp(p, "windows\\fonts\\", 14) || !strncasecmp(p, "windows/fonts/", 14))
+                break;
+        if (*p && xi_gui_windows_font(p + 14, out, n))
+            return out;
+    }
     size_t o = 0;
     const char* p = in;
     /* a drive letter an addon put in front of our own paths (they are never Windows paths) */
@@ -946,6 +956,7 @@ void addons_frame(void)
     g_started = 1;
     xi_patch_watch();
     xi_cmd_frame();
+    xi_manage_frame();
     xi_hooks_frame();
     for (unsigned i = 0; i < g_naddons; ++i)
     {

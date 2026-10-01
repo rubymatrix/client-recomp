@@ -14,6 +14,7 @@
  * nil does); Lua callbacks (InputText, size constraints) run under lua_pcall and their errors are
  * printed, so no longjmp ever crosses ImGui's frames. */
 #include "gui_lua.h"
+#include "xi.h" // xi_host_path
 
 extern "C" {
 #include "lauxlib.h"
@@ -875,6 +876,8 @@ int hand_AddFontFromFileTTF(lua_State* L)
     const char* path = opt_str(L, 1, nullptr, &n);
     if (!a || !path)
         return push_font(L, nullptr);
+    char host[1200]; // Windows-shaped paths, C:\Windows\Fonts\ included (a stand-in font)
+    path = xi_host_path(path, host, sizeof host);
     FILE* fp = fopen(path, "rb"); // ImGui asserts on a missing file; answer nil instead
     if (!fp)
         return push_font(L, nullptr);
