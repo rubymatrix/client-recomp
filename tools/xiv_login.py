@@ -22,7 +22,14 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
-import xiv_args  # noqa: E402
+try:
+    import xiv_args  # noqa: E402
+except ImportError:
+    # pycryptodome (Blowfish) lives in the project's .venv: run there instead
+    venv = os.path.join(ROOT, '.venv', 'bin', 'python')
+    if os.path.exists(venv) and os.path.realpath(sys.executable) != os.path.realpath(venv):
+        os.execv(venv, [venv] + sys.argv)
+    raise SystemExit('pycryptodome is missing: uv pip install --python .venv/bin/python pycryptodome')
 
 DEFAULT_GAME = os.path.expanduser(
     '~/Projects/FFXIV1_0/installer/target/prefix/drive_c/Program Files (x86)/SquareEnix/FINAL FANTASY XIV')
