@@ -1,0 +1,29 @@
+# Never commit anything derived from Square Enix binaries (README, "Rules").
+generated/
+build/
+out/
+*.dll
+*.exe
+*.dat
+*.DAT
+*.unpacked.*
+
+# Tooling noise
+__pycache__/
+*.pyc
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+.vs/
+
+# Jython compiles the discovery scripts next to themselves
+*$py.class
+.DS_Store
+
+# Python environment
+.venv/
+
+# Captured game audio (Square Enix content)
+*.wav
