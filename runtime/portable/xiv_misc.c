@@ -24,6 +24,7 @@
 #include "k32.h"
 #include "plat.h"
 #include "thunk.h"
+#include "user32.h"
 #include "vfs.h"
 
 #define S_OK 0u
@@ -253,9 +254,10 @@ static void sh_SafeArrayPutElement(Guest* g) { RET(E_FAIL, 3); }
 
 /* --- comctl32 (by ordinal): window subclassing -------------------------------------------------- */
 
-static void sh_SetWindowSubclass(Guest* g) { RET(1, 4); }
-static void sh_RemoveWindowSubclass(Guest* g) { RET(1, 3); }
-static void sh_DefSubclassProc(Guest* g) { RET(0, 4); }
+/* the game's input layer hooks its window this way: its mouse and keyboard handlers are subclasses */
+static void sh_SetWindowSubclass(Guest* g) { RET(user32_set_subclass(ARG(0), ARG(1), ARG(2), ARG(3)), 4); }
+static void sh_RemoveWindowSubclass(Guest* g) { RET(user32_remove_subclass(ARG(0), ARG(1), ARG(2)), 3); }
+static void sh_DefSubclassProc(Guest* g) { RET(user32_def_subclass(ARG(0), ARG(1), ARG(2), ARG(3)), 4); }
 
 /* --- iphlpapi, winhttp ------------------------------------------------------------------------- */
 

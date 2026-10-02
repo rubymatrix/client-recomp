@@ -11,6 +11,10 @@
  *   C:\Program Files\SquareEnix\FINAL FANTASY XIV.
  */
 #include <stdio.h>
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -27,6 +31,9 @@
 #define GAME_DIR_GUEST "C:\\Program Files\\SquareEnix\\FINAL FANTASY XIV"
 
 void xiv_misc_init(void);
+void xiv_ui_init(void);
+void sampler_start(void);
+void user32_main_tick(void);
 void xiv_set_documents(const char* host_dir);
 void user32_init(void);
 void d3d9_init(void);
@@ -82,6 +89,14 @@ int main(int argc, char** argv)
         plat_mkdir(docs);
         xiv_set_documents(docs);
     }
+    /* XIV_SERIAL=1: guest threads take turns under one lock instead of running in parallel */
+    if (getenv("XIV_SERIAL") && strcmp(getenv("XIV_SERIAL"), "0"))
+        gt_parallel = 0;
+    if (getenv("XIV_FLAGCUT"))
+    {
+        extern uint32_t rt_flag_lo, rt_flag_hi;
+        sscanf(getenv("XIV_FLAGCUT"), "%x:%x", &rt_flag_lo, &rt_flag_hi);
+    }
     gt_init();
     k32_set_image_name("ffxivgame.exe");
     k32_init(GAME_DIR_GUEST, GAME_DIR_GUEST "\\ffxivgame.exe");
@@ -90,11 +105,13 @@ int main(int argc, char** argv)
     {
         k32_set_command_line(getenv("XIV_ARGS"));
         k32_set_tick_base(getenv("XIV_TICK") ? (uint32_t)strtoul(getenv("XIV_TICK"), NULL, 0) : 0x10000u);
+
     }
     k32_io_init();
     k32_misc_init();
     k32_xiv_init();
     xiv_misc_init();
+    xiv_ui_init();
     ole_init();
     user32_init();
     d3d9_init();
@@ -128,6 +145,23 @@ int main(int argc, char** argv)
         }
         memcpy(GUEST_PTR(0x00F90110u), lobby, n + 1);
         printf("lobby server: %s\n", lobby);
+    }
+
+    /* The frame rate target, 60 (XIV_FPSCAP=<fps>; 0 uncaps): the render loop's limiter
+     * (frame_rate_target in the apply overlay) and the logic loop (worker_tick_period, which also
+     * advances the interface's animations) both run at it. */
+    {
+        const char* cap = getenv("XIV_FPSCAP");
+        int fps = cap ? atoi(cap) : 60;
+        wr32(0x137DF00, fps > 0 ? (uint32_t)fps : 100000u); /* uncapped: a 10 us period, no Sleep */
+        /* a frame that ran over its period: the limiter's Sleep(1) becomes a yield */
+        k32_skip_sleep_at(0x4E8F72);
+        const char* hz = getenv("XIV_TICKHZ");
+        int tick = hz && atoi(hz) > 0 ? atoi(hz) : (fps > 0 ? fps : 120);
+        wr32(0x137DF04, 1000000u / (uint32_t)(tick > 1000 ? 1000 : tick));
+        /* and its sleeps paced exactly: the interface's animations advance on this loop */
+        k32_pace_sleep_at(0xCC6D4C, 1000000000ull / (uint32_t)(tick > 1000 ? 1000 : tick));
+        k32_pace_sleep_at(0xCC6D62, 1000000000ull / (uint32_t)(tick > 1000 ? 1000 : tick));
     }
 
     /* The PEB: what MSVC 2005's CRT and the game may read through fs:[0x30]. */
@@ -167,10 +201,15 @@ int main(int argc, char** argv)
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD))
         printf("SDL_Init: %s\n", SDL_GetError());
     static volatile int done;
+    sampler_start();
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0); /* the main thread: SDL, the window */
+#endif
     plat_thread_start(game_thread, (void*)&done);
     while (!done)
     {
         SDL_PumpEvents();
+        user32_main_tick();
         SDL_Delay(1);
     }
     return 0;

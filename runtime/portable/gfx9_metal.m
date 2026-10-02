@@ -14,6 +14,7 @@
  * variant: the vertex layout's integer attributes, the outputs the pixel shader reads, alpha test,
  * depth samplers), the vertex layout, the target formats and the blend states.
  */
+#import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include <SDL3/SDL.h>
@@ -23,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "gfx9.h"
 #include "sm_msl.h"
@@ -181,6 +183,7 @@ static uint32_t g_ring_used, g_frame;
 static id<MTLBuffer> g_default_attr; /* (0, 0, 0, 1): what an attribute no stream supplies reads */
 static id<MTLLibrary> g_util;
 static id<MTLRenderPipelineState> g_present_pipe;
+static id<MTLRenderPipelineState> g_text_pipe; /* the FPS counter (XIV_FPS=0 hides it) */
 static id<MTLSamplerState> g_linear, g_point;
 
 /* the targets */
@@ -341,7 +344,57 @@ static const char UTIL_MSL[] =
     "  return t.sample(s, i.uv); }\n"
     "struct CO { float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; float4 c2 [[color(2)]]; float4 c3 [[color(3)]]; float d [[depth(any)]]; };\n"
     "fragment CO util_clear(V i [[stage_in]], constant float4& col [[buffer(0)]], constant float4& z [[buffer(1)]]) {\n"
-    "  CO o; o.c0 = o.c1 = o.c2 = o.c3 = col; o.d = z.x; return o; }\n";
+    "  CO o; o.c0 = o.c1 = o.c2 = o.c3 = col; o.d = z.x; return o; }\n"
+    /* the FPS counter: 3x5 glyphs (0-9 . F P S M space), rows of 3 bits from the top, on a dark box.
+     * info: the box's top left in drawable pixels, pixels per font pixel, characters */
+    "constant ushort glyphs[16] = { 0x7B6F, 0x2C97, 0x73E7, 0x73CF, 0x5BC9, 0x79CF, 0x79EF, 0x7249,\n"
+    "  0x7BEF, 0x7BCF, 0x0002, 0x79A4, 0x7BE4, 0x79CF, 0x5F6D, 0x0000 };\n"
+    "fragment float4 util_text(V i [[stage_in]], constant uint* t [[buffer(0)]], constant float4& info [[buffer(1)]]) {\n"
+    "  float2 p = (i.p.xy - info.xy) / info.z - 1.0;\n"
+    "  int cx = int(floor(p.x)), cy = int(floor(p.y)), ci = cx / 4, gx = cx % 4;\n"
+    "  float4 bg = float4(0.0, 0.0, 0.0, 0.55);\n"
+    "  if (p.x < 0.0 || p.y < 0.0 || cy >= 5 || ci >= int(info.w) || gx == 3) return bg;\n"
+    "  uint bit = (uint(glyphs[t[ci]]) >> (14 - (cy * 3 + gx))) & 1u;\n"
+    "  return bit ? float4(1.0, 0.95, 0.4, 1.0) : bg; }\n";
+
+/* Full screen over the whole display: while the game is the active app the menu bar and the Dock are
+ * hidden (macOS brings them back when another app is active), and the window covers the screen's
+ * frame. SDL's full screen leaves the window under the menu bar's strip on displays that keep the
+ * menu bar in full screen (3440x1410 of 3440x1440). */
+typedef struct CoverArgs
+{
+    SDL_Window* w;
+    int on;
+} CoverArgs;
+
+static void cover_main(void* p)
+{
+    CoverArgs* a = (CoverArgs*)p;
+    NSWindow* nw = (__bridge NSWindow*)SDL_GetPointerProperty(SDL_GetWindowProperties(a->w),
+        SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, NULL);
+    if (!nw)
+        return;
+    if (a->on)
+    {
+        [NSApp setPresentationOptions:NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar];
+        [nw setFrame:nw.screen.frame display:YES];
+        rt_log("[gfx9] full screen over %.0fx%.0f\n", nw.screen.frame.size.width, nw.screen.frame.size.height);
+    }
+    else
+        [NSApp setPresentationOptions:NSApplicationPresentationDefault];
+}
+
+static void cover_screen(SDL_Window* w, int on)
+{
+    CoverArgs a = { w, on };
+    sdl_main_run(cover_main, &a);
+}
+
+__attribute__((constructor)) static void cover_register(void)
+{
+    extern void (*user32_cover_screen)(SDL_Window * w, int on);
+    user32_cover_screen = cover_screen; /* before the device: the game goes full screen first */
+}
 
 int g9_init(void* sdl_window, int vsync)
 {
@@ -382,6 +435,15 @@ int g9_init(void* sdl_window, int vsync)
         pd.fragmentFunction = [[g_util newFunctionWithName:@"util_copy"] autorelease];
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         g_present_pipe = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        const char* fps = getenv("XIV_FPS");
+        if (!fps || strcmp(fps, "0"))
+        {
+            pd.fragmentFunction = [[g_util newFunctionWithName:@"util_text"] autorelease];
+            pd.colorAttachments[0].blendingEnabled = YES;
+            pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+            pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            g_text_pipe = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        }
         rt_log("[gfx9] Metal on %s\n", g_dev.name.UTF8String);
         return g_present_pipe != nil;
     }
@@ -389,8 +451,25 @@ int g9_init(void* sdl_window, int vsync)
 
 void g9_resize(uint32_t w, uint32_t h)
 {
-    if (g_layer && w && h)
+    (void)w, (void)h; /* the drawable follows the view (fit_drawable); present scales the back buffer into it */
+}
+
+/* The drawable at the view's own size in pixels: the window's content area is what the screen
+ * shows, and the back buffer (the game's resolution) is scaled into it with its aspect kept. A
+ * drawable of another size would be stretched or offset into the view by Core Animation. */
+static void fit_drawable(G9Tex* bb)
+{
+    CGSize b = g_layer.bounds.size;
+    CGFloat scale = g_layer.contentsScale > 0 ? g_layer.contentsScale : 1;
+    CGFloat w = floor(b.width * scale), h = floor(b.height * scale);
+    if (w < 1 || h < 1)
+        return;
+    if (g_layer.drawableSize.width != w || g_layer.drawableSize.height != h)
+    {
         g_layer.drawableSize = CGSizeMake(w, h);
+        rt_log("[gfx9] view %.0fx%.0f points x%.2f: drawable %.0fx%.0f, back buffer %ux%u\n", b.width, b.height, scale, w, h,
+            bb ? bb->w : 0, bb ? bb->h : 0);
+    }
 }
 
 /* --- textures --------------------------------------------------------------------------------- */
@@ -930,11 +1009,14 @@ void g9_clear(uint32_t nrects, const int32_t* rects, uint32_t flags, uint32_t co
 
 /* --- StretchRect and ColorFill ------------------------------------------------------------------- */
 
+static void fx_note_stretch(G9Tex* src, G9Tex* dst); /* gfx9_fx.h */
+
 void g9_stretch(G9Tex* src, uint32_t sface, uint32_t slevel, const int32_t sr[4], G9Tex* dst, uint32_t dface,
     uint32_t dlevel, const int32_t dr[4], int linear)
 {
     if (!src || !dst)
         return;
+    fx_note_stretch(src, dst);
     uint32_t sw, sh, sd, dw, dh, dd;
     level_dims(src, slevel, &sw, &sh, &sd);
     level_dims(dst, dlevel, &dw, &dh, &dd);
@@ -1257,10 +1339,186 @@ static void draw_prim(MTLPrimitiveType* mp, uint32_t prim, uint32_t count, uint3
 
 static uint32_t g_draw_errors;
 
+#include "gfx9_fx.h"
+
+/* --- one-frame draw trace (XIV_GFXTRACE=<dir>; touch <dir>/req to trace the next frame) ---------
+ * <dir>/draws.txt: a line per draw (shaders, targets, blend, samplers); <dir>/consts.bin: per draw
+ * the vertex then pixel float constants; <dir>/<vs|ps>_<hash>_<variant>.metal: the translations. */
+static FILE* g_trace;
+static const char* g_trace_dir;
+static uint32_t g_trace_draw;
+static G9Tex* g_trace_cubes[32];
+static uint32_t g_trace_ncubes;
+
+static void trace_cube(G9Tex* t)
+{
+    if (!t || t->type != G9_TEX_CUBE || t->fmt != F_A8R8G8B8)
+        return;
+    for (uint32_t i = 0; i < g_trace_ncubes; ++i)
+        if (g_trace_cubes[i] == t)
+            return;
+    if (g_trace_ncubes < 32)
+        g_trace_cubes[g_trace_ncubes++] = t;
+}
+
+/* the traced frame's A8R8G8B8 cube maps: each face and level's mean colour (cubes.txt) */
+static void trace_dump_cubes(void)
+{
+    char p[1024];
+    snprintf(p, sizeof p, "%s/cubes.txt", g_trace_dir);
+    FILE* f = fopen(p, "w");
+    if (!f)
+        return;
+    for (uint32_t i = 0; i < g_trace_ncubes; ++i)
+    {
+        G9Tex* t = g_trace_cubes[i];
+        for (uint32_t l = 0; l < t->levels; ++l)
+        {
+            uint32_t w, h, d;
+            level_dims(t, l, &w, &h, &d);
+            uint8_t* px = (uint8_t*)malloc((size_t)w * h * 4);
+            fprintf(f, "%p L%u %ux%u:", (void*)t, l, w, h);
+            for (uint32_t face = 0; face < 6; ++face)
+            {
+                memset(px, 0, (size_t)w * h * 4);
+                g9_tex_read(t, face, l, px, w * 4);
+                double m[4] = { 0, 0, 0, 0 };
+                for (uint32_t k = 0; k < w * h; ++k)
+                    for (int c = 0; c < 4; ++c)
+                        m[c] += px[4 * k + c];
+                /* BGRA in memory: print R G B A */
+                fprintf(f, "  f%u %3.0f %3.0f %3.0f %3.0f", face, m[2] / (w * h), m[1] / (w * h), m[0] / (w * h),
+                    m[3] / (w * h));
+                if (l == 0)
+                {
+                    char q[1024];
+                    snprintf(q, sizeof q, "%s/cube_%p_f%u.ppm", g_trace_dir, (void*)t, face);
+                    FILE* pf = fopen(q, "wb");
+                    if (pf)
+                    {
+                        fprintf(pf, "P6 %u %u 255\n", w, h);
+                        for (uint32_t k = 0; k < w * h; ++k)
+                        {
+                            uint8_t rgb[3] = { px[4 * k + 2], px[4 * k + 1], px[4 * k] };
+                            fwrite(rgb, 1, 3, pf);
+                        }
+                        fclose(pf);
+                    }
+                }
+            }
+            fprintf(f, "\n");
+            free(px);
+        }
+    }
+    fclose(f);
+    g_trace_ncubes = 0;
+}
+
+static void trace_frame_end(void)
+{
+    if (g_trace)
+    {
+        fprintf(g_trace, "present %p\n", (void*)g_xfx.bb);
+        fclose(g_trace);
+        g_trace = NULL;
+        trace_dump_cubes();
+        rt_log("[gfx9] trace: %u draws in %s\n", g_trace_draw, g_trace_dir);
+    }
+    if (!g_trace_dir && !(g_trace_dir = getenv("XIV_GFXTRACE")))
+        g_trace_dir = "";
+    if (!*g_trace_dir)
+        return;
+    char p[1024];
+    snprintf(p, sizeof p, "%s/req", g_trace_dir);
+    if (remove(p) != 0)
+        return;
+    snprintf(p, sizeof p, "%s/draws.txt", g_trace_dir);
+    g_trace = fopen(p, "w");
+    snprintf(p, sizeof p, "%s/consts.bin", g_trace_dir);
+    FILE* cb = fopen(p, "wb");
+    if (cb)
+        fclose(cb);
+    g_trace_draw = 0;
+}
+
+static void trace_msl(G9Shader* s, const SmOpts* o)
+{
+    char p[1024];
+    snprintf(p, sizeof p, "%s/%s_%08x_%016llx.metal", g_trace_dir, s->info.pixel ? "ps" : "vs", s->info.hash,
+        (unsigned long long)fnv64(o, sizeof *o));
+    FILE* f = fopen(p, "r");
+    if (f)
+    {
+        fclose(f);
+        return;
+    }
+    static char src[1 << 20];
+    SmInfo info;
+    size_t n = sm_translate(s->tokens, s->ntokens, o, &info, src, sizeof src, NULL, 0);
+    if ((f = fopen(p, "w")))
+    {
+        fwrite(src, 1, n, f);
+        fclose(f);
+    }
+}
+
+static void trace_draw(const G9Draw* d, const SmOpts* vo, const SmOpts* po, const PipeKey* k)
+{
+    const SmInfo *vi = &d->vs->info, *pi = &d->ps->info;
+    fprintf(g_trace, "#%u vs %08x ps %08x prim %u n %u inst %u rt %d/%d/%d/%d ds %d srgbw %d blend %d %d %d %d "
+        "z %d/%d/%d cull %d atest %d/%u mask %x vp %ux%u",
+        g_trace_draw, vi->hash, pi->hash, d->prim, d->count, d->instances, (int)k->color[0], (int)k->color[1],
+        (int)k->color[2], (int)k->color[3], (int)k->depth, d->rs.srgb_write, d->rs.blend, d->rs.src, d->rs.dst,
+        d->rs.op, d->rs.zenable, d->rs.zwrite, d->rs.zfunc, d->rs.cull, d->rs.alpha_func, d->rs.alpha_ref,
+        d->rs.write_mask[0], d->vp.w, d->vp.h);
+    if (g_rt[0])
+        fprintf(g_trace, " rt0 %p %ux%u fmt %u face %u level %u", (void*)g_rt[0], g_rt[0]->w, g_rt[0]->h, g_rt[0]->fmt,
+            g_rt_face[0], g_rt_level[0]);
+    trace_cube(g_rt[0]);
+    for (uint32_t s = 0; s < G9_PS_SAMPLERS; ++s)
+    {
+        if (!pi->sampler[s])
+            continue;
+        const G9Tex* t = d->tex[s];
+        const G9Sampler* sm = &d->samp[s];
+        fprintf(g_trace, " | s%u type %u", s, pi->sampler[s]);
+        trace_cube((G9Tex*)t);
+        if (t)
+            fprintf(g_trace, " tex %p fmt %u %ux%u L%u srgb %u addr %u%u%u flt %u%u%u%s%s", (void*)t, t->fmt, t->w,
+                t->h, t->levels, sm->srgb, sm->addr_u, sm->addr_v, sm->addr_w, sm->min, sm->mag, sm->mip,
+                (po->shadow_mask >> s) & 1 ? " SHADOW" : "", (po->depth_mask >> s) & 1 ? " DEPTH" : "");
+        else
+            fprintf(g_trace, " (none)");
+    }
+    fprintf(g_trace, " | el");
+    for (uint32_t j = 0; j < d->nel; ++j)
+        fprintf(g_trace, " %u.%u:t%u@%u/%u", d->el[j].usage, d->el[j].index, d->el[j].type, d->el[j].stream,
+            d->el[j].offset);
+    fprintf(g_trace, "\n");
+    char p[1024];
+    snprintf(p, sizeof p, "%s/consts.bin", g_trace_dir);
+    FILE* cb = fopen(p, "ab");
+    if (cb)
+    {
+        fwrite(d->vsc, 16, G9_VS_FLOATS, cb);
+        fwrite(d->psc, 16, G9_PS_FLOATS, cb);
+        fwrite(d->vsi, 16, 16, cb);
+        fwrite(d->psi, 16, 16, cb);
+        fwrite(d->vsb, 4, 16, cb);
+        fwrite(d->psb, 4, 16, cb);
+        fclose(cb);
+    }
+    trace_msl(d->vs, vo);
+    trace_msl(d->ps, po);
+    g_trace_draw++;
+}
+
 void g9_draw(const G9Draw* d)
 {
     if (!d->vs || !d->ps || !d->count)
         return;
+    fx_hook(d);
+    fx_note_draw(d);
     if (!begin_pass())
         return;
     @autoreleasepool
@@ -1458,7 +1716,9 @@ void g9_draw(const G9Draw* d)
         [enc setFragmentBytes:d->psc length:G9_PS_FLOATS * 16 atIndex:SM_BUF_FLOAT];
         [enc setFragmentBytes:d->psi length:16 * 16 atIndex:SM_BUF_INT];
         [enc setFragmentBytes:d->psb length:16 * 4 atIndex:SM_BUF_BOOL];
-        SmAux aux = { { -1.0f / (d->vp.w ? d->vp.w : 1), 1.0f / (d->vp.h ? d->vp.h : 1), 0, 0 },
+        /* D3D9's pixel centres are on integer coordinates, Metal's on half-integers: geometry moves half a
+         * pixel right and down (+1/w, -1/h in clip space; as wined3d and DXVK do) */
+        SmAux aux = { { 1.0f / (d->vp.w ? d->vp.w : 1), -1.0f / (d->vp.h ? d->vp.h : 1), 0, 0 },
                       { (d->rs.alpha_ref & 255) / 255.0f, 0, 0, 0 } };
         [enc setVertexBytes:&aux length:sizeof aux atIndex:SM_BUF_AUX];
         [enc setFragmentBytes:&aux length:sizeof aux atIndex:SM_BUF_AUX];
@@ -1477,7 +1737,8 @@ void g9_draw(const G9Draw* d)
                 mt = t->srgb;
             }
             [enc setFragmentTexture:mt atIndex:s];
-            [enc setFragmentSamplerState:sampler(&d->samp[s], (po.shadow_mask >> s) & 1) atIndex:s];
+            G9Sampler aniso;
+            [enc setFragmentSamplerState:sampler(fx_sampler(d, s, &aniso), (po.shadow_mask >> s) & 1) atIndex:s];
         }
         for (uint32_t s = 0; s < G9_VS_SAMPLERS; ++s)
         {
@@ -1514,6 +1775,9 @@ void g9_draw(const G9Draw* d)
             else
                 return;
         }
+
+        if (g_trace)
+            trace_draw(d, &vo, &po, &k);
 
         /* --- the draw --- */
         MTLPrimitiveType mp;
@@ -1575,6 +1839,32 @@ void g9_draw(const G9Draw* d)
 
 /* --- present ------------------------------------------------------------------------------------ */
 
+/* "60.0 FPS 16.7 MS" as glyph indices, remade every half second; returns the character count */
+static int fps_text(uint32_t* out)
+{
+    static uint64_t since;
+    static uint32_t frames;
+    static char text[32] = "";
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    if (!since)
+        since = now;
+    frames++;
+    if (now - since >= 500000000ull)
+    {
+        double sec = (now - since) / 1e9;
+        snprintf(text, sizeof text, "%.1f FPS %.1f MS", frames / sec, 1000.0 * sec / frames);
+        since = now;
+        frames = 0;
+    }
+    int n = 0;
+    for (const char* c = text; *c && n < 24; ++c)
+        out[n++] = *c >= '0' && *c <= '9' ? (uint32_t)(*c - '0') : *c == '.' ? 10 : *c == 'F' ? 11
+                   : *c == 'P' ? 12 : *c == 'S' ? 13 : *c == 'M' ? 14 : 15;
+    return n;
+}
+
 void g9_present(G9Tex* bb)
 {
     @autoreleasepool
@@ -1582,6 +1872,7 @@ void g9_present(G9Tex* bb)
         if (g_pending_clear)
             begin_pass();
         end_pass();
+        fit_drawable(bb);
         id<CAMetalDrawable> drawable = [g_layer nextDrawable];
         if (drawable && bb)
         {
@@ -1601,10 +1892,29 @@ void g9_present(G9Tex* bb)
             [e setFragmentTexture:bb->tex atIndex:0];
             [e setFragmentSamplerState:g_linear atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+            uint32_t chars[24];
+            int n = fps_text(chars);
+            if (g_text_pipe && n)
+            {
+                /* top left of the picture, a little in */
+                float px = fmaxf(2.0f, roundf(dh / 360.0f));
+                float x0 = (1.0f - w) * 0.5f * dw + 4 * px, y0 = (1.0f - h) * 0.5f * dh + 4 * px;
+                float bw = (n * 4 + 1) * px, bh = 7 * px;
+                float r[4] = { x0 / dw * 2 - 1, 1 - y0 / dh * 2, (x0 + bw) / dw * 2 - 1, 1 - (y0 + bh) / dh * 2 };
+                float info[4] = { x0, y0, px, (float)n };
+                [e setRenderPipelineState:g_text_pipe];
+                [e setVertexBytes:r length:16 atIndex:0];
+                [e setVertexBytes:uv length:16 atIndex:1];
+                [e setFragmentBytes:chars length:sizeof chars atIndex:0];
+                [e setFragmentBytes:info length:16 atIndex:1];
+                [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+            }
             [e endEncoding];
             [cmd() presentDrawable:drawable];
         }
         g9_flush_frame(0);
+        trace_frame_end();
+        fx_frame_end(bb);
     }
 }
 

@@ -38,3 +38,9 @@ void k32_xiv_init(void);
  * (ffxivgame.exe's launch argument is keyed to it: tools/xiv_args.py). */
 void k32_set_command_line(const char* args);
 void k32_set_tick_base(uint32_t tick);
+/* XIV_CPUS when set, else 0 (each query its own default) */
+unsigned k32_cpus(void);
+/* Sleep calls returning to `ret` only yield (lifting a frame limiter) */
+void k32_skip_sleep_at(uint32_t ret);
+/* Sleep calls returning to `ret` sleep until one period after the last such call woke */
+void k32_pace_sleep_at(uint32_t ret, uint64_t period_ns);

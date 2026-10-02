@@ -53,6 +53,19 @@ static void sh_UnhandledExceptionFilter(Guest* g)
     RET(1, 1); /* EXCEPTION_EXECUTE_HANDLER */
 }
 
+/* XIV_CPUS: the processor count every query reports, when set (0 otherwise: GetSystemInfo says 2,
+ * the affinity masks and GetLogicalProcessorInformation 4, as the game ran best) */
+unsigned k32_cpus(void)
+{
+    static int n = -1;
+    if (n < 0)
+    {
+        const char* e = getenv("XIV_CPUS");
+        n = e && atoi(e) > 0 && atoi(e) <= 16 ? atoi(e) : 0;
+    }
+    return (unsigned)n;
+}
+
 /* GetSystemInfo: a 32-bit process on an x86 machine, as the game was built for */
 static void sh_GetSystemInfo(Guest* g)
 {
@@ -61,8 +74,9 @@ static void sh_GetSystemInfo(Guest* g)
     wr32(p + 4, 4096);         /* dwPageSize */
     wr32(p + 8, 0x00010000u);  /* lpMinimumApplicationAddress */
     wr32(p + 12, 0x7FFEFFFFu); /* lpMaximumApplicationAddress */
-    wr32(p + 16, 0x3);         /* dwActiveProcessorMask */
-    wr32(p + 20, 2);           /* dwNumberOfProcessors */
+    unsigned cpus = k32_cpus() ? k32_cpus() : 2;
+    wr32(p + 16, (1u << cpus) - 1u); /* dwActiveProcessorMask */
+    wr32(p + 20, cpus);        /* dwNumberOfProcessors */
     wr32(p + 24, 586);         /* dwProcessorType: PROCESSOR_INTEL_PENTIUM */
     wr32(p + 28, 0x10000);     /* dwAllocationGranularity */
     wr16(p + 32, 6);           /* wProcessorLevel */

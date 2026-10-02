@@ -15,5 +15,13 @@
   "null_member8_write": {
     "_why": "the store through the same NULL member after the getter: dropped",
     "0x00894B70": "90909090"
+  },
+  "frame_rate_target": {
+    "_why": "the render loop's frame limiter (0x4E8D40) reads its target from a host-set dword in the .tls page's slack (0x137DF00) instead of the configured rate: mov ebp, [esi+0x424] -> mov ebp, [0x137DF00]. The host writes 100000 (uncapped: a 10 us period, never sleeping) or XIV_FPSCAP",
+    "0x004E8D97": "8B2D00DF3701"
+  },
+  "worker_tick_period": {
+    "_why": "the 30 Hz loop limiter (0xCC6D00, called with push 0x1E from 0x4B3E39) takes its period in microseconds from a host-set dword (0x137DF04) instead of 1000000 / 30: xor edx,edx; mov eax,1000000; div [esp+0x18]; xor ebx,ebx; mov ecx,eax -> mov ecx,[0x137DF04]; xor ebx,ebx; xor edx,edx; nop x5. The host writes 1000000 / XIV_TICKHZ",
+    "0x00CC6D18": "8B0D04DF370133DB33D29090909090"
   }
 }

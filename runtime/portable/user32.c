@@ -73,6 +73,9 @@ typedef struct Wnd
     int fullscreen; /* a full-screen D3D device is on it */
     SDL_Window* sdl;
     uint32_t exstyle, userdata; /* GWL_EXSTYLE, GWL_USERDATA (SetWindowLongA) */
+    /* comctl32 subclasses (SetWindowSubclass), last added first to see a message */
+    struct { uint32_t proc, id, ref; } sub[8];
+    int nsub;
 } Wnd;
 static Wnd g_wnds[MAX_WINDOWS];
 static uint32_t g_focus;
@@ -217,10 +220,83 @@ static void sdl_up(void)
 static int show_window(Wnd* w, int show);
 
 /* the window procedure, called as the guest would: stdcall (hwnd, msg, wParam, lParam) */
+/* the subclass a DefSubclassProc on this thread passes on from: its window and place in the chain */
+static _Thread_local uint32_t t_sub_hwnd;
+static _Thread_local int t_sub_level;
+
+/* subclass i of w (and from it down the chain) sees a message: below 0 the window procedure itself */
+static uint32_t call_subclass(Wnd* w, int i, uint32_t msg, uint32_t wp, uint32_t lp)
+{
+    if (i >= w->nsub)
+        i = w->nsub - 1;
+    if (i < 0)
+    {
+        uint32_t a[4] = { w->hwnd, msg, wp, lp };
+        return guest_call(w->wndproc, 4, a);
+    }
+    uint32_t a[6] = { w->hwnd, msg, wp, lp, w->sub[i].id, w->sub[i].ref };
+    uint32_t sh = t_sub_hwnd;
+    int sl = t_sub_level;
+    t_sub_hwnd = w->hwnd;
+    t_sub_level = i;
+    uint32_t r = guest_call(w->sub[i].proc, 6, a);
+    t_sub_hwnd = sh;
+    t_sub_level = sl;
+    return r;
+}
+
+/* the window procedure, called as the guest would: stdcall (hwnd, msg, wParam, lParam), through
+ * its subclasses first */
 static uint32_t call_wndproc(Wnd* w, uint32_t msg, uint32_t wp, uint32_t lp)
 {
-    uint32_t a[4] = { w->hwnd, msg, wp, lp };
-    return guest_call(w->wndproc, 4, a);
+    return call_subclass(w, w->nsub - 1, msg, wp, lp);
+}
+
+int user32_set_subclass(uint32_t hwnd, uint32_t proc, uint32_t id, uint32_t ref)
+{
+    Wnd* w = wnd(hwnd);
+    if (!w || !proc)
+        return 0;
+    for (int i = 0; i < w->nsub; i++)
+        if (w->sub[i].proc == proc && w->sub[i].id == id)
+        {
+            w->sub[i].ref = ref;
+            return 1;
+        }
+    if (w->nsub == (int)(sizeof w->sub / sizeof w->sub[0]))
+        return 0;
+    w->sub[w->nsub].proc = proc;
+    w->sub[w->nsub].id = id;
+    w->sub[w->nsub].ref = ref;
+    w->nsub++;
+    return 1;
+}
+
+int user32_remove_subclass(uint32_t hwnd, uint32_t proc, uint32_t id)
+{
+    Wnd* w = wnd(hwnd);
+    if (!w)
+        return 0;
+    for (int i = 0; i < w->nsub; i++)
+        if (w->sub[i].proc == proc && w->sub[i].id == id)
+        {
+            memmove(&w->sub[i], &w->sub[i + 1], (size_t)(w->nsub - i - 1) * sizeof w->sub[0]);
+            w->nsub--;
+            if (t_sub_hwnd == hwnd && t_sub_level >= i && t_sub_level > 0)
+                t_sub_level--;
+            return 1;
+        }
+    return 0;
+}
+
+uint32_t user32_def_subclass(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp)
+{
+    Wnd* w = wnd(hwnd);
+    if (!w)
+        return 0;
+    /* outside any subclass of this window (a call from elsewhere) the window procedure answers */
+    int i = t_sub_hwnd == hwnd ? t_sub_level - 1 : -1;
+    return call_subclass(w, i, msg, wp, lp);
 }
 
 /* --- message queues -------------------------------------------------------------------------------- */
@@ -348,7 +424,12 @@ static uint32_t vk_of(SDL_Scancode sc)
     case SDL_SCANCODE_LSHIFT:
     case SDL_SCANCODE_RSHIFT: return 0x10;
     case SDL_SCANCODE_LCTRL:
-    case SDL_SCANCODE_RCTRL: return 0x11;
+    case SDL_SCANCODE_RCTRL:
+#ifdef __APPLE__
+    case SDL_SCANCODE_LGUI: /* Command is the Mac's Control: Cmd+C/V/X/A reach the game as Ctrl+ */
+    case SDL_SCANCODE_RGUI:
+#endif
+        return 0x11;
     case SDL_SCANCODE_LALT:
     case SDL_SCANCODE_RALT: return 0x12;
     case SDL_SCANCODE_CAPSLOCK: return 0x14;
@@ -469,8 +550,13 @@ static void pump(void)
     if (!g_sdl_up)
         return;
     SDL_Event e;
+    static int inputlog = -1;
+    if (inputlog < 0)
+        inputlog = getenv("XIV_INPUTLOG") != NULL;
     while (SDL_PollEvent(&e))
     {
+        if (inputlog)
+            rt_log("[input] SDL event %#x window %u\n", e.type, e.window.windowID);
         if (user32_event_hook && e.type != SDL_EVENT_KEY_UP && e.type != SDL_EVENT_MOUSE_BUTTON_UP &&
             e.type != SDL_EVENT_MOUSE_MOTION)
         {
@@ -526,6 +612,18 @@ static void pump(void)
             g_keys[vk] = down ? 0x80 : 0;
             uint32_t msg = vk == 0x12 || (g_keys[0x12] && vk != 0x12) ? (down ? WM_SYSKEYDOWN : WM_SYSKEYUP) : (down ? WM_KEYDOWN : WM_KEYUP);
             post(w->tid, w->hwnd, msg, vk, lp);
+            /* what TranslateMessage adds that SDL's text input never carries: the control
+             * characters (Backspace, Tab, Enter, Esc, Ctrl+letter), auto-repeat included */
+            if (down && msg == WM_KEYDOWN)
+            {
+                uint32_t c = vk == 0x08 ? (g_keys[0x11] ? 0x7Fu : 0x08u)
+                    : vk == 0x0D        ? (g_keys[0x11] ? 0x0Au : 0x0Du)
+                    : vk == 0x09 || vk == 0x1B ? vk
+                    : g_keys[0x11] && vk >= 'A' && vk <= 'Z' ? vk - 0x40u
+                                                              : 0;
+                if (c)
+                    post(w->tid, w->hwnd, WM_CHAR, c, lp);
+            }
             break;
         }
         case SDL_EVENT_TEXT_INPUT:
@@ -650,6 +748,10 @@ static void sh_UnregisterClassA(Guest* g)
     RET(1, 2);
 }
 
+/* Set by a back end that can cover the whole screen itself (gfx9_metal.m: the menu bar and the Dock
+ * hidden, the window over all of the display; SDL's own full screen leaves the menu bar's strip). */
+void (*user32_cover_screen)(SDL_Window* w, int on);
+
 /* No window frame here: the client area is the window. */
 static void sh_AdjustWindowRectEx(Guest* g) { RET(1, 4); }
 static void sh_AdjustWindowRect(Guest* g) { RET(1, 3); }
@@ -674,7 +776,11 @@ static void apply_frame(Wnd* w)
     int spaces = SDL_GetHintBoolean(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, false);
     SDL_SetWindowBordered(w->sdl, !popup || (full && spaces));
     SDL_SetWindowFullscreenMode(w->sdl, NULL);
-    SDL_SetWindowFullscreen(w->sdl, full);
+    bool ok = SDL_SetWindowFullscreen(w->sdl, full);
+    if (user32_cover_screen)
+        user32_cover_screen(w->sdl, full);
+    rt_log("[user32] window %dx%d style %08x: %s%s\n", w->w, w->h, w->style, full ? "full screen" : "windowed",
+        ok ? "" : " (SDL refused)");
 #endif
 }
 
@@ -919,10 +1025,28 @@ static void sh_ScreenToClient(Guest* g)
     RET(w != NULL, 2);
 }
 
+/* The cursor's desktop position, kept by the main thread (user32_main_tick): asking SDL from a
+ * guest thread is a round trip to the main thread with the guest lock held, and the game asks
+ * every frame on its logic thread. */
+static volatile float g_cursor_x, g_cursor_y;
+static volatile int g_cursor_known;
+
+void user32_main_tick(void)
+{
+    if (!g_sdl_up)
+        return;
+    float x = 0, y = 0;
+    SDL_GetGlobalMouseState(&x, &y); /* on the main thread: no marshalling */
+    g_cursor_x = x, g_cursor_y = y;
+    g_cursor_known = 1;
+}
+
 static void sh_GetCursorPos(Guest* g)
 {
     float x = 0, y = 0;
-    if (g_sdl_up)
+    if (g_cursor_known)
+        x = g_cursor_x, y = g_cursor_y;
+    else if (g_sdl_up)
         SDL_GetGlobalMouseState(&x, &y);
     Wnd* w = wnd(g_focus);
     if (w && x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h)
@@ -1080,12 +1204,16 @@ static void sh_GetMessageA(Guest* g)
     RET(m.message != WM_QUIT, 4);
 }
 
-static void sh_TranslateMessage(Guest* g) { RET(0, 1); } /* WM_CHAR comes from SDL's text input */
+/* WM_CHAR comes from SDL's text input, and the control characters from pump() */
+static void sh_TranslateMessage(Guest* g) { RET(0, 1); }
 
 static void sh_DispatchMessageA(Guest* g)
 {
     uint32_t p = ARG(0);
     Wnd* w = wnd(rd32(p));
+    if (getenv("XIV_INPUTLOG") && rd32(p + 4) >= 0x100 && rd32(p + 4) < 0x300 && rd32(p + 4) != 0x200)
+        rt_log("[input] dispatch hwnd %08x msg %#x wp %x lp %x (window %s, focus %08x)\n", rd32(p), rd32(p + 4), rd32(p + 8),
+            rd32(p + 12), w ? "known" : "unknown", g_focus);
     RET(w ? call_wndproc(w, rd32(p + 4), rd32(p + 8), rd32(p + 12)) : 0, 1);
 }
 
@@ -1421,24 +1549,35 @@ static void sh_SetCursorPos(Guest* g)
     RET(1, 2);
 }
 
-/* the clipboard: text only (CF_TEXT, code page 1252), into the host's clipboard as UTF-8 */
+/* the clipboard: text only (CF_TEXT, code page 1252, and CF_UNICODETEXT, UTF-16), the host's
+ * clipboard as UTF-8 */
 static void sh_OpenClipboard(Guest* g) { RET(1, 1); }
 static void sh_EmptyClipboard(Guest* g) { RET(1, 0); }
 static void sh_CloseClipboard(Guest* g) { RET(1, 0); }
 
 static void sh_SetClipboardData(Guest* g)
 {
-    if (ARG(0) == 1 && ARG(1)) /* CF_TEXT; the handle is GlobalAlloc's pointer */
+    if ((ARG(0) == 1 || ARG(0) == 13) && ARG(1)) /* CF_TEXT, CF_UNICODETEXT; the handle is GlobalAlloc's pointer */
     {
-        char utf8[4096];
+        char utf8[8192];
         size_t o = 0;
-        for (uint32_t p = ARG(1); rd8(p) && o + 3 < sizeof utf8; ++p)
+        int wide = ARG(0) == 13;
+        for (uint32_t p = ARG(1); o + 4 < sizeof utf8; p += wide ? 2 : 1)
         {
-            uint8_t c = rd8(p);
+            uint32_t c = wide ? rd16(p) : rd8(p);
+            if (!c)
+                break;
+            if (wide && c >= 0xD800 && c < 0xDC00 && (rd16(p + 2) & 0xFC00) == 0xDC00)
+                c = 0x10000 + ((c - 0xD800) << 10) + (rd16(p + 2) - 0xDC00), p += 2;
             if (c < 0x80)
                 utf8[o++] = (char)c;
-            else
+            else if (c < 0x800)
                 utf8[o++] = (char)(0xC0 | c >> 6), utf8[o++] = (char)(0x80 | (c & 0x3F));
+            else if (c < 0x10000)
+                utf8[o++] = (char)(0xE0 | c >> 12), utf8[o++] = (char)(0x80 | (c >> 6 & 0x3F)), utf8[o++] = (char)(0x80 | (c & 0x3F));
+            else
+                utf8[o++] = (char)(0xF0 | c >> 18), utf8[o++] = (char)(0x80 | (c >> 12 & 0x3F)),
+                utf8[o++] = (char)(0x80 | (c >> 6 & 0x3F)), utf8[o++] = (char)(0x80 | (c & 0x3F));
         }
         utf8[o] = 0;
         sdl_up();
@@ -1883,7 +2022,51 @@ static void sh_GetUserObjectInformationW(Guest* g) { gt_set_error(50); RET(0, 5)
 static void sh_GetDesktopWindow(Guest* g) { RET(0x00010010u, 0); }
 static void sh_GetActiveWindow(Guest* g) { RET(g_focus, 0); }
 static void sh_SetActiveWindow(Guest* g) { uint32_t old = g_focus; g_focus = ARG(0); RET(old, 1); }
-static void sh_GetClipboardData(Guest* g) { RET(0, 1); }
+/* GetClipboardData(format): the host's clipboard text in a block of the guest heap the clipboard
+ * owns (the next call frees it), as CF_UNICODETEXT or CF_TEXT */
+static void sh_GetClipboardData(Guest* g)
+{
+    static uint32_t block;
+    uint32_t fmt = ARG(0);
+    if (fmt != 1 && fmt != 13)
+        RET(0, 1);
+    sdl_up();
+    char* text = SDL_HasClipboardText() ? SDL_GetClipboardText() : NULL;
+    if (!text)
+        RET(0, 1);
+    size_t n = strlen(text);
+    if (block)
+        gheap_free(block);
+    block = gheap_alloc((uint32_t)(n + 1) * 2u + 2u, 0);
+    uint32_t o = block;
+    for (const unsigned char* p = (const unsigned char*)text; *p;)
+    {
+        uint32_t c = *p++;
+        if (c >= 0xC0)
+        {
+            unsigned k = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : 1;
+            c &= 0x3F >> k;
+            for (unsigned i = 0; i < k && (*p & 0xC0) == 0x80; ++i)
+                c = (c << 6) | (*p++ & 0x3F);
+        }
+        else if (c >= 0x80)
+            c = '?';
+        if (c == '\r' && *p == '\n')
+            continue; /* the host's line ends are the game's \n */
+        if (fmt == 1)
+            wr8(o++, (uint8_t)(c <= 0xFF ? c : '?'));
+        else if (c >= 0x10000)
+            wr16(o, (uint16_t)(0xD800 + ((c - 0x10000) >> 10))), wr16(o + 2, (uint16_t)(0xDC00 + (c & 0x3FF))), o += 4;
+        else
+            wr16(o, (uint16_t)c), o += 2;
+    }
+    if (fmt == 1)
+        wr8(o, 0);
+    else
+        wr16(o, 0);
+    SDL_free(text);
+    RET(block, 1);
+}
 static void sh_SetDlgItemTextW(Guest* g) { RET(1, 3); }
 static void sh_GetMenu(Guest* g) { RET(0, 1); }
 static void sh_CreateMenu(Guest* g) { RET(0x00090001u, 0); }
@@ -2116,6 +2299,31 @@ void user32_init(void)
 {
     thunk_register(USER32);
     thunk_register(USER32_XIV);
+}
+
+/* A key press and release to the focused window, as the keyboard would make them (tests: d3d9.c
+ * XIV_AUTOKEYS). */
+void user32_press_key(uint32_t vk)
+{
+    Wnd* w = wnd(g_focus);
+    if (!w)
+        for (int i = 0; i < MAX_WINDOWS && !w; ++i)
+            if (g_wnds[i].used)
+                w = &g_wnds[i];
+    if (!w)
+        return;
+    if (!vk)
+    {
+        /* 0: the window activated, as when the player clicks it */
+        g_focus = w->hwnd;
+        post(w->tid, w->hwnd, WM_ACTIVATEAPP, 1, 0);
+        post(w->tid, w->hwnd, WM_ACTIVATE, 1, 0);
+        post(w->tid, w->hwnd, WM_SETFOCUS, 0, 0);
+        return;
+    }
+    uint32_t scan = scan_of_vk(vk);
+    post(w->tid, w->hwnd, WM_KEYDOWN, vk, 1u | ((scan & 0xFFu) << 16));
+    post(w->tid, w->hwnd, WM_KEYUP, vk, 1u | ((scan & 0xFFu) << 16) | 0xC0000000u);
 }
 
 void* user32_sdl_window(uint32_t hwnd)

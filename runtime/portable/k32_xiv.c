@@ -312,8 +312,7 @@ static void sh_FlsFree(Guest* g) { forward(g, "TlsFree"); }
 
 static uint32_t cpu_mask(void)
 {
-    unsigned n = 4; /* GetSystemInfo (k32_misc.c) reports the same count */
-    return (1u << n) - 1u;
+    return (1u << (k32_cpus() ? k32_cpus() : 4)) - 1u;
 }
 static void sh_GetProcessAffinityMask(Guest* g)
 {
@@ -325,7 +324,7 @@ static void sh_SetProcessAffinityMask(Guest* g) { RET(1, 2); }
 static void sh_SetThreadAffinityMask(Guest* g) { RET(cpu_mask(), 2); } /* the previous mask */
 static void sh_SetThreadIdealProcessor(Guest* g) { RET(0, 2); }
 static void sh_OpenThread(Guest* g) { RET(0xFFFFFFFEu, 3); } /* the current-thread pseudo handle */
-static void sh_SwitchToThread(Guest* g) { gt_unlock(); plat_yield(); gt_lock(); RET(1, 0); }
+static void sh_SwitchToThread(Guest* g) { int held = gt_release(); plat_yield(); gt_reacquire(held); RET(1, 0); }
 static void sh_SleepEx(Guest* g)
 {
     uint32_t ms = ARG(0);
@@ -341,10 +340,10 @@ static void sh_IsDebuggerPresent(Guest* g) { RET(0, 0); }
 static void sh_GetNativeSystemInfo(Guest* g) { forward(g, "GetSystemInfo"); }
 
 /* GetLogicalProcessorInformation(SYSTEM_LOGICAL_PROCESSOR_INFORMATION*, DWORD* length): the same
- * four cores GetSystemInfo reports, one package. Entries are 24 bytes on a 32-bit process. */
+ * cores GetSystemInfo reports (k32_cpus), one package. Entries are 24 bytes on a 32-bit process. */
 static void sh_GetLogicalProcessorInformation(Guest* g)
 {
-    uint32_t buf = ARG(0), lenp = ARG(1), n = 5, need = 24 * n;
+    uint32_t cpus = k32_cpus() ? k32_cpus() : 4, buf = ARG(0), lenp = ARG(1), n = cpus + 1, need = 24 * n;
     if (!buf || rd32(lenp) < need)
     {
         wr32(lenp, need);
@@ -352,13 +351,13 @@ static void sh_GetLogicalProcessorInformation(Guest* g)
         RET(0, 2);
     }
     memset(GUEST_PTR(buf), 0, need);
-    for (uint32_t i = 0; i < 4; ++i)
+    for (uint32_t i = 0; i < cpus; ++i)
     {
         wr32(buf + 24 * i, 1u << i); /* ProcessorMask */
         wr32(buf + 24 * i + 4, 0);   /* RelationProcessorCore */
     }
-    wr32(buf + 24 * 4, 0xF);
-    wr32(buf + 24 * 4 + 4, 3);       /* RelationProcessorPackage */
+    wr32(buf + 24 * cpus, (1u << cpus) - 1u);
+    wr32(buf + 24 * cpus + 4, 3);    /* RelationProcessorPackage */
     wr32(lenp, need);
     RET(1, 2);
 }

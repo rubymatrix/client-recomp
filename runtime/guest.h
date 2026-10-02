@@ -17,7 +17,14 @@
 /* 64-bit hosts (R3: the Windows x64 target and arm64 macOS): guest memory is a reserved 4 GB
  * window somewhere in the host address space; runtime/portable/gwin.c sets its base. */
 extern unsigned char* rt_guest_base;
+#if defined(RT_GUEST_FIXED)
+/* the window is always at RT_GUEST_FIXED (gwin.c places it there): a constant base, so a guest
+ * access is one add - not a reload of rt_guest_base after every store (a store through a char*
+ * may alias the variable, so the compiler must load it again before each access) */
+#define GUEST_PTR(a) ((unsigned char*)(uintptr_t)((uint64_t)(RT_GUEST_FIXED) + (uint32_t)(a)))
+#else
 #define GUEST_PTR(a) (rt_guest_base + (uint32_t)(a))
+#endif
 #else
 #ifndef GUEST_BASE
 #define GUEST_BASE 0u
@@ -92,6 +99,21 @@ extern uint32_t rt_image_lo, rt_image_hi; /* runtime range of the image */
     g->esp = esp; g->ebp = ebp; g->esi = esi; g->edi = edi;                                      \
     g->cf = (uint8_t)cf; g->pf = (uint8_t)pf; g->af = (uint8_t)af; g->zf = (uint8_t)zf;          \
     g->sf = (uint8_t)sf; g->of = (uint8_t)of; g->df = (uint8_t)df
+
+/* At calls and returns only the registers go to the Guest: compiled x86 code never reads flags
+ * across a call or a return (the ABI treats them as clobbered), so the flags each instruction sets
+ * stay function-local and the C compiler deletes every one no branch reads. (Tail jumps, hooks and
+ * helpers still take REGS_STORE, flags and all.) */
+#define REGS_STORE_NOFLAGS                                                                       \
+    g->eax = eax; g->ecx = ecx; g->edx = edx; g->ebx = ebx;                                      \
+    g->esp = esp; g->ebp = ebp; g->esi = esi; g->edi = edi; g->df = (uint8_t)df
+
+/* Bisecting which function's flags must cross a call (RECOMP_FLAGS_BISECT translations): the
+ * flags are left out only for functions in [rt_flag_lo, rt_flag_hi) (XIV_FLAGCUT=lo:hi). */
+extern uint32_t rt_flag_lo, rt_flag_hi;
+#define REGS_STORE_CUT(e)                                                                        \
+    do { if ((uint32_t)(e) >= rt_flag_lo && (uint32_t)(e) < rt_flag_hi) { REGS_STORE_NOFLAGS; }  \
+         else { REGS_STORE; } } while (0)
 
 /* PF: set when the low byte has an even number of 1 bits. 0x6996 is the parity of each nibble. */
 #define PARITY(v) ((unsigned)(!((0x6996u >> ((((uint32_t)(v) & 0xFFu) ^ (((uint32_t)(v) & 0xFFu) >> 4)) & 0xFu)) & 1u)))
@@ -218,6 +240,11 @@ RT_INLINE int64_t fist64(Guest* g, double x) { return fist64_cw(g->fcw, x); }
     g->st[(x87_top + 2) & 7u] = x87_s2; g->st[(x87_top + 3) & 7u] = x87_s3;                      \
     g->st[(x87_top + 4) & 7u] = x87_s4; g->st[(x87_top + 5) & 7u] = x87_s5;                      \
     g->st[(x87_top + 6) & 7u] = x87_s6; g->st[(x87_top + 7) & 7u] = x87_s7
+/* At calls and returns: MSVC's convention leaves the x87 stack empty there but for a return value
+ * in st0 (and the CRT's _CI* helpers' arguments in st0/st1), so only those go to the Guest. */
+#define X87_STORE_CALL                                                                           \
+    g->top = x87_top; g->fcw = (uint16_t)x87_cw;                                                 \
+    g->st[x87_top] = x87_s0; g->st[(x87_top + 1) & 7u] = x87_s1
 #define X87_PUSH(v)                                                                              \
     do                                                                                           \
     {                                                                                            \

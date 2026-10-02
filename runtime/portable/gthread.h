@@ -42,6 +42,24 @@ void gt_exit_self(void);
 void gt_init(void);
 void gt_lock(void);
 void gt_unlock(void);
+/* parallel guest execution (gthread.c): guest code runs unlocked, shims lock */
+extern int gt_parallel;
+int gt_holds(void);
+/* for shims that may run with or without the lock: let go of it if held (returns whether), and back */
+static inline int gt_release(void) { int h = gt_holds(); if (h) gt_unlock(); return h; }
+static inline void gt_reacquire(int held) { if (held) gt_lock(); }
+/* how long this thread has waited for the guest lock, in all */
+uint64_t gt_wait_ns(void);
+/* this thread keeps the guest lock as long as the game thread does (the render thread) */
+void gt_set_long_quantum(void);
+/* how long this thread has been without the lock (blocked, sleeping or waiting for it), in all */
+uint64_t gt_out_ns(void);
+/* The guest lock passed between host threads as is (fibers): the holder calls gt_handoff_out and
+ * stops touching guest state; the thread it wakes calls gt_handoff_in and holds the lock. */
+void gt_handoff_out(void);
+void gt_handoff_in(void);
+/* logs each thread's share of the last window_ns holding the guest lock, and its acquisitions */
+void gt_lock_report(uint64_t window_ns);
 int gt_holds(void);
 /* Nesting: while on, this thread keeps the lock at safepoints (translated loops don't hand it to
  * another guest thread). For host code that must not be re-entered from another thread while it

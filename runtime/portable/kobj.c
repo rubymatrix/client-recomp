@@ -20,16 +20,52 @@ struct KObject
     int signaled, manual;
     int32_t count, max;
     uint32_t owner, recursion;
+    uint32_t wslot; /* its wait word in g_wait (stable: objects are freed, the words are not) */
 };
 
 static KObject* g_slots[MAX_HANDLES];
 static volatile uint32_t g_lock;         /* guards g_slots and every object's state */
-static volatile uint32_t g_epoch;        /* advanced by every signal; waiters sleep on it */
+static volatile uint32_t g_epoch;        /* advanced by every signal; multi-object waiters sleep on it */
+static volatile uint32_t g_epoch_sleepers;
+
+/* A single-object wait sleeps on its object's own word, and a signal wakes only that word's
+ * sleepers, and only if there are any: one global wake for every signal woke every waiting thread
+ * in the process, hundreds of thousands of times a second in busy scenes (the game's render
+ * command queue is a semaphore released once per command). */
+#define WAIT_WORDS 1024u
+static struct
+{
+    volatile uint32_t gen, sleepers;
+} g_wait[WAIT_WORDS];
+static volatile uint32_t g_next_wslot;
+/* XIV_KWAIT_PEROBJECT=1: single-object waits on their own word (off: everything on the epoch, which
+ * every signal advances; wakes still only when someone sleeps on it) */
+static int g_per_object = -1;
+
+static void wake_slot(uint32_t ws)
+{
+    __atomic_fetch_add(&g_wait[ws].gen, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&g_wait[ws].sleepers, __ATOMIC_SEQ_CST))
+        plat_wake_all32(&g_wait[ws].gen);
+    if (__atomic_load_n(&g_epoch_sleepers, __ATOMIC_SEQ_CST))
+    {
+        __atomic_fetch_add(&g_epoch, 1, __ATOMIC_SEQ_CST);
+        plat_wake_all32(&g_epoch);
+    }
+}
 
 static void lock(void)
 {
-    while (plat_atomic_cas32(&g_lock, 0, 1) != 0)
-        plat_yield();
+    /* held for a few instructions: spin on the CPU's hint first, the scheduler only after */
+    for (unsigned spin = 0; plat_atomic_cas32(&g_lock, 0, 1) != 0; ++spin)
+        if (spin < 200)
+        {
+#if defined(__aarch64__)
+            __asm__ volatile("yield");
+#endif
+        }
+        else
+            plat_yield();
 }
 
 static void unlock(void)
@@ -39,8 +75,9 @@ static void unlock(void)
 
 void k_poke(void)
 {
-    plat_atomic_add32(&g_epoch, 1);
-    plat_wake_all32(&g_epoch);
+    __atomic_fetch_add(&g_epoch, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&g_epoch_sleepers, __ATOMIC_SEQ_CST))
+        plat_wake_all32(&g_epoch);
 }
 
 static KObject* get(uint32_t h)
@@ -72,6 +109,7 @@ uint32_t k_new(KKind kind, void* data, void (*close)(void* data))
     o->kind = kind;
     o->data = data;
     o->close = close;
+    o->wslot = __atomic_fetch_add(&g_next_wslot, 1, __ATOMIC_RELAXED) % WAIT_WORDS;
     uint32_t h = insert(o);
     if (!h)
         free(o);
@@ -153,9 +191,10 @@ int k_event_set(uint32_t h, int state)
         return 0;
     }
     o->signaled = state;
+    uint32_t ws = o->wslot;
     unlock();
     if (state)
-        k_poke();
+        wake_slot(ws);
     return 1;
 }
 
@@ -185,9 +224,10 @@ int k_mutex_release(uint32_t h)
     if (--o->recursion == 0)
         o->owner = 0;
     int freed = !o->owner;
+    uint32_t ws = o->wslot;
     unlock();
     if (freed)
-        k_poke();
+        wake_slot(ws);
     return 1;
 }
 
@@ -214,8 +254,9 @@ int k_semaphore_release(uint32_t h, int32_t n, int32_t* previous)
     if (previous)
         *previous = o->count;
     o->count += n;
+    uint32_t ws = o->wslot;
     unlock();
-    k_poke();
+    wake_slot(ws);
     return 1;
 }
 
@@ -251,6 +292,8 @@ static void take(KObject* o, uint32_t tid)
 
 uint32_t k_wait(const uint32_t* handles, uint32_t n, int all, uint32_t ms)
 {
+    if (g_per_object < 0)
+        g_per_object = getenv("XIV_KWAIT_PEROBJECT") != NULL;
     uint32_t tid = plat_thread_id();
     uint64_t deadline = ms == ~0u ? ~0ull : rt_monotonic_ns() + (uint64_t)ms * 1000000u;
     for (;;)
@@ -288,8 +331,28 @@ uint32_t k_wait(const uint32_t* handles, uint32_t n, int all, uint32_t ms)
             unlock();
             return all ? K_WAIT_OBJECT_0 : K_WAIT_OBJECT_0 + first;
         }
-        uint32_t e = g_epoch;
+        /* one object: its own word; several: the epoch every signal advances */
+        volatile uint32_t* word = (n == 1 && g_per_object) ? &g_wait[objs[0]->wslot].gen : &g_epoch;
+        volatile uint32_t* sleepers = (n == 1 && g_per_object) ? &g_wait[objs[0]->wslot].sleepers : &g_epoch_sleepers;
+        uint32_t e = __atomic_load_n(word, __ATOMIC_SEQ_CST);
         unlock();
+        if (ms == 0)
+            return K_WAIT_TIMEOUT;
+        /* a producer signalling once per item (the game's render command semaphore: hundreds of
+         * thousands a second) is usually back within microseconds: watch for its signal before
+         * sleeping, so neither side pays a wake syscall and a scheduler round trip per item */
+        {
+            unsigned spin = 0;
+            while (spin < 3000 && __atomic_load_n(word, __ATOMIC_ACQUIRE) == e)
+            {
+#if defined(__aarch64__)
+                __asm__ volatile("yield");
+#endif
+                spin++;
+            }
+            if (spin < 3000)
+                continue; /* something was signalled: look again */
+        }
         uint64_t now = rt_monotonic_ns();
         if (now >= deadline)
             return K_WAIT_TIMEOUT;
@@ -297,7 +360,9 @@ uint32_t k_wait(const uint32_t* handles, uint32_t n, int all, uint32_t ms)
         int held = gt_holds();
         if (held)
             gt_unlock();
-        plat_wait32_ms(&g_epoch, e, left > 0xFFFFFFFEu ? ~0u : (uint32_t)left);
+        __atomic_fetch_add(sleepers, 1, __ATOMIC_SEQ_CST);
+        plat_wait32_ms(word, e, left > 0xFFFFFFFEu ? ~0u : (uint32_t)left);
+        __atomic_fetch_sub(sleepers, 1, __ATOMIC_SEQ_CST);
         if (held)
             gt_lock();
     }
@@ -331,12 +396,16 @@ static void thread_main(void* p)
     gt_exit_self();
     lock();
     KObject* o = get(c->handle);
+    uint32_t ws = ~0u;
     if (o && o->kind == K_THREAD && o->data == c)
     {
         o->signaled = 1;
         c->exit_code = code;
+        ws = o->wslot;
     }
     unlock();
+    if (ws != ~0u)
+        wake_slot(ws);
     k_poke();
     k_close(c->handle); /* the thread's own reference */
 }

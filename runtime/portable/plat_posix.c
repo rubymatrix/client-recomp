@@ -21,6 +21,7 @@
 
 #if defined(__APPLE__)
 #include <os/os_sync_wait_on_address.h>
+#include <pthread/qos.h>
 #include <sys/sysctl.h>
 #else
 #include <linux/futex.h>
@@ -37,6 +38,20 @@ void* plat_reserve(size_t size)
 {
     void* p = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
     return p == MAP_FAILED ? NULL : p;
+}
+
+/* at exactly `at`, or NULL: a hint, never MAP_FIXED (which would replace whatever is mapped there) */
+void* plat_reserve_at(void* at, size_t size)
+{
+    void* p = mmap(at, size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED)
+        return NULL;
+    if (p != at)
+    {
+        munmap(p, size);
+        return NULL;
+    }
+    return p;
 }
 
 int plat_commit(void* p, size_t size)
@@ -86,6 +101,11 @@ int plat_thread_start(void (*fn)(void*), void* arg)
     pthread_attr_init(&a);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     pthread_attr_setstacksize(&a, 8u << 20); /* translated frames are large; Windows gives 1 MB+ and grows */
+#if defined(__APPLE__)
+    /* the game's threads are its frame: keep them on the performance cores (the default QoS lets
+     * the scheduler put them on the efficiency cores, a fraction of the speed) */
+    pthread_attr_set_qos_class_np(&a, QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     pthread_t t;
     int r = pthread_create(&t, &a, thread_entry, s);
     pthread_attr_destroy(&a);

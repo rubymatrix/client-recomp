@@ -53,7 +53,9 @@ def x87_locals(lines):
             out.append(line[:len(line) - len(code)] + 'X87_STORE; ' + code + ' X87_LOAD;')
             continue
         s = line.replace('REGS_DECL;', 'REGS_DECL; X87_DECL;').replace('REGS_LOAD;', 'REGS_LOAD; X87_LOAD;')
-        s = s.replace('REGS_STORE;', 'REGS_STORE; X87_STORE;')
+        # calls and returns (x86c call/ret tokens; recomp.py resolves the flags) keep only st0/st1
+        s = re.sub(r'(REGS_STORE_(?:TO_[0-9a-f]{8}|RET|NOFLAGS);)', r'\1 X87_STORE_CALL;', s)
+        s = re.sub(r'(REGS_STORE(?:_CUT\(0x[0-9a-f]+\))?;)', r'\1 X87_STORE;', s)
         s = re.sub(r'\bST\(([0-7])\)', r'x87_s\1', s)
         s = s.replace('fpush(g, ', 'X87_PUSH(').replace('fpop(g)', 'X87_POP()').replace('fr(g, ', 'fr_cw(x87_cw, ')
         for f in ('frnd', 'fist16', 'fist32', 'fist64'):
@@ -110,6 +112,98 @@ class FunctionTranslator:
                     break
                 pc = ins.address + ins.size
         self.insns.sort(key=lambda i: i.address)
+
+    # ------------------------------------------------------------------ flag liveness across calls
+
+    FLAG_TEST = (X.X86_EFLAGS_TEST_CF | X.X86_EFLAGS_TEST_ZF | X.X86_EFLAGS_TEST_SF | X.X86_EFLAGS_TEST_OF |
+                 X.X86_EFLAGS_TEST_PF | X.X86_EFLAGS_TEST_AF)
+    FLAG_FULL = [getattr(X, 'X86_EFLAGS_MODIFY_' + f) | getattr(X, 'X86_EFLAGS_SET_' + f) |
+                 getattr(X, 'X86_EFLAGS_RESET_' + f) | getattr(X, 'X86_EFLAGS_UNDEFINED_' + f)
+                 for f in ('CF', 'ZF', 'SF', 'OF', 'PF')]
+
+    def flag_analysis(self):
+        """Which call sites have the flags live after them (the callee's flags are read), whether
+        the flags are live on entry, and the tail-jump targets - each with the function's own
+        returns taken as not reading the flags (mode 0) and as reading them (mode 1). recomp.py
+        turns these into which callees must return their flags and which callers pass theirs."""
+        insns = self.insns
+        idx = {i.address: k for k, i in enumerate(insns)}
+        rw = []
+        succ = []
+        tails = []
+        for i in insns:
+            mn = i.mnemonic.split(' ')[-1]
+            if mn[0] == 'f' and X.X86_GRP_FPU in i.groups:
+                # x87: capstone keeps its FPU flags where EFLAGS would be (a union): only these
+                # touch EFLAGS
+                r = mn.startswith('fcmov')
+                w = mn in ('fcomi', 'fcomip', 'fucomi', 'fucomip')
+            else:
+                try:
+                    ef = i.eflags
+                except Exception:
+                    ef = 0
+                r = bool(ef & self.FLAG_TEST)
+                w = all(ef & m for m in self.FLAG_FULL)
+            nxt = i.address + i.size
+            s = []
+            exits = False  # control leaves the function here with the flags as they are
+            if mn.startswith('ret'):
+                exits = True
+            elif mn == 'call':
+                w = True  # the callee's flags, as far as what follows is concerned
+                if nxt in idx:
+                    s.append(idx[nxt])
+            else:
+                if mn not in ('jmp', 'int3') and nxt in idx:
+                    s.append(idx[nxt])
+                for t in self.jump_targets(i):
+                    if t in idx:
+                        s.append(idx[t])
+                    elif mn == 'jmp':
+                        exits = True
+                        tails.append(t)
+                if mn == 'jmp' and not self.jump_targets(i):
+                    exits = True  # an indirect jump out (a tail call through a pointer)
+            rw.append((r, w, exits))
+            succ.append(s)
+        out = {'tails': tails}
+        for mode in (0, 1):
+            live = [False] * len(insns)
+            changed = True
+            while changed:
+                changed = False
+                for k in range(len(insns) - 1, -1, -1):
+                    r, w, exits = rw[k]
+                    after = (mode and exits) or any(live[s] for s in succ[k])
+                    v = r or (not w and after)
+                    if v != live[k]:
+                        live[k] = v
+                        changed = True
+            calls = []
+            for k, i in enumerate(insns):
+                if i.mnemonic.split(' ')[-1] == 'call':
+                    op = i.operands[0] if i.operands else None
+                    tgt = op.imm & 0xFFFFFFFF if op is not None and op.type == X.X86_OP_IMM else None
+                    la = any(live[s] for s in succ[k])
+                    # the next call the flags reach untouched (a callee that reads them on entry
+                    # takes this callee's: the CRT's `call 0x9e6a28; call 0x9d62d8`, a ZF result)
+                    nxt_call = None
+                    j = k + 1
+                    while j < len(insns) and len(succ[j - 1]) == 1 and succ[j - 1][0] == j:
+                        r, w, exits = rw[j]
+                        mj = insns[j].mnemonic.split(' ')[-1]
+                        if mj == 'call':
+                            o = insns[j].operands[0] if insns[j].operands else None
+                            if o is not None and o.type == X.X86_OP_IMM:
+                                nxt_call = o.imm & 0xFFFFFFFF
+                            break
+                        if r or w or exits:
+                            break
+                        j += 1
+                    calls.append((i.address, tgt, la, nxt_call))
+            out[mode] = {'calls': calls, 'entry': bool(insns) and live[idx.get(self.entry, 0)]}
+        self.flaginfo = out
 
     def jump_targets(self, ins):
         """Direct intra-procedural control transfers out of an instruction, and the return point of
@@ -256,12 +350,14 @@ class FunctionTranslator:
 
     def call(self, target, ret_addr):
         self.ctx.referenced.add(target)
-        return ['esp -= 4; wr32(esp, %s + RD);' % hexu(ret_addr), 'REGS_STORE; %s%08x(g); REGS_LOAD;' % (self.ctx.prefix, target)]
+        # REGS_STORE_TO_<callee>: flags go along only if the callee reads them on entry (recomp.py)
+        return ['esp -= 4; wr32(esp, %s + RD);' % hexu(ret_addr), 'REGS_STORE_TO_%08x; %s%08x(g); REGS_LOAD;' % (target, self.ctx.prefix, target)]
 
     # ------------------------------------------------------------------ translation
 
     def translate(self):
         self.decode()
+        self.flag_analysis()
         body = []
         prev_falls_to = None
         for k, ins in enumerate(self.insns):
@@ -304,7 +400,111 @@ class FunctionTranslator:
         out.append('}')
         return x87_locals(out) if self.uses_x87 else out
 
+    ATOMIC_RMW = ('add', 'sub', 'and', 'or', 'xor', 'inc', 'dec', 'not', 'neg')
+
+    # Imports called millions of times a second, inlined at `call [IAT slot]`: their stdcall
+    # arguments are at esp (no return address pushed), the callee's pop is esp += 4 * n. The rest
+    # go through rt_call_indirect and the thunk dispatch as before.
+    INLINE_IMPORTS = {
+        'InterlockedIncrement': 'eax = __atomic_add_fetch(XI_P(rd32(esp)), 1u, __ATOMIC_SEQ_CST); esp += 4;',
+        'InterlockedDecrement': 'eax = __atomic_sub_fetch(XI_P(rd32(esp)), 1u, __ATOMIC_SEQ_CST); esp += 4;',
+        'InterlockedExchange': 'eax = __atomic_exchange_n(XI_P(rd32(esp)), rd32(esp + 4), __ATOMIC_SEQ_CST); esp += 8;',
+        'InterlockedExchangeAdd': 'eax = __atomic_fetch_add(XI_P(rd32(esp)), rd32(esp + 4), __ATOMIC_SEQ_CST); esp += 8;',
+        'InterlockedCompareExchange': '{ uint32_t e_ = rd32(esp + 8); __atomic_compare_exchange_n(XI_P(rd32(esp)), &e_, '
+                                      'rd32(esp + 4), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); eax = e_; esp += 12; }',
+        'D3DPERF_BeginEvent': 'eax = 0; esp += 8;',
+        'D3DPERF_EndEvent': 'eax = 0;',
+        'D3DPERF_SetMarker': 'esp += 8;',
+        'EnterCriticalSection': 'xi_cs_enter(rd32(esp)); esp += 4;',
+        'LeaveCriticalSection': 'xi_cs_leave(rd32(esp)); esp += 4;',
+        'TlsGetValue': 'eax = xi_tls_get(rd32(esp)); esp += 4;',
+        'FlsGetValue': 'eax = xi_tls_get(rd32(esp)); esp += 4;',
+        'TlsSetValue': 'eax = xi_tls_set(rd32(esp), rd32(esp + 4)); esp += 8;',
+        'FlsSetValue': 'eax = xi_tls_set(rd32(esp), rd32(esp + 4)); esp += 8;',
+        'GetLastError': 'eax = xi_get_error();',
+        'SetLastError': 'xi_set_error(rd32(esp)); esp += 4;',
+        'timeGetTime': 'eax = (uint32_t)(rt_monotonic_ns() / 1000000u);',
+        'QueryPerformanceCounter': 'wr64(rd32(esp), rt_monotonic_ns() / 100u); eax = 1; esp += 4;',
+        'WaitForSingleObject': 'eax = xi_wait1(rd32(esp), rd32(esp + 4)); esp += 8;',
+        'SetEvent': 'eax = xi_set_event(rd32(esp), 1); esp += 4;',
+        'ResetEvent': 'eax = xi_set_event(rd32(esp), 0); esp += 4;',
+        'ReleaseSemaphore': 'eax = xi_release_semaphore(rd32(esp), rd32(esp + 4), rd32(esp + 8)); esp += 12;',
+    }
+
+    def inline_import(self, op):
+        if op.type != X.X86_OP_MEM or op.mem.base or op.mem.index or op.mem.segment:
+            return None
+        name = getattr(self.ctx, 'imports', {}).get(op.mem.disp & 0xFFFFFFFF)
+        return self.INLINE_IMPORTS.get(name)
+
     def one(self, ins):
+        """Returns (C statements, falls_through). Guest threads run in parallel (the runtime's
+        gthread.c), so a lock-prefixed read-modify-write of memory, and xchg with memory (locked
+        on x86 without the prefix), become real atomics; at an unaligned address (which arm64
+        atomics fault on) they fall back to the plain translation."""
+        mn = ins.mnemonic
+        locked = mn.startswith('lock ')
+        base = mn.split(' ', 1)[1] if locked else mn
+        mem = [op for op in ins.operands if op.type == X.X86_OP_MEM]
+        if mem and (locked or base == 'xchg'):
+            r = self.atomic(ins, base, mem[0])
+            if r is not None:
+                return r
+        return self._one(ins)
+
+    def atomic(self, ins, base, m):
+        bits = self.bits_of(m)
+        if bits not in (8, 16, 32):
+            return None
+        T = UT[bits]
+        plain, ft = self._one(ins)
+        pro = self.mem_prologue(ins)
+        P = '((%s volatile*)GUEST_PTR(A))' % T
+        aligned = '((A & %du) == 0)' % (bits // 8 - 1)
+        ops = ins.operands
+        if base == 'xchg':
+            reg = [op for op in ops if op.type == X.X86_OP_REG]
+            if len(reg) != 1:
+                return None
+            body = ['{ %s v_ = __atomic_exchange_n(%s, (%s)%s, __ATOMIC_SEQ_CST); %s }'
+                    % (T, P, T, self.rd(ins, reg[0]), self.wr(ins, reg[0], 'v_'))]
+        elif base == 'xadd':
+            d, src = ops
+            if d.type != X.X86_OP_MEM:
+                return None
+            body = ['{ %s b = %s; %s a = __atomic_fetch_add(%s, b, __ATOMIC_SEQ_CST); %s r = (%s)(a + b);'
+                    % (T, self.rd(ins, src), T, P, T, T)] + self.flags_add('a', 'b', 'r', bits) + \
+                [self.wr(ins, src, 'a') + ' }']
+        elif base == 'cmpxchg':
+            d, src = ops
+            if d.type != X.X86_OP_MEM:
+                return None
+            acc = {8: '(uint8_t)eax', 16: '(uint16_t)eax', 32: 'eax'}[bits]
+            acc_w = {8: 'eax = (eax & 0xFFFFFF00u) | (uint8_t)v;', 16: 'eax = (eax & 0xFFFF0000u) | (uint16_t)v;',
+                     32: 'eax = v;'}[bits]
+            body = ['{ %s a = %s; %s v = a; __atomic_compare_exchange_n(%s, &v, (%s)%s, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);'
+                    ' %s r = (%s)(a - v);' % (T, acc, T, P, T, self.rd(ins, src), T, T)] + \
+                self.flags_sub('a', 'v', 'r', bits) + ['if (!zf) { %s } }' % acc_w]
+        elif base in self.ATOMIC_RMW and ops[0].type == X.X86_OP_MEM:
+            # the plain translation on a local copy, retried until the compare-and-swap lands
+            rd_pat, wr_pat = 'rd%d(A)' % bits, re.compile(r'wr%d\(A, \((\w+)\)\((.*)\)\);$' % bits)
+            stmts = [x for x in plain if x not in pro]
+            out = []
+            for st in stmts:
+                mm = wr_pat.search(st)
+                if mm:
+                    st = st[:mm.start()] + 'M_ = (%s)(%s);' % (mm.group(1), mm.group(2))
+                out.append(st.replace(rd_pat, 'M_'))
+            if any(re.search(r'\bA\b', x) for x in out):
+                return None
+            body = ['{ %s M0_, M_; do { M0_ = M_ = __atomic_load_n(%s, __ATOMIC_RELAXED);' % (T, P)] + out + \
+                ['} while (!__atomic_compare_exchange_n(%s, &M0_, M_, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)); }' % P]
+        else:
+            return None
+        fallback = [x for x in plain if x not in pro]
+        return pro + ['if (%s) {' % aligned] + body + ['} else {'] + fallback + ['}'], ft
+
+    def _one(self, ins):
         """Returns (C statements, falls_through)."""
         mn = ins.mnemonic
         prefix = None
@@ -552,11 +752,14 @@ class FunctionTranslator:
                 if tgt in self.ctx.entries:
                     return self.call(tgt, nxt), True
                 return ['RT_BADJUMP(%s);' % hexu(tgt)], False
-            return pro + ['{ uint32_t t = %s; esp -= 4; wr32(esp, %s + RD); REGS_STORE; rt_call_indirect(g, t); REGS_LOAD; }'
+            inl = self.inline_import(t)
+            if inl:
+                return [inl], True
+            return pro + ['{ uint32_t t = %s; esp -= 4; wr32(esp, %s + RD); REGS_STORE_NOFLAGS; rt_call_indirect(g, t); REGS_LOAD; }'
                           % (self.rd(ins, t, 32), hexu(nxt))], True
         if mn == 'ret':
             n = ops[0].imm if ops else 0
-            return ['esp += %d; REGS_STORE; return;' % (4 + n)], False
+            return ['esp += %d; REGS_STORE_RET; return;' % (4 + n)], False  # REGS_STORE if a caller reads its flags
 
         raise Unsupported(mn)
 

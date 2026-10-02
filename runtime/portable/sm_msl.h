@@ -82,7 +82,7 @@ typedef struct SmOpts
 /* The auxiliary values both stages read (buffer SM_BUF_AUX). */
 typedef struct SmAux
 {
-    float half_pixel[4]; /* -1/width, 1/height of the viewport: D3D9's pixel centres */
+    float half_pixel[4]; /* 1/width, -1/height of the viewport: D3D9's pixel centres */
     float alpha_ref[4];  /* x: D3DRS_ALPHAREF / 255 */
 } SmAux;
 
