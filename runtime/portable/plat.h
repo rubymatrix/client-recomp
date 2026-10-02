@@ -20,6 +20,7 @@ extern const char plat_path_sep;
 
 /* Address space: reserve (no access), commit (read/write) and decommit, page granular. */
 void* plat_reserve(size_t size);
+void* plat_reserve_at(void* at, size_t size);
 int plat_commit(void* p, size_t size);
 void plat_decommit(void* p, size_t size);
 

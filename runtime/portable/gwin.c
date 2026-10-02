@@ -17,6 +17,11 @@ unsigned char* rt_guest_base;
 static uint32_t g_res[GRANULES];   /* granules in the reservation starting here, else 0 */
 static uint8_t g_used[GRANULES];   /* granule belongs to a reservation */
 static uint8_t g_committed[GRANULES * (GRANULE / PAGE) / 8];
+/* pages mapped read-write on the host: a decommit only zeroes them (Windows hands committed pages
+ * back zeroed), so the game's allocator committing and decommitting the same pages all the time
+ * costs no system calls and no fresh page faults */
+static uint8_t g_mapped[GRANULES * (GRANULE / PAGE) / 8];
+#define BIT(m, p) (((m)[(p) >> 3] >> ((p) & 7)) & 1)
 static volatile uint32_t g_lock;
 static uint32_t g_hint = LOW_RESERVED / GRANULE;
 
@@ -34,7 +39,17 @@ static void unlock(void)
 int gwin_init(void)
 {
     /* 4 GB plus a guard page: an unaligned access at 0xFFFFFFFF reaches past the window. */
+#if defined(RT_GUEST_FIXED)
+    rt_guest_base = (unsigned char*)plat_reserve_at((void*)(uintptr_t)(RT_GUEST_FIXED), 0x100000000ull + PAGE);
+    if (rt_guest_base != (unsigned char*)(uintptr_t)(RT_GUEST_FIXED))
+    {
+        rt_log("[recomp] the guest window could not be placed at %#llx (the build expects it there)\n",
+               (unsigned long long)(RT_GUEST_FIXED));
+        return 0;
+    }
+#else
     rt_guest_base = (unsigned char*)plat_reserve(0x100000000ull + PAGE);
+#endif
     if (!rt_guest_base)
         return 0;
     for (uint32_t g = 0; g < LOW_RESERVED / GRANULE; ++g)
@@ -99,11 +114,17 @@ uint32_t gwin_reserve(uint32_t addr, uint32_t size)
 int gwin_commit(uint32_t addr, uint32_t size)
 {
     uint32_t lo = addr & ~(PAGE - 1), hi = (uint32_t)(((uint64_t)addr + size + PAGE - 1) & ~(uint64_t)(PAGE - 1));
-    if (!plat_commit(rt_guest_base + lo, (size_t)hi - lo))
+    int mapped = 1;
+    for (uint32_t p = lo / PAGE; p < hi / PAGE && mapped; ++p)
+        mapped = BIT(g_mapped, p);
+    if (!mapped && !plat_commit(rt_guest_base + lo, (size_t)hi - lo))
         return 0;
     lock();
     for (uint32_t p = lo / PAGE; p < hi / PAGE; ++p)
+    {
         g_committed[p >> 3] |= (uint8_t)(1u << (p & 7));
+        g_mapped[p >> 3] |= (uint8_t)(1u << (p & 7));
+    }
     unlock();
     return 1;
 }
@@ -111,10 +132,26 @@ int gwin_commit(uint32_t addr, uint32_t size)
 void gwin_decommit(uint32_t addr, uint32_t size)
 {
     uint32_t lo = addr & ~(PAGE - 1), hi = (uint32_t)(((uint64_t)addr + size + PAGE - 1) & ~(uint64_t)(PAGE - 1));
+    lock();
+    for (uint32_t p = lo / PAGE; p < hi / PAGE; ++p)
+    {
+        if (BIT(g_committed, p) && BIT(g_mapped, p))
+            memset(rt_guest_base + (size_t)p * PAGE, 0, PAGE);
+        g_committed[p >> 3] &= (uint8_t)~(1u << (p & 7));
+    }
+    unlock();
+}
+
+/* a release gives the pages back to the host */
+static void unmap_range(uint32_t lo, uint32_t hi)
+{
     plat_decommit(rt_guest_base + lo, (size_t)hi - lo);
     lock();
     for (uint32_t p = lo / PAGE; p < hi / PAGE; ++p)
+    {
         g_committed[p >> 3] &= (uint8_t)~(1u << (p & 7));
+        g_mapped[p >> 3] &= (uint8_t)~(1u << (p & 7));
+    }
     unlock();
 }
 
@@ -123,7 +160,7 @@ void gwin_release(uint32_t addr)
     uint32_t start = addr / GRANULE, n = g_res[start];
     if (!n)
         return;
-    gwin_decommit(start * GRANULE, n * GRANULE);
+    unmap_range(start * GRANULE, start * GRANULE + n * GRANULE);
     lock();
     for (uint32_t g = start; g < start + n; ++g)
         g_used[g] = 0;

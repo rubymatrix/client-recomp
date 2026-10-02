@@ -4,6 +4,8 @@
 #include <stdint.h>
 
 void user32_init(void);
+/* Called by the host's main-thread loop each turn: state only the main thread may read (the cursor). */
+void user32_main_tick(void);
 /* An SDL_Window already open (host64's sign-in screen, the graphics back end already on it) for
  * the game's first top-level window to take over instead of opening one: one window, start to end. */
 void user32_adopt_window(void* sdl_window);
@@ -42,3 +44,8 @@ extern void (*user32_quit_hook)(void);
  * the interface), -1 when there is no such point. */
 #define USER32_MOUSE_GIVEN 8
 int user32_mouse_given(int i, float* fx, float* fy);
+void user32_press_key(uint32_t vk);
+/* comctl32 window subclassing (SetWindowSubclass / RemoveWindowSubclass / DefSubclassProc) */
+int user32_set_subclass(uint32_t hwnd, uint32_t proc, uint32_t id, uint32_t ref);
+int user32_remove_subclass(uint32_t hwnd, uint32_t proc, uint32_t id);
+uint32_t user32_def_subclass(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp);

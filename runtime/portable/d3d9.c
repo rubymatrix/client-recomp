@@ -142,28 +142,35 @@ typedef struct Obj
     struct Mask* sbm;
 } Obj;
 
-static Obj* g_objs;
-static uint32_t g_nobjs, g_capobjs, g_free_hint = 1;
+/* Objects live in chunks that never move: the per-draw methods run without the guest lock
+ * (thunk.c kNoLock) on the render thread while another thread may be creating a resource. */
+#define OBJ_CHUNK 1024u
+#define OBJ_CHUNKS 4096u
+static Obj* g_obj_chunks[OBJ_CHUNKS];
+static volatile uint32_t g_nobjs;
+static uint32_t g_free_hint = 1;
 static uint32_t g_vtbl[O_KINDS];
+#define OBJ_AT(i) (&g_obj_chunks[(i) / OBJ_CHUNK][(i) % OBJ_CHUNK])
 
 static uint32_t obj_new(int kind)
 {
     uint32_t i = g_free_hint;
-    while (i < g_nobjs && g_objs[i].kind != O_FREE)
+    while (i < g_nobjs && OBJ_AT(i)->kind != O_FREE)
         i++;
     if (i >= g_nobjs)
     {
-        if (g_nobjs + 2 > g_capobjs)
-        {
-            g_capobjs = g_capobjs ? g_capobjs * 2 : 1024;
-            g_objs = (Obj*)realloc(g_objs, g_capobjs * sizeof *g_objs);
-        }
-        if (!g_nobjs)
-            g_objs[g_nobjs++].kind = O_FREE;
-        i = g_nobjs++;
+        uint32_t n = g_nobjs ? g_nobjs : 1;
+        if (n / OBJ_CHUNK >= OBJ_CHUNKS)
+            return 0;
+        if (!g_obj_chunks[n / OBJ_CHUNK])
+            g_obj_chunks[n / OBJ_CHUNK] = (Obj*)calloc(OBJ_CHUNK, sizeof(Obj));
+        if (!g_obj_chunks[0])
+            g_obj_chunks[0] = (Obj*)calloc(OBJ_CHUNK, sizeof(Obj));
+        i = n;
+        __atomic_store_n(&g_nobjs, n + 1, __ATOMIC_RELEASE);
     }
     g_free_hint = i + 1;
-    Obj* o = &g_objs[i];
+    Obj* o = OBJ_AT(i);
     memset(o, 0, sizeof *o);
     o->kind = (uint8_t)kind;
     o->refs = 1;
@@ -178,7 +185,10 @@ static Obj* obj(uint32_t p)
     if (!p)
         return NULL;
     uint32_t i = rd32(p + 4);
-    return i && i < g_nobjs && g_objs[i].kind != O_FREE && g_objs[i].guest == p ? &g_objs[i] : NULL;
+    if (!i || i >= __atomic_load_n(&g_nobjs, __ATOMIC_ACQUIRE))
+        return NULL;
+    Obj* o = OBJ_AT(i);
+    return o->kind != O_FREE && o->guest == p ? o : NULL;
 }
 
 static uint32_t obj_release(uint32_t p);
@@ -635,7 +645,9 @@ static void IDirect3D9_CreateDevice(Guest* g)
     wr32(pp + 4, d->pp[1]);
     wr32(pp + 8, d->pp[2]);
     user32_set_fullscreen(d->hwnd, !d->pp[8]);
-    if (!g9_init(user32_sdl_window(d->hwnd), d->pp[13] != 0x80000000u))
+    /* uncapped: the display's sync only when asked for (XIV_VSYNC=1), whatever interval the game set */
+    const char* vs = getenv("XIV_VSYNC");
+    if (!g9_init(user32_sdl_window(d->hwnd), vs && strcmp(vs, "0") && d->pp[13] != 0x80000000u))
     {
         rt_log("[d3d9] the Metal back end did not start\n");
         RET(D3DERR_NOTAVAILABLE, 7);
@@ -777,16 +789,59 @@ static G9Tex* surface_gpu(const Obj* s, uint32_t* face, uint32_t* level);
 static void debug_shot(G9Tex* bb, uint32_t w, uint32_t h)
 {
     static const char* path;
-    static uint64_t at;
+    static uint64_t at, at_ns, t0;
+    static int done;
     if (!path)
     {
         path = getenv("XIV_SHOT") ? getenv("XIV_SHOT") : "";
         at = getenv("XIV_SHOT_FRAME") ? strtoull(getenv("XIV_SHOT_FRAME"), NULL, 0) : 300;
+        /* XIV_SHOT_SEC=s: at that many seconds instead, and the share of the screen's centre that
+         * is lit logged (0% with the 3D scene missing behind the interface) */
+        at_ns = getenv("XIV_SHOT_SEC") ? strtoull(getenv("XIV_SHOT_SEC"), NULL, 0) * 1000000000ull : 0;
+        t0 = rt_monotonic_ns();
     }
-    if (!*path || g_dev.frames != at || !bb)
+    /* XIV_SHOT_EVERY=s: <XIV_SHOT>.<n>.ppm every s seconds as well (calibrating test timings) */
+    {
+        static uint64_t every, last_shot;
+        static int nshot;
+        static int init;
+        if (!init)
+            init = 1, every = getenv("XIV_SHOT_EVERY") ? strtoull(getenv("XIV_SHOT_EVERY"), NULL, 0) * 1000000000ull : 0;
+        if (every && *path && bb && rt_monotonic_ns() - t0 >= last_shot + every)
+        {
+            last_shot += every;
+            uint8_t* q = (uint8_t*)malloc((size_t)w * h * 4);
+            g9_tex_read(bb, 0, 0, q, w * 4);
+            char name[512];
+            snprintf(name, sizeof name, "%s.%02d.ppm", path, ++nshot);
+            FILE* f = fopen(name, "wb");
+            if (f)
+            {
+                fprintf(f, "P6\n%u %u\n255\n", w, h);
+                for (size_t i = 0; i < (size_t)w * h; ++i)
+                    fputc(q[i * 4 + 2], f), fputc(q[i * 4 + 1], f), fputc(q[i * 4], f);
+                fclose(f);
+            }
+            free(q);
+        }
+    }
+    if (!*path || !bb || done)
         return;
+    if (at_ns ? rt_monotonic_ns() - t0 < at_ns : g_dev.frames != at)
+        return;
+    done = 1;
     uint8_t* px = (uint8_t*)malloc((size_t)w * h * 4);
     g9_tex_read(bb, 0, 0, px, w * 4);
+    {
+        uint64_t lit = 0, n = 0;
+        for (uint32_t y = h / 4; y < h * 3 / 4; ++y)
+            for (uint32_t x = w / 3; x < w * 2 / 3; ++x, ++n)
+            {
+                const uint8_t* q = px + ((size_t)y * w + x) * 4;
+                lit += q[0] + q[1] + q[2] > 48;
+            }
+        rt_log("[shot] centre lit %.1f%%\n", 100.0 * lit / (n ? n : 1));
+    }
     FILE* f = fopen(path, "wb");
     if (f)
     {
@@ -802,6 +857,14 @@ static void debug_shot(G9Tex* bb, uint32_t w, uint32_t h)
     free(px);
 }
 
+extern void (*thunk_timer)(uint64_t ns);
+extern uint32_t thunk_prof_thread;
+void thunk_prof_report(void);
+void thunk_lock_report(void);
+void xiv_ui_report(void); /* xiv_ui.c: the interface's animation counters (XIV_ANIMLOG) */
+static void prof_noop(uint64_t ns) { (void)ns; }
+static uint64_t g_present_ns; /* time in g9_present, in all */
+
 static void present(void)
 {
     uint32_t f, l;
@@ -809,10 +872,109 @@ static void present(void)
     G9Tex* t = bb ? surface_gpu(bb, &f, &l) : NULL;
     if (bb)
         debug_shot(t, bb->width, bb->height);
+    uint64_t p0 = rt_monotonic_ns();
     g9_present(t);
+    g_present_ns += rt_monotonic_ns() - p0;
     g_dev.frames++;
+    /* XIV_PEEK=base+off,...: logs rd32(rd32(base) + off) every 300 frames (debugging) */
+    if (getenv("XIV_PEEK") && g_dev.frames % 300 == 0)
+        for (const char* k = getenv("XIV_PEEK"); k && *k;)
+        {
+            char* end;
+            uint32_t base = (uint32_t)strtoul(k, &end, 0), off = 0;
+            if (*end == '+')
+                off = (uint32_t)strtoul(end + 1, &end, 0);
+            uint32_t p = rd32(base), v = p ? rd32(p + off) : 0;
+            rt_log("[peek] frame %llu: [%08x]=%08x, [+%x]=%08x\n", (unsigned long long)g_dev.frames, base, p, off, v);
+            k = *end == ',' ? end + 1 : end;
+            if (!*end)
+                break;
+        }
+    /* XIV_AUTOKEYS_MS=ms:vk,ms:vk,...: key presses that many milliseconds after the first frame
+     * (vk 0: activate the window). Wall-clock waits, unlike frame counts, mean the same at any
+     * frame rate. */
+    {
+        static uint64_t t0;
+        static unsigned next;
+        const char* tk = getenv("XIV_AUTOKEYS_MS");
+        if (tk)
+        {
+            if (!t0)
+                t0 = rt_monotonic_ns();
+            uint64_t ms = (rt_monotonic_ns() - t0) / 1000000u;
+            unsigned idx = 0;
+            for (const char* k = tk; *k; ++idx)
+            {
+                char* end;
+                unsigned long at = strtoul(k, &end, 0);
+                if (*end != ':')
+                    break;
+                unsigned long vk = strtoul(end + 1, &end, 0);
+                if (idx == next && ms >= at)
+                {
+                    rt_log("[d3d9] %llu ms: key %#lx\n", (unsigned long long)ms, vk);
+                    user32_press_key((uint32_t)vk);
+                    next++;
+                }
+                if (*end != ',')
+                    break;
+                k = end + 1;
+            }
+        }
+    }
+    /* XIV_AUTOKEYS=frame:vk,frame:vk,...: key presses at those frames (tests) */
+    const char* keys = getenv("XIV_AUTOKEYS");
+    for (const char* k = keys; k && *k;)
+    {
+        char* end;
+        unsigned long fr = strtoul(k, &end, 0);
+        if (*end != ':')
+            break;
+        unsigned long vk = strtoul(end + 1, &end, 0);
+        if (fr == g_dev.frames)
+        {
+            rt_log("[d3d9] frame %lu: key %#lx\n", fr, vk);
+            user32_press_key((uint32_t)vk);
+        }
+        k = *end == ',' ? end + 1 : end;
+        if (!*end)
+            break;
+    }
+    if (g_dev.frames == 1) /* the thread presenting is the frame's critical path */
+    {
+        gt_set_long_quantum();
+        if (getenv("XIV_ANIMLOG"))
+            rt_log("[d3d9] render thread %u\n", plat_thread_id());
+    }
+    /* XIV_PROF=1: where the render thread spends its time in the host, every 600 frames */
+    static int prof = -1;
+    if (prof < 0 && (prof = getenv("XIV_PROF") != NULL))
+    {
+        thunk_timer = prof_noop;
+        if (strcmp(getenv("XIV_PROF"), "logic"))
+            thunk_prof_thread = plat_thread_id();
+    }
+    if (prof && g_dev.frames % 600 == 0)
+        thunk_prof_report();
+    xiv_ui_report();
     if (g_dev.frames == 1 || g_dev.frames % 600 == 0)
-        rt_log("[d3d9] %llu frames\n", (unsigned long long)g_dev.frames);
+    {
+        static uint64_t last_ns, last_frames, last_wait, last_out, last_present;
+        uint64_t now = rt_monotonic_ns();
+        if (last_ns)
+            rt_log("[d3d9] %llu frames (%.1f fps; render thread: %.0f%% lock wait, %.0f%% blocked, %.0f%% present)\n",
+                   (unsigned long long)g_dev.frames, (g_dev.frames - last_frames) * 1e9 / (double)(now - last_ns),
+                   100.0 * (gt_wait_ns() - last_wait) / (double)(now - last_ns),
+                   100.0 * ((gt_out_ns() - last_out) - (gt_wait_ns() - last_wait)) / (double)(now - last_ns),
+                   100.0 * (g_present_ns - last_present) / (double)(now - last_ns));
+        else
+            rt_log("[d3d9] %llu frames\n", (unsigned long long)g_dev.frames);
+        thunk_lock_report();
+        if (last_ns && getenv("XIV_LOCKLOG"))
+            gt_lock_report(now - last_ns);
+        last_ns = now, last_frames = g_dev.frames, last_wait = gt_wait_ns(), last_out = gt_out_ns(),
+        last_present = g_present_ns;
+    }
 }
 
 static void Dev_Present(Guest* g) { present(); RET(D3D_OK, 5); }

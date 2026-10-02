@@ -6,11 +6,13 @@
  * them fail. This is the whole interface it reaches: the engine, mastering, submix and source
  * voices, and effect objects.
  *
- * Sound is not output yet: the engine is a clock. Each started source voice consumes its queued
- * buffers at its sample rate times its frequency ratio, and the game's callbacks run as XAudio2
- * would run them (OnVoiceProcessingPassStart, OnBufferStart/End, OnLoopEnd, OnStreamEnd, the
- * engine's pass callbacks), every 10 ms on an audio thread, so its streaming and its timing see
- * what they expect. Mixing to the speakers goes in where the clock advances.
+ * An audio thread mixes as XAudio2 does: each started source voice (PCM 8/16/24/32, float, MS
+ * ADPCM) is resampled by its rate times its frequency ratio, scaled by its volumes and sent
+ * through its output matrices to its submixes and the mastering voice; submixes run in stage
+ * order; the master is folded to stereo for an SDL audio stream, whose queue sets the pace. The
+ * game's callbacks run as XAudio2 would run them (OnVoiceProcessingPassStart, OnBufferStart/End,
+ * OnLoopEnd, OnStreamEnd, the engine's pass callbacks). Effects are not run: a reverb passes on
+ * only its dry part (1 - WetDryMix), a volume meter reads silence.
  *
  * Vtables in XAudio2 2.4 order. Voices are not COM objects: their vtables start at
  * GetVoiceDetails. Every method is stdcall with `this` first.
@@ -23,6 +25,8 @@
 #include "gwin.h"
 #include "plat.h"
 #include "thunk.h"
+
+#include <SDL3/SDL.h>
 
 #define S_OK 0u
 #define E_NOINTERFACE 0x80004002u
@@ -44,31 +48,59 @@ static const uint8_t CLSID_Reverb_B[16] = { 0xa2, 0x38, 0x77, 0xda, 0x2c, 0xcd, 
 /* --- objects ----------------------------------------------------------------------------------- */
 
 enum { V_FREE, V_ENGINE, V_MASTER, V_SUBMIX, V_SOURCE, V_EFFECT, V_FACTORY };
+/* source sample formats */
+enum { F_NONE, F_PCM8, F_PCM16, F_PCM24, F_PCM32, F_FLOAT, F_ADPCM };
+/* effect kinds */
+enum { FX_OTHER, FX_REVERB, FX_METER };
 
 typedef struct Buf
 {
     uint32_t flags, bytes, data, play_begin, play_length, loop_begin, loop_length, loop_count, context;
 } Buf;
 
+/* an output of a voice: the voice it feeds and its matrix (dc rows of sc levels), when one is set */
+typedef struct Send
+{
+    int dst;
+    uint32_t sc, dc;
+    int set;
+    float m[64];
+} Send;
+
 #define MAX_QUEUE 64
+#define MAX_SENDS 4
+#define MAX_FX 4
+#define MAX_FRAMES 4800 /* the most output frames one pass makes: 100 ms at 48 kHz */
 
 typedef struct Voice
 {
     int kind;
     uint32_t guest;
     int32_t refs;           /* engine, effects, factory */
-    uint32_t channels, rate, flags;
+    uint32_t channels, rate, flags, stage;
     uint32_t callback;      /* source: IXAudio2VoiceCallback* */
     uint16_t format_tag, block_align, samples_per_block;
+    int fmt;
     float volume, ratio;
     int started;
     Buf queue[MAX_QUEUE];
     uint32_t nqueue;
-    double pos;             /* frames into the current buffer */
+    double pos;             /* the current buffer's frame being played (from its start) */
     int buffer_started;
     uint32_t loops_done;
-    uint64_t played;        /* frames */
+    double played;          /* frames */
     float chvol[8];
+    Send sends[MAX_SENDS];
+    int nsends;
+    /* the effect chain: reverbs pass on only their dry part */
+    int nfx, fx_reverb[MAX_FX], fx_on[MAX_FX];
+    float fx_wet[MAX_FX];   /* WetDryMix, 0..100 */
+    int fxkind;             /* an effect object: what it is */
+    float* mix;             /* submix, master: what the pass sends them */
+    /* MS ADPCM: the coefficients and the last block decoded */
+    int16_t coef[64];
+    uint32_t ncoef, adpcm_at;
+    int16_t* adpcm;
 } Voice;
 
 #define MAX_VOICES 512
@@ -78,13 +110,19 @@ static uint32_t g_engine_callbacks[16];
 static uint32_t g_nengine_cb;
 static int g_engine_started;
 static volatile int g_thread_up;
+static int g_master;        /* the mastering voice's index */
+static int g_log;           /* XIV_AUDIOLOG */
 
 static Voice* voice(uint32_t p)
 {
     if (!p)
         return NULL;
-    uint32_t i = rd32(p + 4);
-    return i < MAX_VOICES && g_v[i].kind != V_FREE && g_v[i].guest == p ? &g_v[i] : NULL;
+    /* p may be anything (the sends are probed in two layouts): only a voice's own address is
+     * read, and only once it is known to be one */
+    for (uint32_t i = 1; i < MAX_VOICES; ++i)
+        if (g_v[i].guest == p && g_v[i].kind != V_FREE)
+            return rd32(p + 4) == i ? &g_v[i] : NULL;
+    return NULL;
 }
 
 static uint32_t voice_new(int kind)
@@ -93,12 +131,17 @@ static uint32_t voice_new(int kind)
         if (g_v[i].kind == V_FREE)
         {
             Voice* v = &g_v[i];
+            float* mix = v->mix;
+            int16_t* adpcm = v->adpcm;
             memset(v, 0, sizeof *v);
+            free(mix);
+            free(adpcm);
             v->kind = kind;
             v->refs = 1;
             v->volume = v->ratio = 1.0f;
             for (int c = 0; c < 8; ++c)
                 v->chvol[c] = 1.0f;
+            v->nsends = -1; /* to the mastering voice */
             v->guest = gheap_alloc(8, 1);
             wr32(v->guest, g_vtbl[kind]);
             wr32(v->guest + 4, i);
@@ -112,20 +155,131 @@ static void voice_free(Voice* v)
 {
     wr32(v->guest, 0);
     gheap_free(v->guest);
+    if ((int)(v - g_v) == g_master)
+        g_master = 0;
     v->kind = V_FREE;
 }
 
-/* frames in a buffer's playable region */
-static uint32_t buf_frames(const Voice* v, const Buf* b)
+/* frames in a whole buffer */
+static uint32_t buf_total(const Voice* v, const Buf* b)
 {
-    if (b->play_length)
-        return b->play_length;
-    uint32_t frames;
     if (v->format_tag == 2 && v->block_align) /* MS ADPCM */
-        frames = (b->bytes / v->block_align) * v->samples_per_block;
-    else
-        frames = v->block_align ? b->bytes / v->block_align : 0;
-    return frames > b->play_begin ? frames - b->play_begin : 0;
+        return (b->bytes / v->block_align) * v->samples_per_block;
+    return v->block_align ? b->bytes / v->block_align : 0;
+}
+
+/* the frame a buffer's playable region ends at */
+static uint32_t buf_end(const Voice* v, const Buf* b)
+{
+    uint32_t total = buf_total(v, b);
+    uint32_t end = b->play_length ? b->play_begin + b->play_length : total;
+    return end < total ? end : total;
+}
+
+/* --- decoding ------------------------------------------------------------------------------------- */
+
+static const int16_t kAdpcmCoef[14] = { 256, 0, 512, -256, 0, 0, 192, 64, 240, 0, 460, -208, 392, -232 };
+static const int kAdpcmAdapt[16] = { 230, 230, 230, 230, 307, 409, 512, 614, 768, 614, 512, 409, 307, 230, 230, 230 };
+
+static int16_t clamp16(int x) { return (int16_t)(x < -32768 ? -32768 : x > 32767 ? 32767 : x); }
+
+/* one MS ADPCM block (block_align bytes at p) to samples_per_block interleaved frames */
+static void adpcm_block(const Voice* v, const uint8_t* p, int16_t* out)
+{
+    int ch = (int)v->channels, spb = v->samples_per_block;
+    int pred[2], delta[2], s1[2], s2[2];
+    for (int c = 0; c < ch; ++c)
+    {
+        int k = p[c] < v->ncoef ? p[c] : 0;
+        pred[c] = k;
+        delta[c] = (int16_t)(p[ch + 2 * c] | p[ch + 2 * c + 1] << 8);
+        s1[c] = (int16_t)(p[3 * ch + 2 * c] | p[3 * ch + 2 * c + 1] << 8);
+        s2[c] = (int16_t)(p[5 * ch + 2 * c] | p[5 * ch + 2 * c + 1] << 8);
+        out[c] = (int16_t)s2[c];
+        out[ch + c] = (int16_t)s1[c];
+    }
+    const uint8_t* d = p + 7 * ch;
+    int n = (spb - 2) * ch;
+    if (7 * ch + (n + 1) / 2 > v->block_align)
+        n = (v->block_align - 7 * ch) * 2;
+    for (int k = 0; k < n; ++k)
+    {
+        int c = k % ch;
+        int nib = k & 1 ? d[k >> 1] & 15 : d[k >> 1] >> 4;
+        int sn = nib >= 8 ? nib - 16 : nib;
+        int pr = (s1[c] * v->coef[2 * pred[c]] + s2[c] * v->coef[2 * pred[c] + 1]) >> 8;
+        pr = clamp16(pr + sn * delta[c]);
+        s2[c] = s1[c];
+        s1[c] = pr;
+        delta[c] = kAdpcmAdapt[nib] * delta[c] >> 8;
+        if (delta[c] < 16)
+            delta[c] = 16;
+        out[(2 + k / ch) * ch + c] = (int16_t)pr;
+    }
+}
+
+/* frame fi of buffer b, one float per channel */
+static void fetch(Voice* v, const Buf* b, uint32_t fi, float* out)
+{
+    uint32_t ch = v->channels;
+    switch (v->fmt)
+    {
+    case F_PCM16:
+    {
+        const uint8_t* p = GUEST_PTR(b->data + fi * v->block_align);
+        for (uint32_t c = 0; c < ch; ++c)
+            out[c] = (int16_t)(p[2 * c] | p[2 * c + 1] << 8) * (1.0f / 32768.0f);
+        return;
+    }
+    case F_PCM8:
+    {
+        const uint8_t* p = GUEST_PTR(b->data + fi * v->block_align);
+        for (uint32_t c = 0; c < ch; ++c)
+            out[c] = ((int)p[c] - 128) * (1.0f / 128.0f);
+        return;
+    }
+    case F_PCM24:
+    {
+        const uint8_t* p = GUEST_PTR(b->data + fi * v->block_align);
+        for (uint32_t c = 0; c < ch; ++c)
+            out[c] = (int32_t)((uint32_t)p[3 * c] << 8 | (uint32_t)p[3 * c + 1] << 16 | (uint32_t)p[3 * c + 2] << 24) * (1.0f / 2147483648.0f);
+        return;
+    }
+    case F_PCM32:
+    case F_FLOAT:
+    {
+        const uint8_t* p = GUEST_PTR(b->data + fi * v->block_align);
+        for (uint32_t c = 0; c < ch; ++c)
+        {
+            uint32_t u;
+            memcpy(&u, p + 4 * c, 4);
+            if (v->fmt == F_FLOAT)
+                memcpy(&out[c], &u, 4);
+            else
+                out[c] = (int32_t)u * (1.0f / 2147483648.0f);
+        }
+        return;
+    }
+    case F_ADPCM:
+    {
+        uint32_t spb = v->samples_per_block, blk = fi / spb;
+        uint32_t at = b->data + blk * v->block_align;
+        if (!v->adpcm)
+            v->adpcm = malloc((size_t)spb * ch * sizeof(int16_t));
+        if (v->adpcm_at != at)
+        {
+            adpcm_block(v, GUEST_PTR(at), v->adpcm);
+            v->adpcm_at = at;
+        }
+        const int16_t* s = v->adpcm + (fi % spb) * ch;
+        for (uint32_t c = 0; c < ch; ++c)
+            out[c] = s[c] * (1.0f / 32768.0f);
+        return;
+    }
+    default:
+        for (uint32_t c = 0; c < ch; ++c)
+            out[c] = 0;
+    }
 }
 
 /* --- the game's callbacks ----------------------------------------------------------------------- */
@@ -151,54 +305,99 @@ static void ecb(unsigned slot)
     }
 }
 
-/* one processing pass of `ms` milliseconds */
-static void pass(double ms)
+/* --- mixing ------------------------------------------------------------------------------------- */
+
+/* the level from source channel s to destination channel d when no matrix is set */
+static float default_level(uint32_t sc, uint32_t dc, uint32_t s, uint32_t d)
 {
-    if (g_engine_started)
-        ecb(0);
-    for (uint32_t i = 1; i < MAX_VOICES; ++i)
+    if (dc == 1)
+        return 1.0f / (float)sc;
+    if (sc == 1)
+        return d < 2 ? 1.0f : 0.0f;
+    return s == d ? 1.0f : 0.0f;
+}
+
+/* what reaches a voice's outputs of its input: its reverbs keep only their dry part */
+static float voice_gain(const Voice* v)
+{
+    float g = v->volume;
+    for (int i = 0; i < v->nfx; ++i)
+        if (v->fx_reverb[i] && v->fx_on[i])
+            g *= 1.0f - v->fx_wet[i] / 100.0f;
+    return g;
+}
+
+/* frame `in` (sc channels, gains applied) to v's outputs at output frame i */
+static void send_frame(Voice* v, const float* in, uint32_t i)
+{
+    int n = v->nsends < 0 ? 1 : v->nsends;
+    for (int k = 0; k < n; ++k)
     {
-        Voice* v = &g_v[i];
-        if (v->kind != V_SOURCE || !v->started)
+        int di = v->nsends < 0 ? g_master : v->sends[k].dst;
+        Voice* d = di > 0 && di < MAX_VOICES ? &g_v[di] : NULL;
+        if (!d || (d->kind != V_SUBMIX && d->kind != V_MASTER) || !d->mix || d == v)
             continue;
-        uint32_t guest = v->guest;
-        if (v->callback)
+        uint32_t sc = v->channels, dc = d->channels;
+        const Send* s = v->nsends < 0 ? NULL : &v->sends[k];
+        int set = s && s->set && s->sc == sc && s->dc == dc;
+        float* o = d->mix + (size_t)i * dc;
+        for (uint32_t c = 0; c < dc; ++c)
         {
-            uint32_t need = v->nqueue ? 0 : (uint32_t)(v->rate * ms / 1000.0) * v->block_align;
-            vcb(v->callback, 0, 1, need, 0);
-            if (voice(guest) != v)
-                continue; /* the callback destroyed it */
+            float acc = 0;
+            for (uint32_t x = 0; x < sc; ++x)
+                acc += in[x] * (set ? s->m[c * sc + x] : default_level(sc, dc, x, c));
+            o[c] += acc;
         }
-        double frames = v->rate * (double)v->ratio * ms / 1000.0;
-        while (frames > 0 && v->nqueue && voice(guest) == v)
+    }
+}
+
+/* source voice v: n output frames at out_rate into its outputs, its buffers and callbacks as
+ * XAudio2 runs them */
+static void mix_source(Voice* v, uint32_t n, uint32_t out_rate)
+{
+    uint32_t guest = v->guest;
+    double step = v->rate * (double)v->ratio / out_rate;
+    float a[8], b2[8], f[8];
+    uint32_t i = 0;
+    int guard = 0;
+    while (i < n && v->nqueue)
+    {
+        Buf* b = &v->queue[0];
+        if (!v->buffer_started)
         {
-            Buf* b = &v->queue[0];
-            if (!v->buffer_started)
+            v->buffer_started = 1;
+            v->pos = b->play_begin;
+            v->loops_done = 0;
+            vcb(v->callback, 3, 1, b->context, 0);
+            if (voice(guest) != v || !v->nqueue)
+                return;
+            b = &v->queue[0];
+        }
+        uint32_t end = buf_end(v, b);
+        int looping = b->loop_count && v->loops_done < b->loop_count;
+        uint32_t lend = end;
+        if (looping)
+        {
+            lend = b->loop_length ? b->loop_begin + b->loop_length : end;
+            if (lend > end)
+                lend = end;
+            if (lend <= b->loop_begin)
+                looping = 0, lend = end;
+        }
+        if (v->pos >= lend)
+        {
+            if (++guard > 64)
+                break; /* buffers with nothing in them: on to the next pass */
+            if (looping)
             {
-                v->buffer_started = 1;
-                vcb(v->callback, 3, 1, b->context, 0);
-                if (voice(guest) != v || !v->nqueue)
-                    break;
-                b = &v->queue[0];
-            }
-            uint32_t total = buf_frames(v, b);
-            double left = (double)total - v->pos;
-            if (frames < left)
-            {
-                v->pos += frames;
-                v->played += (uint64_t)frames;
-                frames = 0;
-                break;
-            }
-            frames -= left;
-            v->played += (uint64_t)left;
-            if (b->loop_count && v->loops_done < b->loop_count)
-            {
-                /* a loop: back to its start (255 = forever) */
-                if (b->loop_count != 255)
+                v->pos = b->loop_begin + (v->pos - lend);
+                if (v->pos >= lend)
+                    v->pos = b->loop_begin;
+                if (b->loop_count != 255) /* XAUDIO2_LOOP_INFINITE */
                     v->loops_done++;
-                v->pos = b->loop_begin;
                 vcb(v->callback, 5, 1, b->context, 0);
+                if (voice(guest) != v)
+                    return;
                 continue;
             }
             Buf done = *b;
@@ -209,32 +408,192 @@ static void pass(double ms)
             v->loops_done = 0;
             vcb(v->callback, 4, 1, done.context, 0);
             if (voice(guest) != v)
-                break;
+                return;
             if (done.flags & 0x40) /* XAUDIO2_END_OF_STREAM */
+            {
                 vcb(v->callback, 2, 0, 0, 0);
+                if (voice(guest) != v)
+                    return;
+            }
+            continue;
         }
+        guard = 0;
+        uint32_t ch = v->channels > 8 ? 8 : v->channels;
+        /* as many frames as this buffer (or its loop) has before its end */
+        float gain = voice_gain(v);
+        while (i < n && v->pos < lend)
+        {
+            uint32_t fi = (uint32_t)v->pos;
+            float t = (float)(v->pos - fi);
+            fetch(v, b, fi, a);
+            if (t > 0 && fi + 1 < lend)
+            {
+                fetch(v, b, fi + 1, b2);
+                for (uint32_t c = 0; c < ch; ++c)
+                    a[c] += (b2[c] - a[c]) * t;
+            }
+            for (uint32_t c = 0; c < ch; ++c)
+                f[c] = a[c] * gain * v->chvol[c];
+            send_frame(v, f, i);
+            v->pos += step;
+            v->played += step;
+            i++;
+        }
+    }
+}
+
+/* a submix or the master: its volume, then (a submix) on to its outputs */
+static void mix_bus(Voice* v, uint32_t n)
+{
+    float gain = voice_gain(v), f[8];
+    uint32_t ch = v->channels > 8 ? 8 : v->channels;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const float* in = v->mix + (size_t)i * v->channels;
+        for (uint32_t c = 0; c < ch; ++c)
+            f[c] = in[c] * gain * v->chvol[c];
+        if (gain != 0)
+            send_frame(v, f, i);
+    }
+}
+
+static float g_out[MAX_FRAMES * 2];
+
+/* one processing pass of n frames at out_rate: the speakers' stereo into g_out */
+static void pass(uint32_t n, uint32_t out_rate)
+{
+    if (g_engine_started)
+        ecb(0);
+    for (uint32_t i = 1; i < MAX_VOICES; ++i)
+    {
+        Voice* v = &g_v[i];
+        if ((v->kind == V_SUBMIX || v->kind == V_MASTER) && v->channels)
+        {
+            if (!v->mix)
+                v->mix = malloc((size_t)MAX_FRAMES * v->channels * sizeof(float));
+            memset(v->mix, 0, (size_t)n * v->channels * sizeof(float));
+        }
+    }
+    for (uint32_t i = 1; i < MAX_VOICES; ++i)
+    {
+        Voice* v = &g_v[i];
+        if (v->kind != V_SOURCE || !v->started)
+            continue;
+        uint32_t guest = v->guest;
+        if (v->callback)
+        {
+            uint32_t need = v->nqueue ? 0 : (uint32_t)(n * v->rate * (double)v->ratio / out_rate) * v->block_align;
+            vcb(v->callback, 0, 1, need, 0);
+            if (voice(guest) != v)
+                continue; /* the callback destroyed it */
+        }
+        mix_source(v, n, out_rate);
         if (voice(guest) == v && v->callback)
             vcb(v->callback, 1, 0, 0, 0);
     }
+    /* submixes in processing stage order, each before what it feeds */
+    for (int stage = -1;;)
+    {
+        uint32_t next = 0xFFFFFFFFu;
+        for (uint32_t i = 1; i < MAX_VOICES; ++i)
+            if (g_v[i].kind == V_SUBMIX && (int64_t)g_v[i].stage > stage && g_v[i].stage < next)
+                next = g_v[i].stage;
+        if (next == 0xFFFFFFFFu)
+            break;
+        for (uint32_t i = 1; i < MAX_VOICES; ++i)
+            if (g_v[i].kind == V_SUBMIX && g_v[i].stage == next && g_v[i].mix)
+                mix_bus(&g_v[i], n);
+        stage = (int)next;
+    }
+    Voice* m = g_master ? &g_v[g_master] : NULL;
+    if (m && m->kind == V_MASTER && m->mix)
+    {
+        float gain = m->volume;
+        uint32_t ch = m->channels;
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            const float* in = m->mix + (size_t)i * ch;
+            float l, r;
+            if (ch == 1)
+                l = r = in[0] * m->chvol[0];
+            else
+            {
+                l = in[0] * m->chvol[0], r = in[1] * m->chvol[1];
+                if (ch >= 3) /* centre (and the surrounds) folded into the front pair; LFE dropped */
+                    l += 0.7071f * in[2] * m->chvol[2], r += 0.7071f * in[2] * m->chvol[2];
+                if (ch >= 6)
+                    l += 0.7071f * in[4] * m->chvol[4], r += 0.7071f * in[5] * m->chvol[5];
+            }
+            l *= gain, r *= gain;
+            g_out[2 * i] = l < -1 ? -1 : l > 1 ? 1 : l;
+            g_out[2 * i + 1] = r < -1 ? -1 : r > 1 ? 1 : r;
+        }
+    }
+    else
+        memset(g_out, 0, (size_t)n * 2 * sizeof(float));
     if (g_engine_started)
         ecb(1);
 }
 
+/* The speakers set the pace: each pass tops the device's queue up to ~40 ms. With no device the
+ * clock runs on the wall clock instead. */
 static void audio_thread(void* arg)
 {
     (void)arg;
+    SDL_AudioStream* stream = NULL;
+    uint32_t rate = 48000;
     uint64_t last = rt_monotonic_ns();
+    int tried = 0;
+    FILE* dump = getenv("XIV_AUDIODUMP") ? fopen(getenv("XIV_AUDIODUMP"), "wb") : NULL;
     for (;;)
     {
-        plat_sleep_ms(10);
+        plat_sleep_ms(5);
+        if (!stream && !tried && g_master)
+        {
+            tried = 1;
+            rate = g_v[g_master].rate ? g_v[g_master].rate : 48000;
+            if (!SDL_InitSubSystem(SDL_INIT_AUDIO))
+                rt_log("[xaudio2] SDL audio: %s\n", SDL_GetError());
+            else
+            {
+                SDL_AudioSpec spec = { SDL_AUDIO_F32, 2, (int)rate };
+                stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+                if (stream)
+                    SDL_ResumeAudioStreamDevice(stream);
+                else
+                    rt_log("[xaudio2] no audio device: %s\n", SDL_GetError());
+            }
+            rt_log("[xaudio2] output %s at %u Hz\n", stream ? "on" : "off", rate);
+        }
+        uint32_t n;
         uint64_t now = rt_monotonic_ns();
-        double ms = (now - last) / 1e6;
+        if (stream)
+        {
+            uint32_t queued = (uint32_t)SDL_GetAudioStreamQueued(stream) / 8;
+            uint32_t target = rate / 25;
+            if (queued >= target)
+                continue;
+            n = target - queued;
+        }
+        else
+        {
+            double ms = (now - last) / 1e6;
+            if (ms < 10)
+                continue;
+            n = (uint32_t)(rate * (ms > 100 ? 100 : ms) / 1000.0);
+        }
         last = now;
-        if (ms > 100)
-            ms = 100;
+        if (n > MAX_FRAMES)
+            n = MAX_FRAMES;
+        if (!n)
+            continue;
         gt_lock();
-        pass(ms);
+        pass(n, rate);
         gt_unlock();
+        if (stream)
+            SDL_PutAudioStreamData(stream, g_out, (int)(n * 2 * sizeof(float)));
+        if (dump) /* XIV_AUDIODUMP=<file>: the output as raw stereo float32 */
+            fwrite(g_out, 2 * sizeof(float), n, dump);
     }
 }
 
@@ -243,8 +602,55 @@ static void start_thread(void)
     if (!g_thread_up)
     {
         g_thread_up = 1;
+        g_log = getenv("XIV_AUDIOLOG") != NULL;
         plat_thread_start(audio_thread, NULL);
     }
+}
+
+/* SetOutputVoices / the sends at creation: XAUDIO2_VOICE_SENDS { count, IXAudio2Voice** } in 2.4
+ * (later versions point at { flags, voice } descriptors instead: both are read) */
+static void set_sends(Voice* v, uint32_t p)
+{
+    if (!p)
+    {
+        v->nsends = -1;
+        return;
+    }
+    uint32_t count = rd32(p), arr = rd32(p + 4);
+    v->nsends = 0;
+    for (uint32_t i = 0; i < count && v->nsends < MAX_SENDS; ++i)
+    {
+        Voice* d = voice(rd32(arr + 4 * i));
+        if (!d)
+            d = voice(rd32(arr + 8 * i + 4));
+        if (!d)
+            continue;
+        Send* s = &v->sends[v->nsends++];
+        memset(s, 0, sizeof *s);
+        s->dst = (int)(d - g_v);
+    }
+    if (g_log)
+        rt_log("[xaudio2] voice %d sends %d (first -> %d)\n", (int)(v - g_v), v->nsends, v->nsends > 0 ? v->sends[0].dst : -1);
+}
+
+/* SetEffectChain / the chain at creation: XAUDIO2_EFFECT_CHAIN { count, { IUnknown*, initial
+ * state, output channels }* } */
+static void set_effects(Voice* v, uint32_t p)
+{
+    v->nfx = 0;
+    if (!p)
+        return;
+    uint32_t count = rd32(p), arr = rd32(p + 4);
+    for (uint32_t i = 0; i < count && v->nfx < MAX_FX; ++i)
+    {
+        Voice* e = voice(rd32(arr + 12 * i));
+        int k = v->nfx++;
+        v->fx_reverb[k] = e && e->fxkind == FX_REVERB;
+        v->fx_on[k] = rd32(arr + 12 * i + 4) != 0;
+        v->fx_wet[k] = 100.0f;
+    }
+    if (g_log)
+        rt_log("[xaudio2] voice %d effects %d\n", (int)(v - g_v), v->nfx);
 }
 
 /* --- IUnknown pieces: the engine, the factory, effects -------------------------------------------- */
@@ -328,12 +734,40 @@ static void XA_CreateSourceVoice(Guest* g)
         RET(E_INVALIDARG, 8);
     uint32_t wf = ARG(2);
     v->format_tag = rd16(wf), v->channels = rd16(wf + 2), v->rate = rd32(wf + 4), v->block_align = rd16(wf + 12);
-    if (v->format_tag == 2)
-        v->samples_per_block = rd16(wf + 18 + 2);
+    uint32_t tag = v->format_tag, bits = rd16(wf + 14);
+    if (tag == 0xFFFE && rd16(wf + 16) >= 22) /* WAVE_FORMAT_EXTENSIBLE: its subformat's tag */
+        tag = rd32(wf + 24);
+    if (tag == 1)
+        v->fmt = bits == 8 ? F_PCM8 : bits == 16 ? F_PCM16 : bits == 24 ? F_PCM24 : bits == 32 ? F_PCM32 : F_NONE;
+    else if (tag == 3 && bits == 32)
+        v->fmt = F_FLOAT;
+    else if (tag == 2 && v->channels <= 2) /* ADPCMWAVEFORMAT: samples per block, its coefficients */
+    {
+        v->fmt = F_ADPCM;
+        v->samples_per_block = rd16(wf + 18);
+        v->ncoef = rd16(wf + 20);
+        if (v->ncoef > 32)
+            v->ncoef = 32;
+        for (uint32_t i = 0; i < 2 * v->ncoef; ++i)
+            v->coef[i] = (int16_t)rd16(wf + 22 + 2 * i);
+        if (!v->ncoef)
+            memcpy(v->coef, kAdpcmCoef, sizeof kAdpcmCoef), v->ncoef = 7;
+        if (v->samples_per_block < 2)
+            v->fmt = F_NONE;
+    }
+    if (v->fmt == F_NONE || v->channels == 0 || v->channels > 8)
+    {
+        rt_log("[xaudio2] source format %04x, %u bits, %u channels: silent\n", tag, bits, v->channels);
+        v->fmt = F_NONE;
+    }
     v->flags = ARG(3);
     v->callback = ARG(5);
     if (!v->rate)
         v->rate = 48000;
+    set_sends(v, ARG(6));
+    set_effects(v, ARG(7));
+    if (g_log)
+        rt_log("[xaudio2] source %d: format %04x %u Hz %u ch %u bits\n", (int)(v - g_v), tag, v->rate, v->channels, bits);
     wr32(ARG(1), p);
     RET(S_OK, 8);
 }
@@ -343,7 +777,15 @@ static void XA_CreateSubmixVoice(Guest* g)
     uint32_t p = voice_new(V_SUBMIX);
     Voice* v = voice(p);
     if (v)
-        v->channels = ARG(2), v->rate = ARG(3), v->flags = ARG(4);
+    {
+        v->channels = ARG(2) ? ARG(2) : 2, v->rate = ARG(3), v->flags = ARG(4), v->stage = ARG(5);
+        if (v->channels > 8)
+            v->channels = 8;
+        set_sends(v, ARG(6));
+        set_effects(v, ARG(7));
+        if (g_log)
+            rt_log("[xaudio2] submix %d: %u ch, stage %u\n", (int)(v - g_v), v->channels, v->stage);
+    }
     wr32(ARG(1), p);
     RET(p ? S_OK : E_INVALIDARG, 8);
 }
@@ -353,7 +795,13 @@ static void XA_CreateMasteringVoice(Guest* g)
     uint32_t p = voice_new(V_MASTER);
     Voice* v = voice(p);
     if (v)
+    {
         v->channels = ARG(2) ? ARG(2) : 2, v->rate = ARG(3) ? ARG(3) : 48000;
+        if (v->channels > 8)
+            v->channels = 8;
+        set_effects(v, ARG(6));
+        g_master = (int)(v - g_v);
+    }
     wr32(ARG(1), p);
     RET(p ? S_OK : E_INVALIDARG, 7);
 }
@@ -373,12 +821,54 @@ static void V_GetVoiceDetails(Guest* g)
         wr32(ARG(1), v->flags), wr32(ARG(1) + 4, v->channels), wr32(ARG(1) + 8, v->rate);
     RET(0, 2);
 }
-static void V_SetOutputVoices(Guest* g) { RET(S_OK, 2); }
-static void V_SetEffectChain(Guest* g) { RET(S_OK, 2); }
-static void V_EnableEffect(Guest* g) { RET(S_OK, 3); }
-static void V_DisableEffect(Guest* g) { RET(S_OK, 3); }
-static void V_GetEffectState(Guest* g) { if (ARG(2)) wr32(ARG(2), 1); RET(0, 3); }
-static void V_SetEffectParameters(Guest* g) { RET(S_OK, 5); }
+static void V_SetOutputVoices(Guest* g)
+{
+    Voice* v = voice(ARG(0));
+    if (v && v->kind != V_MASTER)
+        set_sends(v, ARG(1));
+    RET(S_OK, 2);
+}
+static void V_SetEffectChain(Guest* g)
+{
+    Voice* v = voice(ARG(0));
+    if (v)
+        set_effects(v, ARG(1));
+    RET(S_OK, 2);
+}
+static void V_EnableEffect(Guest* g)
+{
+    Voice* v = voice(ARG(0));
+    if (v && ARG(1) < (uint32_t)v->nfx)
+        v->fx_on[ARG(1)] = 1;
+    RET(S_OK, 3);
+}
+static void V_DisableEffect(Guest* g)
+{
+    Voice* v = voice(ARG(0));
+    if (v && ARG(1) < (uint32_t)v->nfx)
+        v->fx_on[ARG(1)] = 0;
+    RET(S_OK, 3);
+}
+static void V_GetEffectState(Guest* g)
+{
+    Voice* v = voice(ARG(0));
+    if (ARG(2))
+        wr32(ARG(2), v && ARG(1) < (uint32_t)v->nfx ? (uint32_t)v->fx_on[ARG(1)] : 1);
+    RET(0, 3);
+}
+/* SetEffectParameters(index, params, size, operation set): a reverb's WetDryMix (its first float) */
+static void V_SetEffectParameters(Guest* g)
+{
+    Voice* v = voice(ARG(0));
+    if (v && ARG(1) < (uint32_t)v->nfx && v->fx_reverb[ARG(1)] && ARG(2) && ARG(3) >= 4)
+    {
+        float w;
+        memcpy(&w, GUEST_PTR(ARG(2)), 4);
+        if (w >= 0 && w <= 100)
+            v->fx_wet[ARG(1)] = w;
+    }
+    RET(S_OK, 5);
+}
 static void V_GetEffectParameters(Guest* g) { if (ARG(2) && ARG(3)) memset(GUEST_PTR(ARG(2)), 0, ARG(3)); RET(S_OK, 4); }
 static void V_SetFilterParameters(Guest* g) { RET(S_OK, 3); }
 static void V_GetFilterParameters(Guest* g)
@@ -426,15 +916,47 @@ static void V_GetChannelVolumes(Guest* g)
     }
     RET(0, 3);
 }
-static void V_SetOutputMatrix(Guest* g) { RET(S_OK, 6); }
+/* the send of v to the voice at guest address dest (NULL: its only one) */
+static Send* find_send(Voice* v, uint32_t dest)
+{
+    if (!v)
+        return NULL;
+    if (v->nsends < 0) /* to the master by default: made explicit to hold a matrix */
+    {
+        if (!g_master)
+            return NULL;
+        v->nsends = 1;
+        memset(&v->sends[0], 0, sizeof v->sends[0]);
+        v->sends[0].dst = g_master;
+    }
+    Voice* d = voice(dest);
+    for (int i = 0; i < v->nsends; ++i)
+        if (!dest || (d && v->sends[i].dst == (int)(d - g_v)))
+            return &v->sends[i];
+    return NULL;
+}
+/* SetOutputMatrix(destination, source channels, destination channels, levels, operation set):
+ * levels[source channels * d + s] */
+static void V_SetOutputMatrix(Guest* g)
+{
+    Send* s = find_send(voice(ARG(0)), ARG(1));
+    uint32_t sc = ARG(2), dc = ARG(3);
+    if (s && ARG(4) && sc * dc <= 64)
+    {
+        memcpy(s->m, GUEST_PTR(ARG(4)), 4 * sc * dc);
+        s->sc = sc, s->dc = dc, s->set = 1;
+    }
+    RET(S_OK, 6);
+}
 /* GetOutputMatrix(destination, source channels, destination channels, float*) */
 static void V_GetOutputMatrix(Guest* g)
 {
+    Send* sd = find_send(voice(ARG(0)), ARG(1));
     uint32_t sc = ARG(2), dc = ARG(3), p = ARG(4);
     for (uint32_t d = 0; d < dc; ++d)
         for (uint32_t s = 0; s < sc; ++s)
         {
-            float f = (d == s || sc == 1) ? 1.0f : 0.0f;
+            float f = sd && sd->set && sd->sc == sc && sd->dc == dc ? sd->m[d * sc + s] : default_level(sc, dc, s, d);
             memcpy(GUEST_PTR(p + 4 * (d * sc + s)), &f, 4);
         }
     RET(0, 5);
@@ -495,7 +1017,7 @@ static void SV_GetState(Guest* g)
     uint32_t p = ARG(1);
     wr32(p, v && v->nqueue ? v->queue[0].context : 0);
     wr32(p + 4, v ? v->nqueue : 0);
-    wr64(p + 8, v ? v->played : 0);
+    wr64(p + 8, v ? (uint64_t)v->played : 0);
     RET(0, 2);
 }
 static void SV_SetFrequencyRatio(Guest* g)
@@ -547,6 +1069,9 @@ static int class_hook(uint32_t clsid, uint32_t riid, uint32_t* obj)
     if (!memcmp(c, CLSID_Reverb_A, 16) || !memcmp(c, CLSID_Reverb_B, 16) || !memcmp(c, CLSID_VolumeMeter, 16))
     {
         *obj = voice_new(V_EFFECT);
+        Voice* e = voice(*obj);
+        if (e)
+            e->fxkind = memcmp(c, CLSID_VolumeMeter, 16) ? FX_REVERB : FX_METER;
         return 1;
     }
     return 0;

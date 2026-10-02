@@ -24,3 +24,6 @@ __pycache__/
 
 # Python environment
 .venv/
+
+# Captured game audio (Square Enix content)
+*.wav

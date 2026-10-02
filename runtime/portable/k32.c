@@ -7,10 +7,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "gthread.h"
 #include "gwin.h"
 #include "k32.h"
+#include "kobj.h"
 #include "pe.h"
 #include "plat.h"
 #include "thunk.h"
@@ -311,23 +313,24 @@ static void sh_GetCurrentThread(Guest* g) { RET(0xFFFFFFFEu, 0); }
 static void sh_GetCurrentProcess(Guest* g) { RET(0xFFFFFFFFu, 0); }
 static void sh_GetCurrentProcessId(Guest* g) { RET(0x1000u, 0); }
 
-/* --- critical sections --------------------------------------------------------------------------
+/* --- critical sections ---------------------------------------------------------------------------
  * The CRITICAL_SECTION stays in guest memory with its Win32 layout (+8 RecursionCount,
- * +12 OwningThread). Guest code runs one thread at a time, so taking a free section needs no
- * atomics; a thread that must wait releases the guest lock and sleeps on g_cs_epoch, which every
- * release of a contended section advances. */
+ * +12 OwningThread). Guest threads run in parallel (gthread.c), so the owner is taken with a
+ * compare-and-swap; the recursion count is only touched by the owner. A thread that must wait
+ * spins briefly, then sleeps on g_cs_epoch, which every release of a contended section advances.
+ * These shims run with or without the guest lock. */
 static volatile uint32_t g_cs_epoch, g_cs_waiters;
 
 static int cs_try(uint32_t cs, uint32_t tid)
 {
-    uint32_t owner = rd32(cs + 12);
-    if (!owner)
+    volatile uint32_t* owner = (volatile uint32_t*)GUEST_PTR(cs + 12);
+    uint32_t expect = 0;
+    if (__atomic_compare_exchange_n(owner, &expect, tid, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
     {
-        wr32(cs + 12, tid);
         wr32(cs + 8, 1);
         return 1;
     }
-    if (owner == tid)
+    if (expect == tid)
     {
         wr32(cs + 8, rd32(cs + 8) + 1);
         return 1;
@@ -354,14 +357,27 @@ static void sh_DeleteCriticalSection(Guest* g) { RET(0, 1); }
 static void sh_EnterCriticalSection(Guest* g)
 {
     uint32_t cs = ARG(0), tid = gt_self()->tid;
-    while (!cs_try(cs, tid))
+    for (unsigned spin = 0; !cs_try(cs, tid); ++spin)
     {
-        uint32_t e = g_cs_epoch;
-        g_cs_waiters++;
-        gt_unlock();
-        plat_wait32(&g_cs_epoch, e);
-        gt_lock();
-        g_cs_waiters--;
+        if (spin < 100)
+        {
+#if defined(__aarch64__)
+            __asm__ volatile("yield");
+#endif
+            continue;
+        }
+        uint32_t e = __atomic_load_n(&g_cs_epoch, __ATOMIC_SEQ_CST);
+        __atomic_fetch_add(&g_cs_waiters, 1, __ATOMIC_SEQ_CST);
+        if (!cs_try(cs, tid))
+        {
+            int held = gt_release();
+            plat_wait32(&g_cs_epoch, e);
+            gt_reacquire(held);
+            __atomic_fetch_sub(&g_cs_waiters, 1, __ATOMIC_SEQ_CST);
+            continue;
+        }
+        __atomic_fetch_sub(&g_cs_waiters, 1, __ATOMIC_SEQ_CST);
+        break;
     }
     RET(0, 1);
 }
@@ -376,28 +392,28 @@ static void sh_LeaveCriticalSection(Guest* g)
     else
     {
         wr32(cs + 8, 0);
-        wr32(cs + 12, 0);
-        if (g_cs_waiters)
+        __atomic_store_n((volatile uint32_t*)GUEST_PTR(cs + 12), 0, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&g_cs_waiters, __ATOMIC_SEQ_CST))
         {
-            g_cs_epoch++;
+            __atomic_fetch_add(&g_cs_epoch, 1, __ATOMIC_SEQ_CST);
             plat_wake_all32(&g_cs_epoch);
         }
     }
     RET(0, 1);
 }
 
-/* --- interlocked: guest code holds the guest lock, so plain read-modify-write is atomic ------- */
-static void sh_InterlockedIncrement(Guest* g) { uint32_t v = rd32(ARG(0)) + 1; wr32(ARG(0), v); RET(v, 1); }
-static void sh_InterlockedDecrement(Guest* g) { uint32_t v = rd32(ARG(0)) - 1; wr32(ARG(0), v); RET(v, 1); }
-static void sh_InterlockedExchange(Guest* g) { uint32_t o = rd32(ARG(0)); wr32(ARG(0), ARG(1)); RET(o, 2); }
-static void sh_InterlockedExchangeAdd(Guest* g) { uint32_t o = rd32(ARG(0)); wr32(ARG(0), o + ARG(1)); RET(o, 2); }
+/* --- interlocked: real atomics (guest threads run in parallel) ---------------------------------- */
+#define IPTR(a) ((volatile uint32_t*)GUEST_PTR(a))
+static void sh_InterlockedIncrement(Guest* g) { RET(__atomic_add_fetch(IPTR(ARG(0)), 1, __ATOMIC_SEQ_CST), 1); }
+static void sh_InterlockedDecrement(Guest* g) { RET(__atomic_sub_fetch(IPTR(ARG(0)), 1, __ATOMIC_SEQ_CST), 1); }
+static void sh_InterlockedExchange(Guest* g) { RET(__atomic_exchange_n(IPTR(ARG(0)), ARG(1), __ATOMIC_SEQ_CST), 2); }
+static void sh_InterlockedExchangeAdd(Guest* g) { RET(__atomic_fetch_add(IPTR(ARG(0)), ARG(1), __ATOMIC_SEQ_CST), 2); }
 
 static void sh_InterlockedCompareExchange(Guest* g)
 {
-    uint32_t o = rd32(ARG(0));
-    if (o == ARG(2))
-        wr32(ARG(0), ARG(1));
-    RET(o, 3);
+    uint32_t expect = ARG(2);
+    __atomic_compare_exchange_n(IPTR(ARG(0)), &expect, ARG(1), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    RET(expect, 3); /* the value it held: equal to the comparand when the exchange happened */
 }
 
 /* --- code pages and character types: Windows-1252 ----------------------------------------------
@@ -664,15 +680,75 @@ static void sh_GetSystemTimeAsFileTime(Guest* g)
     RET(0, 1);
 }
 
+/* Sleeps the host lifts: by the address the call returns to (a game's frame limiter, say) */
+static uint32_t g_no_sleep[8];
+static int g_nno_sleep;
+
+void k32_skip_sleep_at(uint32_t ret)
+{
+    if (g_nno_sleep < (int)(sizeof g_no_sleep / sizeof g_no_sleep[0]))
+        g_no_sleep[g_nno_sleep++] = ret;
+}
+
+/* Sleeps the host paces itself: a loop's limiter whose whole-millisecond sleeps would make its
+ * cadence uneven sleeps instead until exactly one period after it last woke there */
+static uint32_t g_paced[4];
+static int g_npaced;
+static uint64_t g_pace_ns, g_paced_woke;
+
+void k32_pace_sleep_at(uint32_t ret, uint64_t period_ns)
+{
+    if (g_npaced < (int)(sizeof g_paced / sizeof g_paced[0]))
+        g_paced[g_npaced++] = ret;
+    g_pace_ns = period_ns;
+}
+
+static int paced_sleep(uint32_t ret)
+{
+    for (int i = 0; i < g_npaced; ++i)
+        if (g_paced[i] == ret)
+        {
+            uint64_t now = rt_monotonic_ns(), until = g_paced_woke + g_pace_ns;
+            int held = gt_release();
+            if (g_paced_woke && until > now && until - now <= g_pace_ns)
+            {
+                struct timespec t = { (time_t)((until - now) / 1000000000u), (long)((until - now) % 1000000000u) };
+                while (nanosleep(&t, &t) != 0)
+                    ;
+            }
+            else
+                plat_yield();
+            g_paced_woke = rt_monotonic_ns();
+            gt_reacquire(held);
+            return 1;
+        }
+    return 0;
+}
+
 static void sh_Sleep(Guest* g)
 {
-    uint32_t ms = ARG(0);
-    gt_unlock();
+    uint32_t ms = ARG(0), ret = rd32(g->esp);
+    /* XIV_PROF=logic: the shim-time profile follows the logic loop's thread (its limiter sleeps here) */
+    static int prof_logic = -1;
+    if (prof_logic < 0)
+        prof_logic = getenv("XIV_PROF") && !strcmp(getenv("XIV_PROF"), "logic");
+    if (prof_logic == 1 && (ret == 0xcc6d4c || ret == 0xcc6d62))
+    {
+        extern uint32_t thunk_prof_thread;
+        thunk_prof_thread = plat_thread_id();
+        prof_logic = 2;
+    }
+    if (paced_sleep(ret))
+        RET(0, 1);
+    for (int i = 0; i < g_nno_sleep; ++i)
+        if (g_no_sleep[i] == ret)
+            ms = 0;
+    int held = gt_release();
     if (ms)
         plat_sleep_ms(ms);
     else
         plat_yield();
-    gt_lock();
+    gt_reacquire(held);
     RET(0, 1);
 }
 
@@ -804,4 +880,85 @@ void k32_init(const char* game_dir, const char* exe_path)
     snprintf(g_game_dir, sizeof g_game_dir, "%s", game_dir);
     snprintf(g_exe_path, sizeof g_exe_path, "%s", exe_path);
     thunk_register(K32);
+}
+
+/* --- imports the translator inlines at their call sites (recomp/x86c.py INLINE_IMPORTS): the hot
+ * ones, called millions of times a second, without the thunk dispatch -------------------------- */
+void xi_cs_enter(uint32_t cs)
+{
+    uint32_t tid = gt_self()->tid;
+    if (cs_try(cs, tid))
+        return;
+    for (unsigned spin = 0; !cs_try(cs, tid); ++spin)
+    {
+        if (spin < 100)
+        {
+#if defined(__aarch64__)
+            __asm__ volatile("yield");
+#endif
+            continue;
+        }
+        uint32_t e = __atomic_load_n(&g_cs_epoch, __ATOMIC_SEQ_CST);
+        __atomic_fetch_add(&g_cs_waiters, 1, __ATOMIC_SEQ_CST);
+        if (!cs_try(cs, tid))
+        {
+            int held = gt_release();
+            plat_wait32(&g_cs_epoch, e);
+            gt_reacquire(held);
+            __atomic_fetch_sub(&g_cs_waiters, 1, __ATOMIC_SEQ_CST);
+            continue;
+        }
+        __atomic_fetch_sub(&g_cs_waiters, 1, __ATOMIC_SEQ_CST);
+        return;
+    }
+}
+
+void xi_cs_leave(uint32_t cs)
+{
+    uint32_t n = rd32(cs + 8);
+    if (n > 1)
+    {
+        wr32(cs + 8, n - 1);
+        return;
+    }
+    wr32(cs + 8, 0);
+    __atomic_store_n((volatile uint32_t*)GUEST_PTR(cs + 12), 0, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&g_cs_waiters, __ATOMIC_SEQ_CST))
+    {
+        __atomic_fetch_add(&g_cs_epoch, 1, __ATOMIC_SEQ_CST);
+        plat_wake_all32(&g_cs_epoch);
+    }
+}
+
+uint32_t xi_tls_get(uint32_t i)
+{
+    if (i >= GT_TLS_SLOTS)
+    {
+        gt_set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    GThread* t = gt_self();
+    wr32(t->teb + 0x34, 0);
+    return t->tls[i];
+}
+
+uint32_t xi_tls_set(uint32_t i, uint32_t v)
+{
+    if (i >= GT_TLS_SLOTS)
+        return 0;
+    gt_self()->tls[i] = v;
+    return 1;
+}
+
+uint32_t xi_get_error(void) { return gt_get_error(); }
+void xi_set_error(uint32_t e) { gt_set_error(e); }
+uint32_t xi_wait1(uint32_t h, uint32_t ms) { return k_wait(&h, 1, 0, ms); }
+uint32_t xi_set_event(uint32_t h, int state) { return (uint32_t)k_event_set(h, state); }
+uint32_t xi_release_semaphore(uint32_t h, uint32_t n, uint32_t prev)
+{
+    int32_t p = 0;
+    int ok = k_semaphore_release(h, (int32_t)n, &p);
+    if (ok && prev)
+        wr32(prev, (uint32_t)p);
+    return (uint32_t)ok;
 }
