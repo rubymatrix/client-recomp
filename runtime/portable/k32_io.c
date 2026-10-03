@@ -356,7 +356,13 @@ static void sh_CreateDirectoryA(Guest* g)
 {
     char host[1400];
     if (!host_of(ARG(0), host, sizeof host))
+    {
+        /* "C:\Users" above the Documents mount: it exists on Windows. ffxivgame's recursive mkdir
+         * (FUN_00d37ed0, used before writing user\<id>\game|ui|mcr*) gives up on any other error */
+        if (ARG(0) && vfs_is_virtual_dir((const char*)GUEST_PTR(ARG(0))))
+            gt_set_error(ERROR_ALREADY_EXISTS);
         RET(0, 2);
+    }
     if (!plat_mkdir(host))
     {
         gt_set_error(plat_error() == PLAT_EXISTS ? ERROR_ALREADY_EXISTS : win32_error(plat_error()));

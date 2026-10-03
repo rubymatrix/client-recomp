@@ -386,6 +386,26 @@ int vfs_host_path(const char* guest, char* host, size_t n)
     return to_utf8(mapped, host, n);
 }
 
+int vfs_is_virtual_dir(const char* guest)
+{
+    char full[1024];
+    if (!vfs_full_path(guest, full, sizeof full))
+        return 0;
+    size_t l = strlen(full);
+    if (l == 3 && full[1] == ':' && full[2] == '\\')
+        return 1; /* a drive root */
+    for (unsigned i = 0; i < g_nmounts; ++i)
+    {
+        const char* m = g_mounts[i].guest;
+        int match = strlen(m) > l && m[l] == '\\';
+        for (size_t k = 0; match && k < l; ++k)
+            match = lower((unsigned char)full[k]) == lower((unsigned char)m[k]);
+        if (match)
+            return 1;
+    }
+    return 0;
+}
+
 const char* vfs_cwd(void)
 {
     return g_cwd;
