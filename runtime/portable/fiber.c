@@ -68,9 +68,16 @@ static Fiber* fiber(uint32_t p)
 
 static Fiber* fiber_new(uint32_t param, uint32_t start)
 {
+    /* DeleteFiber keeps the slot (the game may still read the deleted object), so once every slot
+     * has been used, take one whose fiber was deleted and has stopped. The old guest object stays
+     * readable but no longer resolves (fiber() checks guest == p). Without this the job system's
+     * fiber churn ran the table out after ~40 minutes of play. */
+    for (int pass = 0; pass < 2; ++pass)
     for (uint32_t i = 1; i < MAX_FIBERS; ++i)
-        if (!g_fibers[i])
+        if (!g_fibers[i] || (pass && g_fibers[i]->deleted && !g_fibers[i]->running && !g_fibers[i]->stack))
         {
+            if (g_fibers[i])
+                free(g_fibers[i]);
             Fiber* f = (Fiber*)calloc(1, sizeof *f);
             f->guest = gheap_alloc(16, 1);
             wr32(f->guest, param);
