@@ -645,9 +645,9 @@ static void IDirect3D9_CreateDevice(Guest* g)
     wr32(pp + 4, d->pp[1]);
     wr32(pp + 8, d->pp[2]);
     user32_set_fullscreen(d->hwnd, !d->pp[8]);
-    /* uncapped: the display's sync only when asked for (XIV_VSYNC=1), whatever interval the game set */
+    /* the display's sync on, whatever interval the game set; XIV_VSYNC=0 turns it off */
     const char* vs = getenv("XIV_VSYNC");
-    if (!g9_init(user32_sdl_window(d->hwnd), vs && strcmp(vs, "0") && d->pp[13] != 0x80000000u))
+    if (!g9_init(user32_sdl_window(d->hwnd), !vs || strcmp(vs, "0")))
     {
         rt_log("[d3d9] the Metal back end did not start\n");
         RET(D3DERR_NOTAVAILABLE, 7);

@@ -10,3 +10,8 @@ void dinput_setup(void);
 /* Set by the addon host: sees each XInput read the game makes (pad `user`) and may change it (a
  * button an addon took stays up for the game). */
 extern void (*dinput_xpad_hook)(uint32_t user, XPad* pad);
+
+/* XInputGetState / XInputSetState over the SDL gamepads, for whichever import the game reaches them
+ * through (FFXI's cdecl xinputdll.dll, XIV's stdcall xinput1_3): the Win32 error code. */
+uint32_t dinput_xinput_get_state(uint32_t user, uint32_t state);
+uint32_t dinput_xinput_set_state(uint32_t user, uint32_t vibration);
