@@ -11,14 +11,15 @@
  *   oleaut32, comctl32   the VARIANT/SAFEARRAY calls WMI queries make, and window subclassing.
  *   iphlpapi, winhttp    no adapter table; no HTTP (the client's news and banner fetches fail
  *                        the way they do offline).
- *   xinput1_3            by ordinal: no controller connected (SDL input reaches the game through
- *                        DirectInput, input.c).
+ *   xinput1_3            by ordinal: the SDL gamepads (dinput.c). The game's IsXInputDevice (WMI,
+ *                        ole.c) files each pad as an XInput device and polls it only here.
  *   d3d9 D3DPERF_*       profiling markers: ignored.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "dinput.h"
 #include "gthread.h"
 #include "gwin.h"
 #include "k32.h"
@@ -33,7 +34,6 @@
 #define CRYPT_E_NO_MATCH 0x80092009u
 #define DISP_E_TYPEMISMATCH 0x80020005u
 #define ERROR_NOT_SUPPORTED 50u
-#define ERROR_DEVICE_NOT_CONNECTED 1167u
 #define ERROR_RESOURCE_TYPE_NOT_FOUND 1813u
 
 /* --- crypt32 / wintrust ------------------------------------------------------------------------ */
@@ -279,8 +279,8 @@ static void sh_WinHttpCloseHandle(Guest* g) { RET(1, 1); }
 
 /* --- xinput1_3 (by ordinal), D3DPERF ----------------------------------------------------------- */
 
-static void sh_XInputGetState(Guest* g) { RET(ERROR_DEVICE_NOT_CONNECTED, 2); }
-static void sh_XInputSetState(Guest* g) { RET(ERROR_DEVICE_NOT_CONNECTED, 2); }
+static void sh_XInputGetState(Guest* g) { RET(dinput_xinput_get_state(ARG(0), ARG(1)), 2); }
+static void sh_XInputSetState(Guest* g) { RET(dinput_xinput_set_state(ARG(0), ARG(1)), 2); }
 static void sh_XInputEnable(Guest* g) { RET(0, 1); }
 
 static void sh_D3DPERF_BeginEvent(Guest* g) { RET(0, 2); }

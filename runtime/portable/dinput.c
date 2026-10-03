@@ -656,6 +656,34 @@ static void DD_GetDeviceInfo(Guest* g)
     RET(DI_OK, 2);
 }
 
+/* GetObjectInfo(pdidoi, dwObj, dwHow): DIPH_DEVICE 0 (names no object: DIERR_INVALIDPARAM, as
+ * DirectInput answers; XIV asks that of an XInput pad and ignores the result), BYOFFSET 1 (where
+ * the data format puts it), BYID 2 (DIDFT type | instance << 8) */
+static void DD_GetObjectInfo(Guest* g)
+{
+    Dev* d = dev(ARG(0));
+    uint32_t p = ARG(1), obj = ARG(2), how = ARG(3);
+    if (!d || !p || (how != 1 && how != 2))
+        RET(DIERR_INVALIDPARAM, 4);
+    if (d->kind != D_PAD)
+        RET(DIERR_OBJECTNOTFOUND, 4);
+    static const int srcs[3] = { SRC_AXIS, SRC_POV, SRC_BUTTON };
+    static const int counts[3] = { PAD_AXES, 1, PAD_BUTTONS };
+    static const uint32_t types[3] = { 0x2u, 0x10u, 0x4u };
+    for (int k = 0; k < 3; ++k)
+        for (int i = 0; i < counts[k]; ++i)
+        {
+            uint32_t ofs = object_ofs(d, srcs[k], i);
+            uint32_t id = types[k] | (srcs[k] == SRC_POV ? 0u : (uint32_t)i << 8);
+            if (how == 1 ? obj == ofs : (obj & 0xFFFF1F) == id)
+            {
+                write_object(p, srcs[k], i, ofs);
+                RET(DI_OK, 4);
+            }
+        }
+    RET(DIERR_OBJECTNOTFOUND, 4);
+}
+
 static void DD_Poll(Guest* g)
 {
     Dev* d = dev(ARG(0));
@@ -758,6 +786,7 @@ static const ShimDef DINPUT[] = {
     S("IDirectInputDevice8A", "SetDataFormat", DD_SetDataFormat),
     S("IDirectInputDevice8A", "SetEventNotification", DD_SetEventNotification),
     S("IDirectInputDevice8A", "SetCooperativeLevel", DD_SetCooperativeLevel),
+    S("IDirectInputDevice8A", "GetObjectInfo", DD_GetObjectInfo),
     S("IDirectInputDevice8A", "GetDeviceInfo", DD_GetDeviceInfo),
     S("IDirectInputDevice8A", "Poll", DD_Poll),
     S("IDirectInputDevice8A", "CreateEffect", DD_CreateEffect),
@@ -822,10 +851,9 @@ void (*dinput_xpad_hook)(uint32_t user, XPad* pad);
 static int g_xseen[4] = { -1, -1, -1, -1 }; /* connected at the last poll: -1 never polled */
 static int g_xinput_seen[4];
 
-/* XInputGetState_(dwUserIndex, XINPUT_STATE* pState) */
-static void XI_GetState(Guest* g)
+/* XInputGetState(dwUserIndex, XINPUT_STATE* pState): the error code */
+uint32_t dinput_xinput_get_state(uint32_t user, uint32_t out)
 {
-    uint32_t user = ARG(0), out = ARG(1);
     XPad x;
     int connected = user < 4 && input_xpad((int)user, &x);
     if (user < 4 && connected != g_xseen[user])
@@ -844,7 +872,7 @@ static void XI_GetState(Guest* g)
     {
         if (out)
             memset(GUEST_PTR(out), 0, 16);
-        RETC(ERROR_DEVICE_NOT_CONNECTED);
+        return ERROR_DEVICE_NOT_CONNECTED;
     }
     if (dinput_xpad_hook)
         dinput_xpad_hook(user, &x); /* the addon host: button events, and buttons it keeps from the game */
@@ -860,19 +888,21 @@ static void XI_GetState(Guest* g)
     wr16(out + 10, (uint16_t)x.ly);
     wr16(out + 12, (uint16_t)x.rx);
     wr16(out + 14, (uint16_t)x.ry);
-    RETC(0);
+    return 0;
 }
 
-/* XInputSetState_(dwUserIndex, XINPUT_VIBRATION* {wLeftMotorSpeed, wRightMotorSpeed}) */
-static void XI_SetState(Guest* g)
+/* XInputSetState(dwUserIndex, XINPUT_VIBRATION* {wLeftMotorSpeed, wRightMotorSpeed}) */
+uint32_t dinput_xinput_set_state(uint32_t user, uint32_t v)
 {
-    uint32_t user = ARG(0), v = ARG(1);
     if (user >= 4 || user >= (uint32_t)input_pad_count())
-        RETC(ERROR_DEVICE_NOT_CONNECTED);
+        return ERROR_DEVICE_NOT_CONNECTED;
     if (v)
         input_rumble((int)user, rd16(v), rd16(v + 2));
-    RETC(0);
+    return 0;
 }
+
+static void XI_GetState(Guest* g) { RETC(dinput_xinput_get_state(ARG(0), ARG(1))); }
+static void XI_SetState(Guest* g) { RETC(dinput_xinput_set_state(ARG(0), ARG(1))); }
 
 /* XInputEnable_(BOOL): the wrapper returns 1 */
 static void XI_Enable(Guest* g) { RETC(1); }
