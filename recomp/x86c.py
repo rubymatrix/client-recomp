@@ -26,6 +26,9 @@ R16 = {'ax': 'eax', 'cx': 'ecx', 'dx': 'edx', 'bx': 'ebx', 'sp': 'esp', 'bp': 'e
 R8L = {'al': 'eax', 'cl': 'ecx', 'dl': 'edx', 'bl': 'ebx'}
 R8H = {'ah': 'eax', 'ch': 'ecx', 'dh': 'edx', 'bh': 'ebx'}
 UT = {8: 'uint8_t', 16: 'uint16_t', 32: 'uint32_t', 64: 'uint64_t'}
+# Segment selectors of a 32-bit Windows process (flat model): cs 0x1B, fs 0x3B (TEB), the rest 0x23.
+SEGREGS = ("cs", "ds", "es", "ss", "fs", "gs")
+SEGSEL = {"cs": 0x1B, "fs": 0x3B}
 ST_ = {8: 'int8_t', 16: 'int16_t', 32: 'int32_t', 64: 'int64_t'}
 
 CC = {
@@ -542,6 +545,14 @@ class FunctionTranslator:
 
         pro = self.mem_prologue(ins)
 
+        if mn == 'mov' and any(op.type == X.X86_OP_REG and ins.reg_name(op.reg) in SEGREGS for op in ops):
+            # segment registers in a flat address space (see push/pop sreg below): a read gives the
+            # selector Windows hands a 32-bit process; a load changes nothing. The CRT reads them all
+            # when it fills a CONTEXT (__invoke_watson, 0x9d2194).
+            d, s = ops
+            if d.type == X.X86_OP_REG and ins.reg_name(d.reg) in SEGREGS:
+                return [], True
+            return pro + [self.wr(ins, d, '0x%Xu' % SEGSEL.get(ins.reg_name(s.reg), 0x23))], True
         if mn in ('mov', 'movzx', 'movsx'):
             d, s = ops
             sb, db = self.bits_of(s), self.bits_of(d)
@@ -627,10 +638,10 @@ class FunctionTranslator:
         if mn == 'cwd':
             return ['edx = (edx & 0xFFFF0000u) | ((eax & 0x8000u) ? 0xFFFFu : 0u);'], True
         if mn in ('push', 'pop') and ops and ops[0].type == X.X86_OP_REG and \
-                ins.reg_name(ops[0].reg) in ('cs', 'ds', 'es', 'ss', 'fs', 'gs'):
+                ins.reg_name(ops[0].reg) in SEGREGS:
             # segment registers in a flat address space: the selectors Windows gives a 32-bit
             # process, pushed for show (Miles saves ds/es around its mixer); a pop changes nothing
-            sel = {'cs': 0x1B, 'fs': 0x3B}.get(ins.reg_name(ops[0].reg), 0x23)
+            sel = SEGSEL.get(ins.reg_name(ops[0].reg), 0x23)
             if mn == 'push':
                 return ['esp -= 4; wr32(esp, 0x%Xu);' % sel], True
             return ['esp += 4;'], True

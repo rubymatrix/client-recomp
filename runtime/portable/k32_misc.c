@@ -49,7 +49,26 @@ static void sh_SetEnvironmentVariableA(Guest* g) { RET(1, 2); } /* the guest rea
 static void sh_UnhandledExceptionFilter(Guest* g)
 {
     uint32_t rec = ARG(0) ? rd32(ARG(0)) : 0;
+    uint32_t ctx = ARG(0) ? rd32(ARG(0) + 4) : 0;
     rt_log("[recomp] UnhandledExceptionFilter: code %08x at %08x\n", rec ? rd32(rec) : 0, rec ? rd32(rec + 12) : 0);
+    if (ctx)
+    {
+        /* The CRT's __invoke_watson (0x9d2194; code c000000d = an _invalid_parameter, e.g. an STL
+         * bounds check or a *_s buffer too small) fills CONTEXT with the caller's Esp/Ebp: list the
+         * code addresses on that stack, nearest first, so the failing caller can be found (gsym). */
+        uint32_t esp = rd32(ctx + 0xc4), ebp = rd32(ctx + 0xb4);
+        rt_log("  context eip=%08x esp=%08x ebp=%08x; code addresses on the stack:", rd32(ctx + 0xb8), esp, ebp);
+        for (int i = 0, n = 0; i < 512 && n < 24; ++i)
+        {
+            uint32_t v = rd32(esp + 4u * i);
+            if (v >= 0x00401000u && v < 0x00f3e000u)
+            {
+                rt_log(" %08x", v);
+                ++n;
+            }
+        }
+        rt_log("\n");
+    }
     RET(1, 1); /* EXCEPTION_EXECUTE_HANDLER */
 }
 
