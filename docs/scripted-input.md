@@ -53,6 +53,10 @@ an appended line counts from when it is read (so `+0` means now).
 | `walkto X Z [tol] [timeout_ms] [Y]` | walk to world X,Z (default tol 1.0, timeout 60000; with Y, also within 1.2 of that height); see Navigation |
 | `via X Z [tol] [timeout_ms] [Y]` | a waypoint: like `walkto` (default tol 1.5) but at full speed and the stick stays held for the next one |
 | `walkpath X1 Z1 X2 Z2 ...` | `via` each point, `walkto` the last (what `tools/input/route.py --walkpath` prints) |
+| `path X Z Y [X Z Y ...]` / `path clear` | collect a route (any number of lines) for the next `follow` |
+| `follow [tol] [timeout_ms]` | walk the collected route (pure pursuit; default tol 0.8, timeout 180000); **what `route.py` prints by default** |
+| `navstats` | log `navstats contacts=N stalls=M dist=D time=T` since the last one, and reset |
+| `navset maxmag\|minmag V` | cap / floor the stick magnitude while walking (0.5 walks) |
 | `face X Z` / `turn DEG` | turn toward a point / by DEG (positive = left, the game's rotation sense) |
 | `pos` | `[input] <ms>: pos=x,y,z rot=r` (the client's own player position) |
 | `stop` | end a running `walkto`/`face`/`waitfor`/`target`/`interact` now |
@@ -64,7 +68,7 @@ an appended line counts from when it is read (so `+0` means now).
 | `waitfor in\|out\|any OPCODE [timeout_ms]` | wait for a game packet (hex opcode) since the previous action |
 | `nettrace 0\|1` | log every game packet as `[net] in/out 0xOPCODE src=... len=... <payload>` (not 0xCA/0xCF/0x01/0x02) |
 
-`walkto`, `via`, `face`, `turn`, `waitfor`, `target`, `untarget` and `interact` **block the
+`walkto`, `via`, `follow`, `face`, `turn`, `waitfor`, `target`, `untarget` and `interact` **block the
 timeline**: the lines after them wait, and their times are shifted by however long the blocking
 command took (so `+500 shot x` after a walk is 500 ms after the walk ends). Each one ends by
 itself (done, timeout or stuck) and logs one result line (below); shell loops can wait for it in
@@ -122,34 +126,62 @@ guest memory and steers the scripted left stick.
   each time: `walkto blocked at ... detour right|left`). After 6 detours it gives up with `stuck`.
   `face`/`turn`: `face done|timeout pos=... rot=r want=w`. A light stick push turns the character
   and moves it a little (under ~0.5).
-- **Paths come from the server's navmesh.** `walkto` steers in a straight line. Walls, counters,
-  railings and different floors stop it. For anything that is not in plain view, take the path
-  from the Map Server's Detour navmesh (`Map Server/Navigation/ZoneNavMesh.cs`):
-  `tools/input/route.py X Y Z` asks the running Map Server through the admin API's `/lua`
-  (`TryFindPath` from the player's server position, with no server change). It prints a `via`
-  line per corner, with the corner's height, and a final `walkto`:
+- **Routes: `tools/input/route.py` + `follow`.** `walkto` steers in a straight line, so walls,
+  counters, railings and other floors stop it. For anything not in plain view, use a route from the
+  Map Server's Detour navmesh (`Map Server/Navigation/ZoneNavMesh.cs`, agent radius 0.5).
+  `tools/input/route.py X Y Z [--player NAME]` asks the running Map Server through the admin
+  API's `/lua` (`TryFindPath` from the player's server position, no server change) and prints
+  `path` lines (a point every metre) and a `follow`:
 
   ```bash
-  recomp/tools/input/route.py 57 4 -1205 >> recomp/build/run/input.txt      # Carpenters' Guild -> the Roost
-  recomp/tools/input/route.py 11.85 8.75 -1263.45 >> recomp/build/run/input.txt   # and back
-  recomp/tools/input/route.py 57 4 -1205 --walkpath     # one `walkpath` line instead
+  recomp/tools/input/route.py 58.4 4.2 -1206.5 >> recomp/build/run/input.txt     # guild -> the Roost
+  recomp/tools/input/route.py 11.85 8.75 -1263.45 >> recomp/build/run/input.txt  # and back
+  recomp/tools/input/route.py 58.4 4.2 -1206.5 --via        # the older corner via/walkto lines
   ```
 
+  Before the points are printed, route.py moves them:
+  - away from walls: 16 navmesh rays per point aim for 1.1 m of clearance (`--clearance`), moving
+    a point at most 0.6 (`--push`); the pushes are smoothed along the path;
+  - to 1.4 m (`--npc-clear`) from every NPC and object of the zone and of the merged seamless zone,
+    which the client collides with and the navmesh does not have;
+  - to 1.4 m from the spots in `tools/input/obstacles.json`, which the client collides with but the
+    navmesh lets through. One known spot: the rocks at the foot of the Roost ramp (x ~111-112,
+    z ~-1198). They were found by `follow` stalling there and mapped with a fan of two-point
+    `follow` walks (`path clear` / `path X Z Y X2 Z2 Y` / `follow 0.3 3000` / `pos`).
   Y picks the floor: the Roost's square (y 4) lies under the walkway from the guild (y 10 to 12).
-  The navmesh route goes round by the ramp at x ~111. The heights on `via` stop a waypoint on
-  a switchback from counting as reached from the floor below it.
+
+- **`follow`: pure pursuit.** Every frame it projects the position onto the path near the
+  current segment (preferring the same floor) and aims at a point further along. That point is
+  as far as 2.5 m ahead, but only as far as the straight line to it stays within 0.3 m of the
+  path, so a hairpin or a door frame is not cut. The stick drops to 0.75 or 0.55 where the path
+  bends hard within the next few metres, and to 0.45 while the facing is still more than 50
+  degrees off. Steering is integral on the facing error (as `walkto`) plus feed-forward of the
+  aim point's swing, so corners do not overshoot. A fixed sideways stick walks a circle, because
+  the camera follows the character (measured).
+  - Turning round is not a stall. If the walk makes no progress along the path, or toward the
+    end, for 0.9 s, the client has hit something the route does not know about. It logs
+    `follow stalled at X,Y,Z ... obstacle near X,Z`, moves the path points near that spot 1.1 m
+    or more away from it, backs off for 0.4 s and goes on. After 6 stalls it ends as `stuck`.
+  - Results: `[input] <ms>: follow done|timeout|stuck pos=x,y,z dist=d along=a/total contacts=N
+    stalls=M (T ms)`.
+- **Wall contacts** are counted for `walkto`, `via` and `follow`. A contact is a 250 ms window
+  at under 60% of running speed (~5/s) with the stick at full tilt for the last 500 ms, the
+  facing on target, and no client frame over 80 ms. Seamless zone merges stall the client for a
+  moment and are excluded. Each contact logs `contact at X,Y,Z (v/s of vref)`. `navstats` sums
+  them.
 - Positions to compare against: `meteor_sessions` (server) or `pos`.
 
-```
-+0 via 88.53 -1236.81 1.5 30000 12.30   # a waypoint, with its height
-+0 walkto 58.36 -1206.53 1 30000 4.20   # the last one slows down and stops
-+500 shot roost
-```
+Measured 2026-10-05 (Josh Dev, local Meteor, `navstats` per leg):
 
-Measured 2026-10-05 (Josh Dev, local Meteor): the guild (11.9, -1263) to the Roost (58.4, -1206.5)
-took 34 s over 11 waypoints. The way back took 47 s over 19. The server logged
-`[seamless] Josh Dev: zone 206 -> 155 at (90.1, -1234.9)` and `zone 155 -> 206 at (82.3, -1239.7)`,
-and the client showed each half's NPCs after the switch.
+| route | old corner `via`/`walkto` | `follow` (final) |
+|---|---|---|
+| guild (11.9, -1263) -> Roost (58.4, -1206.5), 197 m | 2-4 contacts, 0-1 stalls, 45 s | 0 contacts, 0 stalls, 43-48 s (x2) |
+| Roost -> guild | **stuck** at the ramp foot: 35 contacts, 66 detours, never arrived | 0 contacts, 0 stalls, 47 s (x2) |
+| inside the guild: entrance -> (-6, -1262.5), 18 m between NPCs and benches | 2 contacts, 2 stalls | 0, 0, 4.3 s |
+| and back | 0, 0 | 0, 0, 6.8 s |
+
+Every guild <-> Roost walk switched zones on the server: `[seamless] Josh Dev: zone 206 -> 155 at
+(~90, -1236)` and `zone 155 -> 206 at (~82.5, -1240)`.
 
 ## Interaction (`target`, `interact`, menus)
 

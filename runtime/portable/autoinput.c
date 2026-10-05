@@ -44,6 +44,9 @@ enum
     A_TARGET,   /* text = actor id, hex ("" = untarget), a = tries, b = key */
     A_INTERACT, /* b = key */
     A_NETTRACE, /* a = 1 on */
+    A_FOLLOW,   /* pts/npts = path (x, z, y), a = tolerance cm, b = timeout ms */
+    A_NAVSTATS, /* log and reset the walk statistics */
+    A_NAVSET,   /* text = name, x = value */
 };
 
 typedef struct Act
@@ -53,14 +56,20 @@ typedef struct Act
     int kind, a, b;
     float x, y;
     char text[256];
+    float* pts; /* A_FOLLOW: owned path, x z y per point */
+    int npts;
 } Act;
+
+/* `path` lines collect points here until a `follow` takes them */
+static float* g_pend;
+static int g_pend_n, g_pend_cap;
 
 static Act* g_acts;
 static size_t g_n, g_cap;
 static uint32_t g_order;
 static uint64_t g_t0, g_last_t; /* g_last_t: the previous line's time, for +ms */
 static FILE* g_file;
-static char g_partial[1024];
+static char g_partial[8192];
 static size_t g_plen;
 static char g_shotdir[512];
 static char g_shot_pending[600];
@@ -299,6 +308,43 @@ static void parse_line(char* line, int appended)
         a->a = SDL_SCANCODE_RETURN, a->b = 0;
         g_last_t = at + 120;
     }
+    /* path X Z Y [X Z Y ...] | path clear: collect a route; follow [tol] [timeout_ms]: walk it */
+    else if (!strcasecmp(cmd, "path") && n >= 3)
+    {
+        if (!strcasecmp(tok[2], "clear"))
+            g_pend_n = 0;
+        for (int i = 2; i + 2 < n; i += 3)
+        {
+            if (g_pend_n == g_pend_cap)
+            {
+                g_pend_cap = g_pend_cap ? g_pend_cap * 2 : 256;
+                g_pend = (float*)realloc(g_pend, (size_t)g_pend_cap * 3 * sizeof(float));
+            }
+            float* q = g_pend + 3 * g_pend_n++;
+            q[0] = strtof(tok[i], NULL), q[1] = strtof(tok[i + 1], NULL), q[2] = strtof(tok[i + 2], NULL);
+        }
+    }
+    else if (!strcasecmp(cmd, "follow"))
+    {
+        if (g_pend_n < 1)
+        {
+            rt_log("[input] line %d: follow without a path\n", g_line);
+            return;
+        }
+        Act* a = add(t, A_FOLLOW);
+        a->pts = g_pend, a->npts = g_pend_n;
+        g_pend = NULL, g_pend_n = g_pend_cap = 0;
+        a->a = (int)(100.0f * (n > 2 ? strtof(tok[2], NULL) : 0.8f));
+        a->b = n > 3 ? (int)strtol(tok[3], NULL, 0) : 180000;
+    }
+    else if (!strcasecmp(cmd, "navset") && n >= 4)
+    {
+        Act* a = add(t, A_NAVSET);
+        snprintf(a->text, sizeof a->text, "%s", tok[2]);
+        a->x = strtof(tok[3], NULL);
+    }
+    else if (!strcasecmp(cmd, "navstats"))
+        add(t, A_NAVSTATS);
     else if (!strcasecmp(cmd, "nettrace") && n >= 3)
         add(t, A_NETTRACE)->a = atoi(tok[2]);
     else if (!strcasecmp(cmd, "navtrace") && n >= 3)
@@ -425,7 +471,7 @@ static int by_time(const void* p, const void* q)
 #define NAV_CHARA_VT 0x00fa7c50u
 #define NAV_PI 3.14159265f
 
-enum { NAV_NONE, NAV_WALK, NAV_FACE, NAV_WAIT, NAV_TARGET, NAV_INTERACT };
+enum { NAV_NONE, NAV_WALK, NAV_FACE, NAV_WAIT, NAV_TARGET, NAV_INTERACT, NAV_FOLLOW };
 static int g_nav_trace; /* `navtrace MS`: log the steering state every MS (0 = off) */
 
 static struct
@@ -519,8 +565,13 @@ static float wrap(float a)
     return a;
 }
 
+/* `navset maxmag|minmag V`: limits on the stick magnitude while walking (walk at 0.5, say) */
+static float g_nav_maxmag = 1.0f, g_nav_minmag = 0.0f;
+
 static void nav_stick(float s, float mag)
 {
+    if (mag > 0)
+        mag = mag > g_nav_maxmag ? g_nav_maxmag : mag < g_nav_minmag ? g_nav_minmag : mag;
     g_nav.s = s;
     g_pad.lx = axis(sinf(s) * mag), g_pad.ly = axis(cosf(s) * mag);
     input_vpad_set(&g_pad);
@@ -562,11 +613,296 @@ static void nav_begin(int mode, uint64_t now)
     }
 }
 
+
+/* --- walk statistics -----------------------------------------------------------------------------
+ * A wall contact shows up as speed lost while the stick is held at full tilt and the character is
+ * not turning (for the last 500 ms), and the client is not stalling: over each 250 ms window, speed under 60% of the running speed (a running average of
+ * such windows, ~5/s) counts as one contact (a run of such windows is one). Logged as `contact at`,
+ * summed in `navstats` and in the end line of walkto/follow. */
+static struct
+{
+    float px, pz, vref, minmag, maxerr, dist;
+    uint64_t t, start, last_call, maxgap;
+    int in_contact, contacts, stucks, have, prev_full;
+} g_mv;
+
+static void mv_reset(void)
+{
+    float v = g_mv.vref;
+    memset(&g_mv, 0, sizeof g_mv);
+    g_mv.vref = v > 3.0f ? v : 5.0f;
+}
+
+static void mv_sample(uint64_t now, float x, float y, float z, float mag, float err)
+{
+    if (g_mv.vref < 3.0f)
+        g_mv.vref = 5.0f;
+    if (!g_mv.have)
+    {
+        g_mv.have = 1, g_mv.px = x, g_mv.pz = z, g_mv.t = now, g_mv.minmag = mag, g_mv.maxerr = err;
+        g_mv.last_call = now, g_mv.maxgap = 0;
+        if (!g_mv.start)
+            g_mv.start = now;
+        return;
+    }
+    if (now - g_mv.last_call > g_mv.maxgap)
+        g_mv.maxgap = now - g_mv.last_call;
+    g_mv.last_call = now;
+    g_mv.minmag = mag < g_mv.minmag ? mag : g_mv.minmag;
+    g_mv.maxerr = err > g_mv.maxerr ? err : g_mv.maxerr;
+    if (now - g_mv.t < 250)
+        return;
+    float d = hypotf(x - g_mv.px, z - g_mv.pz), v = d * 1000.0f / (float)(now - g_mv.t);
+    g_mv.dist += d;
+    /* a frame over 80 ms in the window is the client stalling (a zone merge spawns dozens of
+     * actors at once), not a wall */
+    int full = g_mv.minmag >= 0.95f && g_mv.maxerr < 0.35f && g_mv.maxgap <= 80;
+    if (full && v > 3.0f && v < 7.0f) /* running speed: a slow average of clean full-stick windows */
+        g_mv.vref += 0.1f * (v - g_mv.vref);
+    /* and the window before was at full stick too: speed lags the stick by a few hundred ms
+     * (starting off, after slowing for a corner) */
+    int slow = full && g_mv.prev_full && v < 0.6f * g_mv.vref;
+    g_mv.prev_full = full;
+    if (slow && !g_mv.in_contact)
+    {
+        g_mv.contacts++;
+        rt_log("[input] %llu ms: contact at %.2f,%.2f,%.2f (%.1f/s of %.1f)\n", (unsigned long long)now, x, y, z, v, g_mv.vref);
+    }
+    g_mv.in_contact = slow;
+    g_mv.px = x, g_mv.pz = z, g_mv.t = now, g_mv.minmag = 2, g_mv.maxerr = 0, g_mv.maxgap = 0;
+}
+
+/* --- follow: pure pursuit along a dense path ------------------------------------------------------
+ * The path is the navmesh polyline (tools/input/route.py: a point every metre, pushed away from
+ * walls). Each frame: find the closest point on the path near the current segment, aim at a point
+ * further along it (as far as the straight line there stays on the path, see below), and slow
+ * down where the path bends within the next few metres, so corners are taken on the path instead
+ * of cut. No progress along the path for 0.9 s
+ * is a stall (the client's collision has something the navmesh has not): the path is bent round
+ * the spot ahead, the walk backs off for 0.4 s and goes on; 6 stalls end it as `stuck`. */
+#define FOLLOW_LOOKAHEAD 2.5f
+#define FOLLOW_CHORD 0.3f
+#define FOLLOW_AVOID 1.1f
+static struct
+{
+    float* p; /* x z y */
+    float* cum; /* arc length at each point */
+    int n, k;
+    float along, best_along, best_dend, tol;
+    uint64_t start, deadline, progress_t, backoff_until, hug_until;
+    int stalls;
+    float prev_r, prev_h, last_err;
+    uint64_t settled_since;
+    int have_cam;
+} g_fol;
+
+/* Steering for follow. The stick is camera-relative and the camera swings round behind the
+ * character as it runs, so the stick angle for a heading drifts: holding a fixed sideways stick
+ * walks a circle (measured). So the stick angle is closed-loop on the facing error (integral,
+ * as nav_steer), plus feed-forward of the heading change: when the aim point swings by dh, the
+ * stick swings by -dh in the same frame (the facing the stick asks for is camera - stick), so a
+ * corner gets its turn at once instead of after the integrator has caught up and overshot. */
+static void fol_steer(uint64_t now, float r, float h, float dt, float mag)
+{
+    (void)now;
+    if (!g_fol.have_cam)
+    {
+        g_fol.have_cam = 1;
+        g_nav.s = wrap(g_nav.c - h);
+    }
+    else
+    {
+        float step = wrap(r - h) * dt * 3.0f, lim = dt * 3.0f;
+        g_nav.s = wrap(g_nav.s - wrap(h - g_fol.prev_h) + (step > lim ? lim : step < -lim ? -lim : step));
+    }
+    g_fol.prev_h = h;
+    nav_stick(g_nav.s, mag);
+}
+
+static void fol_point(float s, float* x, float* z)
+{
+    int n = g_fol.n;
+    if (s <= 0)
+    {
+        *x = g_fol.p[0], *z = g_fol.p[1];
+        return;
+    }
+    int i0 = g_fol.k > 0 ? g_fol.k - 1 : 0;
+    if (s < g_fol.cum[i0])
+        i0 = 0;
+    for (int i = i0; i + 1 < n; ++i)
+        if (g_fol.cum[i + 1] >= s)
+        {
+            float len = g_fol.cum[i + 1] - g_fol.cum[i], t = len > 0 ? (s - g_fol.cum[i]) / len : 0;
+            *x = g_fol.p[3 * i] + t * (g_fol.p[3 * i + 3] - g_fol.p[3 * i]);
+            *z = g_fol.p[3 * i + 1] + t * (g_fol.p[3 * i + 4] - g_fol.p[3 * i + 1]);
+            return;
+        }
+    *x = g_fol.p[3 * (n - 1)], *z = g_fol.p[3 * (n - 1) + 1];
+}
+
+/* closest point on segments [k0, k1) to (x, z): sets k, returns arc length, *off = distance */
+static float fol_project(float x, float y, float z, int k0, int k1, float* off)
+{
+    float best = 1e30f, bs = 0;
+    int bk = g_fol.k;
+    for (int i = k0; i < k1 && i + 1 < g_fol.n; ++i)
+    {
+        const float *a = g_fol.p + 3 * i, *b = a + 3;
+        float ex = b[0] - a[0], ez = b[1] - a[1], l2 = ex * ex + ez * ez;
+        float t = l2 > 0 ? ((x - a[0]) * ex + (z - a[1]) * ez) / l2 : 0;
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        float qx = a[0] + t * ex, qz = a[1] + t * ez, qy = a[2] + t * (b[2] - a[2]);
+        float d = hypotf(x - qx, z - qz) + 0.5f * fabsf(y - qy); /* prefer the floor we are on */
+        if (d < best)
+            best = d, bk = i, bs = g_fol.cum[i] + t * sqrtf(l2);
+    }
+    g_fol.k = bk;
+    *off = best;
+    return bs;
+}
+
+static void fol_begin(Act* a, uint64_t now, float x, float y, float z)
+{
+    free(g_fol.p), free(g_fol.cum);
+    memset(&g_fol, 0, sizeof g_fol);
+    g_fol.p = a->pts, g_fol.n = a->npts;
+    a->pts = NULL;
+    g_fol.cum = (float*)calloc((size_t)g_fol.n, sizeof(float));
+    for (int i = 1; i < g_fol.n; ++i)
+        g_fol.cum[i] = g_fol.cum[i - 1] + hypotf(g_fol.p[3 * i] - g_fol.p[3 * i - 3], g_fol.p[3 * i + 1] - g_fol.p[3 * i - 2]);
+    g_fol.tol = a->a / 100.0f;
+    g_fol.prev_r = g_nav.last_r, g_fol.settled_since = now;
+    g_fol.best_dend = 1e30f;
+    g_fol.start = g_fol.progress_t = now;
+    g_fol.deadline = now + (uint64_t)a->b;
+    float off;
+    g_fol.along = g_fol.best_along = fol_project(x, y, z, 0, g_fol.n, &off);
+    rt_log("[input] %llu ms: follow %d points, %.1f long, from %.2f,%.2f,%.2f (%.2f off the path)\n", (unsigned long long)now,
+        g_fol.n, g_fol.cum[g_fol.n - 1], x, y, z, off);
+}
+
+static int follow_tick(uint64_t now, float x, float y, float z, float r, float dt)
+{
+    int n = g_fol.n;
+    float total = g_fol.cum[n - 1], off;
+    float along = fol_project(x, y, z, g_fol.k > 2 ? g_fol.k - 2 : 0, g_fol.k + 10, &off);
+    if (off > 4.0f) /* knocked off the path: find it again */
+        along = fol_project(x, y, z, 0, n, &off);
+    g_fol.along = along;
+    float ex = g_fol.p[3 * (n - 1)] - x, ez = g_fol.p[3 * (n - 1) + 1] - z, dend = hypotf(ex, ez);
+    const char* end = dend <= g_fol.tol && total - along < g_fol.tol + 1.0f ? "done" : now > g_fol.deadline ? "timeout" : NULL;
+    if (!end && (along > g_fol.best_along + 0.3f || dend < g_fol.best_dend - 0.3f))
+        g_fol.best_along = fmaxf(along, g_fol.best_along), g_fol.best_dend = fminf(dend, g_fol.best_dend),
+        g_fol.progress_t = now;
+    if (g_fol.last_err > 1.0f) /* turning round (at the start, in a hairpin) is not a stall */
+        g_fol.progress_t = now;
+    if (!end && now - g_fol.progress_t > 900 && now >= g_fol.backoff_until)
+    {
+        g_mv.stucks++;
+        if (++g_fol.stalls > 6)
+            end = "stuck";
+        else
+        {
+            /* something the navmesh does not have (a rock edge, a post): it is just ahead, where we
+             * are facing. Move the path out of its way (points within FOLLOW_AVOID of it, out to
+             * that distance; more each time we stall here), back off, and go on. */
+            float ox = x + 0.9f * sinf(r), oz = z + 0.9f * cosf(r);
+            float rad = FOLLOW_AVOID + 0.3f * (float)(g_fol.stalls - 1);
+            int moved = 0;
+            for (int i = 1; i + 1 < n; ++i)
+            {
+                float* q = g_fol.p + 3 * i;
+                float dx = q[0] - ox, dz = q[1] - oz, d = hypotf(dx, dz);
+                if (d >= rad || fabsf(q[2] - y) > 2.0f)
+                    continue;
+                if (d < 0.05f) /* on it: go round the side away from where we came from */
+                    dx = cosf(r), dz = -sinf(r), d = 1;
+                q[0] = ox + dx / d * rad, q[1] = oz + dz / d * rad;
+                moved++;
+            }
+            for (int i = 1; i < n; ++i)
+                g_fol.cum[i] = g_fol.cum[i - 1] + hypotf(g_fol.p[3 * i] - g_fol.p[3 * i - 3], g_fol.p[3 * i + 1] - g_fol.p[3 * i - 2]);
+            total = g_fol.cum[n - 1];
+            g_fol.best_along = fol_project(x, y, z, 0, n, &off);
+            g_fol.backoff_until = now + 400;
+            g_fol.progress_t = now + 400;
+            rt_log("[input] %llu ms: follow stalled at %.2f,%.2f,%.2f (%.1f of %.1f): obstacle near %.2f,%.2f, %d points moved "
+                   "%.1f clear; back off\n",
+                (unsigned long long)now, x, y, z, along, total, ox, oz, moved, rad);
+        }
+    }
+    if (end)
+    {
+        nav_stick(0, 0);
+        rt_log("[input] %llu ms: follow %s pos=%.2f,%.2f,%.2f dist=%.2f along=%.1f/%.1f contacts=%d stalls=%d (%llu ms)\n",
+            (unsigned long long)now, end, x, y, z, dend, along, total, g_mv.contacts, g_fol.stalls,
+            (unsigned long long)(now - g_fol.start));
+        return 1;
+    }
+    if (now < g_fol.backoff_until)
+    {
+        /* step back toward the path behind us */
+        float bx, bz;
+        fol_point(along - 2.0f, &bx, &bz);
+        float h = hypotf(bx - x, bz - z) > 0.3f ? atan2f(bx - x, bz - z) : wrap(r + NAV_PI);
+        fol_steer(now, r, h, dt, 0.6f);
+        return 0;
+    }
+    /* the longest lookahead (up to FOLLOW_LOOKAHEAD) whose straight line from here stays within
+     * FOLLOW_CHORD of the path: on a straight it looks far and runs smooth, in a hairpin it shrinks
+     * to the next half metre, so the inside of the bend (a railing, a door frame) is not cut */
+    float look = now < g_fol.hug_until ? 1.0f : FOLLOW_LOOKAHEAD;
+    float lx, lz, fx, fz;
+    for (;; look -= 0.25f)
+    {
+        fol_point(along + look, &lx, &lz);
+        if (look <= 0.5f)
+            break;
+        float cx = lx - x, cz = lz - z, c2 = cx * cx + cz * cz, worst = 0;
+        for (float t = 0.25f; t < look; t += 0.25f)
+        {
+            float qx, qz;
+            fol_point(along + t, &qx, &qz);
+            float u = c2 > 0 ? ((qx - x) * cx + (qz - z) * cz) / c2 : 0;
+            u = u < 0 ? 0 : u > 1 ? 1 : u;
+            float dd = hypotf(qx - (x + u * cx), qz - (z + u * cz));
+            worst = dd > worst ? dd : worst;
+        }
+        if (worst <= FOLLOW_CHORD)
+            break;
+    }
+    fol_point(along + look + 2.5f, &fx, &fz);
+    float h = atan2f(lx - x, lz - z);
+    /* the bend ahead: between where we aim now and where the path goes after it */
+    float bend = (hypotf(fx - lx, fz - lz) > 0.2f) ? fabsf(wrap(atan2f(fx - lx, fz - lz) - h)) : 0;
+    float err = fabsf(wrap(r - h));
+    g_fol.last_err = err;
+    float mag = bend > 1.2f ? 0.55f : bend > 0.7f ? 0.75f : 1.0f;
+    if (look < 1.25f) /* a tight bend right here */
+        mag = fminf(mag, 0.5f);
+    if (err > 0.9f)
+        mag = mag < 0.45f ? mag : 0.45f;
+    float left = total - along;
+    if (left < 3.0f)
+        mag = fminf(mag, 0.45f + 0.55f * left / 3.0f);
+    fol_steer(now, r, h, dt, mag);
+    mv_sample(now, x, y, z, mag, err);
+    static uint64_t trace_t;
+    if (g_nav_trace && now - trace_t >= (uint64_t)g_nav_trace)
+    {
+        trace_t = now;
+        rt_log("[input] %llu ms: fol pos=%.2f,%.2f along=%.1f/%.1f off=%.2f k=%d r=%.3f h=%.3f look=%.2f bend=%.2f mag=%.2f\n",
+            (unsigned long long)now, x, z, along, total, off, g_fol.k, r, h, look, bend, mag);
+    }
+    return 0;
+}
+
 /* One frame of a running walkto/face/turn. Returns 1 when it has finished. */
 static int nav_tick(uint64_t now)
 {
     float x, y, z, r;
-    const char* what = g_nav.mode == NAV_WALK ? "walkto" : "face";
+    const char* what = g_nav.mode == NAV_WALK ? "walkto" : g_nav.mode == NAV_FOLLOW ? "follow" : "face";
     if (!my_pos(&x, &y, &z, &r))
     {
         if (now - g_nav.start < 3000) /* zoning: the element may come back */
@@ -585,6 +921,8 @@ static int nav_tick(uint64_t now)
     }
     g_nav.last_r = r;
 
+    if (g_nav.mode == NAV_FOLLOW)
+        return follow_tick(now, x, y, z, r, dt);
     if (g_nav.mode == NAV_FACE)
     {
         float err = wrap(r - g_nav.heading);
@@ -616,6 +954,7 @@ static int nav_tick(uint64_t now)
             g_nav.detour_until = now + 900 + 300 * (uint64_t)g_nav.detours;
             g_nav.progress_t = now;
             g_nav.detours++;
+            g_mv.stucks++;
             rt_log("[input] %llu ms: walkto blocked at %.2f,%.2f,%.2f (%.2f to go): detour %s\n", (unsigned long long)now,
                 x, y, z, d, g_nav.detour_side > 0 ? "right" : "left");
         }
@@ -641,6 +980,8 @@ static int nav_tick(uint64_t now)
     if (err > 1.2f) /* still turning: don't run a wide arc */
         mag = mag < 0.5f ? mag : 0.5f;
     nav_steer(r, h, dt, mag);
+    if (now >= g_nav.detour_until)
+        mv_sample(now, x, y, z, mag, err);
     static uint64_t trace_t;
     if (g_nav_trace && now - trace_t >= (uint64_t)g_nav_trace)
     {
@@ -767,7 +1108,7 @@ static uint32_t rd_u32(const uint8_t* p)
 /* One frame of waitfor / target / interact; 1 when finished */
 static int busy_tick(uint64_t now)
 {
-    if (g_nav.mode == NAV_WALK || g_nav.mode == NAV_FACE)
+    if (g_nav.mode == NAV_WALK || g_nav.mode == NAV_FACE || g_nav.mode == NAV_FOLLOW)
         return nav_tick(now);
     static uint64_t down_since;
     static int down_key;
@@ -919,7 +1260,7 @@ const char* autoinput_frame(void)
             }
         if (stop)
         {
-            if (g_nav.mode == NAV_WALK || g_nav.mode == NAV_FACE)
+            if (g_nav.mode == NAV_WALK || g_nav.mode == NAV_FACE || g_nav.mode == NAV_FOLLOW)
                 nav_stick(0, 0);
             rt_log("[input] %llu ms: stopped\n", (unsigned long long)now);
         }
@@ -942,6 +1283,32 @@ const char* autoinput_frame(void)
             g_act_seq = g_net_seq;
         switch (a->kind)
         {
+        case A_FOLLOW:
+        {
+            float x, y, z, r;
+            if (!my_pos(&x, &y, &z, &r))
+            {
+                rt_log("[input] %llu ms: follow: no local player element (not in world?)\n", (unsigned long long)now);
+                free(a->pts), a->pts = NULL;
+                break;
+            }
+            nav_begin(NAV_FOLLOW, now);
+            fol_begin(a, now, x, y, z);
+            break;
+        }
+        case A_NAVSET:
+            if (!strcasecmp(a->text, "maxmag"))
+                g_nav_maxmag = a->x;
+            else if (!strcasecmp(a->text, "minmag"))
+                g_nav_minmag = a->x;
+            else
+                rt_log("[input] navset: unknown %s\n", a->text);
+            break;
+        case A_NAVSTATS:
+            rt_log("[input] %llu ms: navstats contacts=%d stalls=%d dist=%.1f time=%llu ms\n", (unsigned long long)now,
+                g_mv.contacts, g_mv.stucks, g_mv.dist, (unsigned long long)(g_mv.start ? now - g_mv.start : 0));
+            mv_reset();
+            break;
         case A_WALKTO:
         case A_FACE:
         case A_TURN:
