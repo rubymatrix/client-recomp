@@ -6,7 +6,8 @@
 22000 key Return            # Start
 +2500 key Left              # the dialog opens on No: move to Yes
 +700  shot 02_dialog
-+300  key Return            # Yes
++300  click 0.4695 0.7298    # Yes (a click: the keys do not reach this dialog unless the
+                            # window has been focused, e.g. when another app is in front)
 +20000 shot 03_charaselect
 +500  key Return            # the first character (highlighted on entry): straight to loading
 +40000 shot 04_world        # zoned in by now (check with ./xivctl wait)

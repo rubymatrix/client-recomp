@@ -699,6 +699,11 @@ static void pump(void)
             if (!w)
                 break;
             int on = e.type == SDL_EVENT_WINDOW_FOCUS_GAINED;
+            /* a scripted run (autoinput.c) plays into the game while another app is in front: the
+             * game drops keyboard and pad input when it is not the active window, so it never
+             * hears that it lost focus */
+            if (!on && getenv("XIV_INPUT_SCRIPT") && *getenv("XIV_INPUT_SCRIPT"))
+                break;
             post(w->tid, w->hwnd, WM_ACTIVATEAPP, (uint32_t)on, 0);
             post(w->tid, w->hwnd, WM_ACTIVATE, on ? 1u : 0u, 0);
             post(w->tid, w->hwnd, on ? WM_SETFOCUS : WM_KILLFOCUS, 0, 0);

@@ -12,11 +12,13 @@
  * `echo "+0 stick l 0 1 3000" >> script` walks forward for 3 s now). '#' starts a comment. */
 #include <SDL3/SDL.h>
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
+#include "gwin.h"
 #include "input.h"
 #include "runtime.h"
 #include "user32.h"
@@ -32,6 +34,16 @@ enum
     A_SHOT,   /* text = path */
     A_LOG,    /* text */
     A_QUIT,
+    A_WALKTO, /* x y = target X Z, a = tolerance cm, b = timeout ms, text "via": no slowing down */
+    A_FACE,   /* x y = point X Z */
+    A_TURN,   /* x = degrees */
+    A_POS,    /* log position */
+    A_STOP,   /* end a running walkto/face/turn now */
+    A_TRACE,  /* a = ms between steering log lines, 0 = off */
+    A_WAITFOR,  /* a = 0 in / 1 out / 2 either, b = opcode, x = timeout ms */
+    A_TARGET,   /* text = actor id, hex ("" = untarget), a = tries, b = key */
+    A_INTERACT, /* b = key */
+    A_NETTRACE, /* a = 1 on */
 };
 
 typedef struct Act
@@ -110,9 +122,9 @@ static void parse_line(char* line, int appended)
     char* hash = strchr(line, '#');
     if (hash)
         *hash = 0;
-    char* tok[8];
+    char* tok[160];
     int n = 0;
-    for (char* p = strtok(line, " \t\r\n"); p && n < 8; p = strtok(NULL, " \t\r\n"))
+    for (char* p = strtok(line, " \t\r\n"); p && n < 160; p = strtok(NULL, " \t\r\n"))
         tok[n++] = p;
     if (n < 2)
         return;
@@ -206,6 +218,91 @@ static void parse_line(char* line, int appended)
             a->a = b, a->b = 0;
         }
     }
+    /* walkto X Z [tolerance] [timeout_ms] | face X Z | turn DEG | pos: navigation (nav.* below) */
+    else if ((!strcasecmp(cmd, "walkto") || !strcasecmp(cmd, "via")) && n >= 4)
+    {
+        Act* a = add(t, A_WALKTO);
+        int via = !strcasecmp(cmd, "via");
+        if (via)
+            snprintf(a->text, sizeof a->text, "via");
+        a->x = strtof(tok[2], NULL), a->y = strtof(tok[3], NULL);
+        a->a = (int)(100.0f * (n > 4 ? strtof(tok[4], NULL) : via ? 1.5f : 1.0f));
+        a->b = n > 5 ? (int)strtol(tok[5], NULL, 0) : 60000;
+        /* [Y]: also require the height (within 1.2) - a waypoint on a ramp or a floor above */
+        snprintf(a->text + 4, sizeof a->text - 4, "%s", n > 6 ? tok[6] : "");
+    }
+    /* walkpath X1 Z1 X2 Z2 ...: `via` each point but the last, `walkto` the last */
+    else if (!strcasecmp(cmd, "walkpath") && n >= 4)
+    {
+        for (int i = 2; i + 1 < n; i += 2)
+        {
+            Act* a = add(t, A_WALKTO);
+            int last = i + 3 >= n;
+            if (!last)
+                snprintf(a->text, sizeof a->text, "via");
+            a->x = strtof(tok[i], NULL), a->y = strtof(tok[i + 1], NULL);
+            a->a = last ? 100 : 150;
+            a->b = 30000;
+        }
+    }
+    else if (!strcasecmp(cmd, "face") && n >= 4)
+    {
+        Act* a = add(t, A_FACE);
+        a->x = strtof(tok[2], NULL), a->y = strtof(tok[3], NULL);
+    }
+    else if (!strcasecmp(cmd, "turn") && n >= 3)
+        add(t, A_TURN)->x = strtof(tok[2], NULL);
+    else if (!strcasecmp(cmd, "pos"))
+        add(t, A_POS);
+    else if (!strcasecmp(cmd, "stop"))
+        add(t, A_STOP);
+    /* waitfor in|out|any OPCODE [timeout_ms]: wait for a game packet (seen since the previous action) */
+    else if (!strcasecmp(cmd, "waitfor") && n >= 4)
+    {
+        Act* a = add(t, A_WAITFOR);
+        a->a = !strcasecmp(tok[2], "in") ? 0 : !strcasecmp(tok[2], "out") ? 1 : 2;
+        a->b = (int)strtol(tok[3], NULL, 16);
+        a->x = n > 4 ? strtof(tok[4], NULL) : 10000.0f;
+    }
+    /* target ID [tries] [key] | untarget [key] */
+    else if (!strcasecmp(cmd, "target") && n >= 3)
+    {
+        Act* a = add(t, A_TARGET);
+        snprintf(a->text, sizeof a->text, "%s", tok[2]);
+        a->a = n > 3 ? atoi(tok[3]) : 20;
+        a->b = n > 4 ? scancode_of(tok[4]) : SDL_SCANCODE_TAB;
+    }
+    else if (!strcasecmp(cmd, "untarget"))
+    {
+        Act* a = add(t, A_TARGET);
+        a->a = 1;
+        a->b = n > 2 ? scancode_of(tok[2]) : SDL_SCANCODE_ESCAPE;
+    }
+    /* interact [key]: confirm on the current target, wait for the client's EventStart (0x012D) */
+    else if (!strcasecmp(cmd, "interact"))
+        add(t, A_INTERACT)->b = n > 2 ? scancode_of(tok[2]) : SDL_SCANCODE_RETURN;
+    /* choose N: menu item N (1 = the first): Down N-1 times, then Return */
+    else if (!strcasecmp(cmd, "choose") && n >= 3)
+    {
+        int k = atoi(tok[2]);
+        uint64_t at = t;
+        for (int i = 1; i < k; ++i, at += 250)
+        {
+            Act* a = add(at, A_KEY);
+            a->a = SDL_SCANCODE_DOWN, a->b = 1;
+            a = add(at + 100, A_KEY);
+            a->a = SDL_SCANCODE_DOWN, a->b = 0;
+        }
+        Act* a = add(at, A_KEY);
+        a->a = SDL_SCANCODE_RETURN, a->b = 1;
+        a = add(at + 120, A_KEY);
+        a->a = SDL_SCANCODE_RETURN, a->b = 0;
+        g_last_t = at + 120;
+    }
+    else if (!strcasecmp(cmd, "nettrace") && n >= 3)
+        add(t, A_NETTRACE)->a = atoi(tok[2]);
+    else if (!strcasecmp(cmd, "navtrace") && n >= 3)
+        add(t, A_TRACE)->a = atoi(tok[2]);
     else if (!strcasecmp(cmd, "shot") && n >= 3)
     {
         Act* a = add(t, A_SHOT);
@@ -303,6 +400,456 @@ static int by_time(const void* p, const void* q)
     return a->t != b->t ? (a->t < b->t ? -1 : 1) : (a->order < b->order ? -1 : a->order > b->order);
 }
 
+
+/* --- navigation ---------------------------------------------------------------------------------
+ * walkto/face/turn steer the scripted left stick in a closed loop on the local player's position
+ * and facing, read from guest memory each frame (docs/scripted-input.md; facts below
+ * established with lldb on the live client, 2026-10-05):
+ *
+ *   [0x01356e10]                 actor manager (the object CharaElement+0x7c points at)
+ *   mgr+0x1783c                  my player's actor id (FUN_004d7490)
+ *   mgr+0x4ac+0x38 = mgr+0x4e4   std::map<u32 actorId, CharaElement*> (FUN_004d9970 -> FUN_004de190);
+ *                                its head node at mgr+0x4e8. Node: left +0, parent +4, right +8,
+ *                                key +0xc, value +0x10, isnil byte +0x15.
+ *   CharaElement (vtable 0x00fa7c50): +0x88 actor id, +0x9c x, +0xa0 y, +0xa4 z (the position the
+ *                                client reports in 0x00CA), +0xac rotation (radians; 0 faces +Z,
+ *                                +pi/2 faces +X: direction = (sin r, cos r) in (x, z)).
+ *
+ * The left stick is camera-relative and mirrored against the rotation: holding the stick at angle
+ * s (0 = up, +pi/2 = right) turns the character to r = c - s, where c is the camera's heading.
+ * The camera is not read; c is estimated as r + s whenever the facing has settled while the
+ * stick is held, so the camera following the player (or being turned) is tracked as it goes. */
+#define NAV_MGR_GLOBAL 0x01356e10u
+#define NAV_MGR_MYID 0x1783cu
+#define NAV_MGR_MAPHEAD 0x4e8u
+#define NAV_CHARA_VT 0x00fa7c50u
+#define NAV_PI 3.14159265f
+
+enum { NAV_NONE, NAV_WALK, NAV_FACE, NAV_WAIT, NAV_TARGET, NAV_INTERACT };
+static int g_nav_trace; /* `navtrace MS`: log the steering state every MS (0 = off) */
+
+static struct
+{
+    int mode;
+    float tx, tz, tol, heading; /* heading: NAV_FACE target rotation */
+    uint64_t start, deadline, progress_t, detour_until, last_tick;
+    int steering;
+    float best;
+    int detours, detour_side;
+    float s;         /* stick angle held now */
+    float c;         /* camera heading estimate */
+    int have_c;
+    float last_r;
+    uint64_t last_c_t;
+    uint32_t order_limit; /* actions queued before the nav started are shifted by its duration */
+    /* waitfor / target / interact */
+    int dir, key, tries, untarget, via, has_y;
+    float ty;
+    uint16_t op;
+    uint32_t since, want_id;
+    uint64_t pressed;
+} g_nav;
+static uint32_t g_win;
+static int g_nav_held; /* a `via` ended with the stick still held: released unless a walk follows */
+
+static int nav_rd32(uint32_t va, uint32_t* out)
+{
+#if defined(RT_GUEST_WINDOW)
+    if (va < 0x10000u || !gwin_is_committed(va) || !gwin_is_committed(va + 3))
+        return 0;
+#else
+    if (va < 0x10000u)
+        return 0;
+#endif
+    memcpy(out, GUEST_PTR(va), 4);
+    return 1;
+}
+
+static int nav_rdf(uint32_t va, float* out)
+{
+    uint32_t v;
+    if (!nav_rd32(va, &v))
+        return 0;
+    memcpy(out, &v, 4);
+    return isfinite(*out);
+}
+
+/* The CharaElement of an actor id (my player for id 0), or 0 */
+static uint32_t element_of(uint32_t id)
+{
+    uint32_t mgr, my, head, node, v;
+    if (!nav_rd32(NAV_MGR_GLOBAL, &mgr) || !nav_rd32(mgr + NAV_MGR_MYID, &my) || !nav_rd32(mgr + NAV_MGR_MAPHEAD, &head) ||
+        !nav_rd32(head + 4, &node))
+        return 0;
+    if (!id)
+        id = my;
+    for (int i = 0; i < 64 && node && node != head; ++i)
+    {
+        uint32_t key;
+        if (!nav_rd32(node + 0x14, &v) || (v >> 8 & 0xff) || !nav_rd32(node + 0xc, &key)) /* isnil (+0x15) */
+            return 0;
+        if (key == id)
+        {
+            uint32_t el, vt, eid;
+            if (nav_rd32(node + 0x10, &el) && nav_rd32(el, &vt) && vt == NAV_CHARA_VT && nav_rd32(el + 0x88, &eid) &&
+                eid == id)
+                return el;
+            return 0;
+        }
+        if (!nav_rd32(node + (id < key ? 0 : 8), &node))
+            return 0;
+    }
+    return 0;
+}
+
+static uint32_t my_element(void) { return element_of(0); }
+
+static int my_pos(float* x, float* y, float* z, float* r)
+{
+    uint32_t el = my_element();
+    return el && nav_rdf(el + 0x9c, x) && nav_rdf(el + 0xa0, y) && nav_rdf(el + 0xa4, z) && nav_rdf(el + 0xac, r);
+}
+
+static float wrap(float a)
+{
+    while (a > NAV_PI)
+        a -= 2 * NAV_PI;
+    while (a < -NAV_PI)
+        a += 2 * NAV_PI;
+    return a;
+}
+
+static void nav_stick(float s, float mag)
+{
+    g_nav.s = s;
+    g_pad.lx = axis(sinf(s) * mag), g_pad.ly = axis(cosf(s) * mag);
+    input_vpad_set(&g_pad);
+}
+
+/* Steer toward heading h. The follow camera turns while the player walks, so the stick angle is
+ * corrected continuously from the facing error (an integrator, time constant ~0.2 s, rate-limited
+ * so a turn in progress does not wind it up) rather than computed once from a camera estimate. */
+static void nav_steer(float r, float h, float dt, float mag)
+{
+    if (!g_nav.steering)
+    {
+        g_nav.steering = 1;
+        g_nav.s = wrap(g_nav.c - h);
+    }
+    else
+    {
+        float step = wrap(r - h) * dt * 5.0f, lim = dt * 4.0f;
+        g_nav.s = wrap(g_nav.s + (step > lim ? lim : step < -lim ? -lim : step));
+    }
+    nav_stick(g_nav.s, mag);
+}
+
+static void nav_begin(int mode, uint64_t now)
+{
+    float x, y, z, r;
+    g_nav.mode = mode;
+    g_nav.steering = 0, g_nav.last_tick = now;
+    g_nav.start = g_nav.progress_t = now;
+    g_nav.best = 1e30f;
+    g_nav.detours = 0, g_nav.detour_until = 0;
+    g_nav.order_limit = g_order;
+    if (my_pos(&x, &y, &z, &r))
+    {
+        /* no recent estimate: assume the camera is behind the player (it follows while walking) */
+        if (!g_nav.have_c || now - g_nav.last_c_t > 5000)
+            g_nav.c = r, g_nav.have_c = 1;
+        g_nav.last_r = r;
+    }
+}
+
+/* One frame of a running walkto/face/turn. Returns 1 when it has finished. */
+static int nav_tick(uint64_t now)
+{
+    float x, y, z, r;
+    const char* what = g_nav.mode == NAV_WALK ? "walkto" : "face";
+    if (!my_pos(&x, &y, &z, &r))
+    {
+        if (now - g_nav.start < 3000) /* zoning: the element may come back */
+            return 0;
+        rt_log("[input] %llu ms: %s lost (no local player element)\n", (unsigned long long)now, what);
+        return 1;
+    }
+    /* the camera heading as of the stick held now (exact once the facing has caught up) */
+    float dt = (float)(now - g_nav.last_tick) / 1000.0f;
+    dt = dt < 0 ? 0 : dt > 0.1f ? 0.1f : dt;
+    g_nav.last_tick = now;
+    if (g_pad.lx || g_pad.ly)
+    {
+        g_nav.c = wrap(r + g_nav.s);
+        g_nav.last_c_t = now;
+    }
+    g_nav.last_r = r;
+
+    if (g_nav.mode == NAV_FACE)
+    {
+        float err = wrap(r - g_nav.heading);
+        if (fabsf(err) < 0.06f || now > g_nav.deadline)
+        {
+            nav_stick(0, 0);
+            rt_log("[input] %llu ms: face %s pos=%.2f,%.2f,%.2f rot=%.3f want=%.3f\n", (unsigned long long)now,
+                fabsf(err) < 0.06f ? "done" : "timeout", x, y, z, r, g_nav.heading);
+            return 1;
+        }
+        /* a light push toward the heading: turns the character with little travel */
+        nav_steer(r, g_nav.heading, dt, 0.3f);
+        return 0;
+    }
+
+    float dx = g_nav.tx - x, dz = g_nav.tz - z, d = sqrtf(dx * dx + dz * dz);
+    int arrived = d <= g_nav.tol && (!g_nav.has_y || fabsf(y - g_nav.ty) < 1.2f);
+    const char* end = arrived ? "done" : now > g_nav.deadline ? "timeout" : NULL;
+    if (!end && d < g_nav.best - 0.5f)
+        g_nav.best = d, g_nav.progress_t = now;
+    if (!end && now - g_nav.progress_t > 2500 && now >= g_nav.detour_until)
+    {
+        if (g_nav.detours >= 6)
+            end = "stuck";
+        else
+        {
+            /* blocked: slide sideways for a moment, alternating sides, then aim again */
+            g_nav.detour_side = (g_nav.detours & 1) ? -1 : 1;
+            g_nav.detour_until = now + 900 + 300 * (uint64_t)g_nav.detours;
+            g_nav.progress_t = now;
+            g_nav.detours++;
+            rt_log("[input] %llu ms: walkto blocked at %.2f,%.2f,%.2f (%.2f to go): detour %s\n", (unsigned long long)now,
+                x, y, z, d, g_nav.detour_side > 0 ? "right" : "left");
+        }
+    }
+    if (end)
+    {
+        if (g_nav.via && !strcmp(end, "done")) /* keep the stick: the next waypoint takes over */
+        {
+            g_nav_held = 1;
+            rt_log("[input] %llu ms: via done pos=%.2f,%.2f,%.2f\n", (unsigned long long)now, x, y, z);
+            return 1;
+        }
+        nav_stick(0, 0);
+        rt_log("[input] %llu ms: %s %s pos=%.2f,%.2f,%.2f rot=%.3f dist=%.2f target=%.2f,%.2f (%llu ms)\n",
+            (unsigned long long)now, g_nav.via ? "via" : "walkto", end, x, y, z, r, d, g_nav.tx, g_nav.tz, (unsigned long long)(now - g_nav.start));
+        return 1;
+    }
+    float h = atan2f(dx, dz);
+    if (now < g_nav.detour_until)
+        h = wrap(h - g_nav.detour_side * NAV_PI * 0.55f); /* r = h - pi/2: to the character's right */
+    float err = fabsf(wrap(r - h));
+    float mag = d > 4 || g_nav.via ? 1.0f : 0.45f + 0.55f * d / 4;
+    if (err > 1.2f) /* still turning: don't run a wide arc */
+        mag = mag < 0.5f ? mag : 0.5f;
+    nav_steer(r, h, dt, mag);
+    static uint64_t trace_t;
+    if (g_nav_trace && now - trace_t >= (uint64_t)g_nav_trace)
+    {
+        trace_t = now;
+        rt_log("[input] %llu ms: nav pos=%.2f,%.2f r=%.3f h=%.3f c=%.3f s=%.3f mag=%.2f d=%.2f\n", (unsigned long long)now, x,
+            z, r, h, g_nav.c, g_nav.s, mag, d);
+    }
+    return 0;
+}
+
+
+/* --- packet tap ---------------------------------------------------------------------------------
+ * ws2.c hands over every byte of the game-server connection (both directions). Packets are split
+ * into game messages (BasePacket 0x10 header: +1 compressed, +4 u16 size; subpackets: +0 u16 size,
+ * +2 u16 type (3 = game message), +4 source actor, +8 target actor; game message: +0x12 u16
+ * opcode, payload from +0x20) and kept in a small ring for `waitfor`, `target` and `interact`.
+ * Compressed packets are skipped (Meteor does not compress game traffic). */
+typedef struct NetMsg
+{
+    uint32_t seq;
+    int out;
+    uint16_t op;
+    uint32_t src, plen;
+    uint8_t pay[96];
+} NetMsg;
+
+#define NET_RING 512
+static NetMsg g_net[NET_RING];
+static uint32_t g_net_seq;  /* messages seen */
+static uint32_t g_act_seq;  /* g_net_seq when the previous action ran */
+static int g_net_trace;
+static volatile uint32_t g_net_lock;
+
+static struct
+{
+    uint8_t* buf;
+    uint32_t len, cap;
+} g_stream[64][2];
+
+static void net_msg(int out, const uint8_t* sub, uint32_t size)
+{
+    NetMsg* m = &g_net[g_net_seq % NET_RING];
+    memset(m, 0, sizeof *m);
+    m->out = out;
+    memcpy(&m->op, sub + 0x12, 2);
+    memcpy(&m->src, sub + 4, 4);
+    m->plen = size - 0x20;
+    memcpy(m->pay, sub + 0x20, m->plen < sizeof m->pay ? m->plen : sizeof m->pay);
+    m->seq = ++g_net_seq;
+    if (g_net_trace && m->op != 0x00CA && m->op != 0x00CF && m->op != 0x0001 && m->op != 0x0002)
+    {
+        char hex[3 * 24 + 1] = "";
+        for (uint32_t i = 0; i < m->plen && i < 24; ++i)
+            snprintf(hex + 3 * i, 4, "%02x ", m->pay[i]);
+        rt_log("[net] %s 0x%04X src=0x%08X len=%u %s\n", out ? "out" : "in ", m->op, m->src, m->plen, hex);
+    }
+}
+
+void autoinput_net(int stream, int out, const uint8_t* p, uint32_t n)
+{
+    if (stream < 0 || stream >= 64 || !getenv("XIV_INPUT_SCRIPT"))
+        return;
+    while (__atomic_exchange_n(&g_net_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    __typeof__(g_stream[0][0])* st = &g_stream[stream][out != 0];
+    if (st->len + n > st->cap)
+    {
+        st->cap = (st->len + n) * 2;
+        st->buf = (uint8_t*)realloc(st->buf, st->cap);
+    }
+    memcpy(st->buf + st->len, p, n);
+    st->len += n;
+    uint32_t off = 0;
+    while (st->len - off >= 0x10)
+    {
+        const uint8_t* b = st->buf + off;
+        uint16_t size;
+        memcpy(&size, b + 4, 2);
+        if (size < 0x10)
+        {
+            off = st->len; /* lost sync: drop what we have */
+            break;
+        }
+        if (st->len - off < size)
+            break;
+        if (!b[1])
+            for (uint32_t q = 0x10; q + 0x10 <= size;)
+            {
+                uint16_t ss, type;
+                memcpy(&ss, b + q, 2);
+                memcpy(&type, b + q + 2, 2);
+                if (ss < 0x10 || q + ss > size)
+                    break;
+                if (type == 3 && ss >= 0x20)
+                    net_msg(out, b + q, ss);
+                q += ss;
+            }
+        off += size;
+    }
+    memmove(st->buf, st->buf + off, st->len - off);
+    st->len -= off;
+    __atomic_store_n(&g_net_lock, 0, __ATOMIC_RELEASE);
+}
+
+/* The newest message after `since` matching dir (0 in, 1 out, 2 either) and opcode */
+static const NetMsg* net_find(uint32_t since, int dir, uint16_t op)
+{
+    for (uint32_t s = g_net_seq; s > since && g_net_seq - s < NET_RING; --s)
+    {
+        const NetMsg* m = &g_net[(s - 1) % NET_RING];
+        if (m->seq == s && m->op == op && (dir == 2 || m->out == dir))
+            return m;
+    }
+    return NULL;
+}
+
+static uint32_t rd_u32(const uint8_t* p)
+{
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+/* One frame of waitfor / target / interact; 1 when finished */
+static int busy_tick(uint64_t now)
+{
+    if (g_nav.mode == NAV_WALK || g_nav.mode == NAV_FACE)
+        return nav_tick(now);
+    static uint64_t down_since;
+    static int down_key;
+    if (down_key && now - down_since >= 100)
+    {
+        push_key(g_win, down_key, 0);
+        down_key = 0;
+    }
+#define PRESS(k) (push_key(g_win, (k), 1), down_key = (k), down_since = now, g_nav.pressed = now, g_nav.since = g_net_seq)
+    if (g_nav.mode == NAV_WAIT)
+    {
+        const NetMsg* m = net_find(g_nav.since, g_nav.dir, g_nav.op);
+        if (m || now > g_nav.deadline)
+        {
+            rt_log("[input] %llu ms: waitfor %s 0x%04X %s%s (%llu ms)\n", (unsigned long long)now,
+                g_nav.dir == 0 ? "in" : g_nav.dir == 1 ? "out" : "any", g_nav.op, m ? "seen" : "timeout",
+                m ? (m->out ? " (sent)" : " (received)") : "", (unsigned long long)(now - g_nav.start));
+            return 1;
+        }
+        return 0;
+    }
+    if (g_nav.mode == NAV_INTERACT)
+    {
+        if (!g_nav.pressed)
+            PRESS(g_nav.key);
+        const NetMsg* m = net_find(g_nav.since, 1, 0x012D);
+        if (m || now > g_nav.deadline)
+        {
+            char ev[40] = "";
+            if (m)
+                for (uint32_t i = 0x10; i + 3 < m->plen && i + 3 < sizeof m->pay; ++i)
+                    if (isalpha(m->pay[i]) && isalnum(m->pay[i + 1]) && isalnum(m->pay[i + 2]))
+                    {
+                        snprintf(ev, sizeof ev, "%.*s", (int)(sizeof m->pay - i), (const char*)m->pay + i);
+                        break;
+                    }
+            rt_log("[input] %llu ms: interact %s%s%s target=0x%08X\n", (unsigned long long)now, m ? "started " : "no event",
+                ev, "", m ? rd_u32(m->pay + 4) : 0);
+            return 1;
+        }
+        return 0;
+    }
+    /* NAV_TARGET: press the key, look at the SetTarget (0x00CD) the client sends, repeat */
+    if (!g_nav.pressed || (now - g_nav.pressed > 800 && g_nav.tries > 0))
+    {
+        if (!g_nav.pressed && !g_nav.untarget)
+        {
+            uint32_t el = my_element(), cur = 0;
+            if (el && nav_rd32(el + 0x12c, &cur) && cur == g_nav.want_id && g_nav.want_id)
+            {
+                rt_log("[input] %llu ms: target done id=0x%08X (already)\n", (unsigned long long)now, cur);
+                return 1;
+            }
+        }
+        g_nav.tries--;
+        PRESS(g_nav.key);
+        return 0;
+    }
+    const NetMsg* m = net_find(g_nav.since, 1, 0x00CD);
+    if (m && m->plen >= 4)
+    {
+        uint32_t id = rd_u32(m->pay);
+        int ok = g_nav.untarget ? id == 0xC0000000u : id == g_nav.want_id;
+        g_nav.since = m->seq; /* this one is handled */
+        if (ok)
+        {
+            rt_log("[input] %llu ms: %s done id=0x%08X\n", (unsigned long long)now, g_nav.untarget ? "untarget" : "target", id);
+            return 1;
+        }
+        rt_log("[input] %llu ms: target: got 0x%08X, next\n", (unsigned long long)now, id);
+        if (g_nav.tries > 0)
+            g_nav.pressed = now - 801; /* press again now */
+    }
+    if (now - g_nav.pressed > 800 && g_nav.tries <= 0)
+    {
+        rt_log("[input] %llu ms: %s not found\n", (unsigned long long)now, g_nav.untarget ? "untarget" : "target");
+        return 1;
+    }
+    return 0;
+#undef PRESS
+}
+
 const char* autoinput_frame(void)
 {
     static int init;
@@ -343,21 +890,135 @@ const char* autoinput_frame(void)
         last_read = now;
         read_script(1);
     }
-    if (!g_n)
+    if (!g_n && !g_nav.mode && !g_nav_held)
         return NULL;
     qsort(g_acts, g_n, sizeof *g_acts, by_time);
     int ww = 0, wh = 0;
     uint32_t win = user32_game_window(&ww, &wh);
     if (!win)
         return NULL;
+    g_win = win;
     size_t done = 0;
     int pad_changed = 0;
     const char* shot = NULL;
-    for (; done < g_n && g_acts[done].t <= now; ++done)
+    if (g_nav.mode)
+    {
+        /* the timeline waits for the blocking command; only `stop` and `quit` get through */
+        int stop = 0;
+        for (size_t i = 0; i < g_n && g_acts[i].t <= now; ++i)
+            if (g_acts[i].kind == A_QUIT)
+            {
+                rt_log("[input] %llu ms: quit (during a blocking command)\n", (unsigned long long)now);
+                fflush(NULL);
+                _Exit(0);
+            }
+            else if (g_acts[i].kind == A_STOP)
+            {
+                stop = 1;
+                g_acts[i].kind = A_LOG, snprintf(g_acts[i].text, sizeof g_acts[i].text, "stop");
+            }
+        if (stop)
+        {
+            if (g_nav.mode == NAV_WALK || g_nav.mode == NAV_FACE)
+                nav_stick(0, 0);
+            rt_log("[input] %llu ms: stopped\n", (unsigned long long)now);
+        }
+        if (!stop && !busy_tick(now))
+            return NULL;
+        uint64_t paused = now - g_nav.start;
+        for (size_t i = 0; i < g_n; ++i)
+            if (g_acts[i].order < g_nav.order_limit)
+                g_acts[i].t += paused;
+        g_last_t += paused;
+        g_nav.mode = NAV_NONE;
+        qsort(g_acts, g_n, sizeof *g_acts, by_time);
+    }
+    for (; done < g_n && g_acts[done].t <= now && !g_nav.mode; ++done)
     {
         Act* a = &g_acts[done];
+        /* waitfor matches packets since the last action that could have caused one */
+        if (a->kind != A_WAITFOR && a->kind != A_SHOT && a->kind != A_LOG && a->kind != A_POS &&
+            a->kind != A_TRACE && a->kind != A_NETTRACE && a->kind != A_MOVE)
+            g_act_seq = g_net_seq;
         switch (a->kind)
         {
+        case A_WALKTO:
+        case A_FACE:
+        case A_TURN:
+        {
+            nav_begin(a->kind == A_WALKTO ? NAV_WALK : NAV_FACE, now);
+            float x, y, z, r;
+            if (!my_pos(&x, &y, &z, &r))
+            {
+                rt_log("[input] %llu ms: %s: no local player element (not in world?)\n", (unsigned long long)now,
+                    a->kind == A_WALKTO ? "walkto" : "face");
+                g_nav.mode = NAV_NONE;
+                break;
+            }
+            g_nav.tx = a->x, g_nav.tz = a->y;
+            if (a->kind == A_WALKTO)
+            {
+                g_nav.tol = a->a / 100.0f;
+                g_nav.via = a->text[0] == 'v';
+                g_nav.has_y = a->text[4] != 0;
+                g_nav.ty = g_nav.has_y ? strtof(a->text + 4, NULL) : 0;
+                g_nav.deadline = now + (uint64_t)a->b;
+                rt_log("[input] %llu ms: %s %.2f,%.2f (tol %.2f) from %.2f,%.2f,%.2f\n", (unsigned long long)now,
+                    g_nav.via ? "via" : "walkto", a->x, a->y, g_nav.tol, x, y, z);
+            }
+            else
+            {
+                g_nav.heading = a->kind == A_TURN ? wrap(r + a->x * NAV_PI / 180.0f) : atan2f(a->x - x, a->y - z);
+                g_nav.deadline = now + 3000;
+                rt_log("[input] %llu ms: face rot %.3f -> %.3f\n", (unsigned long long)now, r, g_nav.heading);
+            }
+            /* the walk starts on the next frame; later actions wait for it (shifted when it ends) */
+            break;
+        }
+        case A_POS:
+        {
+            float x, y, z, r;
+            if (my_pos(&x, &y, &z, &r))
+                rt_log("[input] %llu ms: pos=%.2f,%.2f,%.2f rot=%.3f el=0x%08x\n", (unsigned long long)now, x, y, z, r,
+                    my_element());
+            else
+                rt_log("[input] %llu ms: pos: no local player element\n", (unsigned long long)now);
+            break;
+        }
+        case A_WAITFOR:
+            g_nav.mode = NAV_WAIT, g_nav.start = now, g_nav.order_limit = g_order;
+            g_nav.dir = a->a, g_nav.op = (uint16_t)a->b, g_nav.since = g_act_seq;
+            g_nav.deadline = now + (uint64_t)a->x;
+            break;
+        case A_TARGET:
+        case A_INTERACT:
+        {
+            g_nav.mode = a->kind == A_TARGET ? NAV_TARGET : NAV_INTERACT;
+            g_nav.start = now, g_nav.order_limit = g_order, g_nav.pressed = 0;
+            g_nav.key = a->b, g_nav.tries = a->a, g_nav.deadline = now + 3000;
+            g_nav.untarget = a->kind == A_TARGET && !a->text[0];
+            g_nav.want_id = 0;
+            if (a->kind == A_TARGET && a->text[0])
+            {
+                char* end;
+                unsigned long id = strtoul(a->text, &end, 16);
+                if (*end || !id)
+                {
+                    /* NPC names are not in the client's CharaElement (sheet text, held on the Lua
+                     * side): look the id up with meteor_actors */
+                    rt_log("[input] %llu ms: target %s: give the actor id in hex\n", (unsigned long long)now, a->text);
+                    g_nav.mode = NAV_NONE;
+                    break;
+                }
+                g_nav.want_id = (uint32_t)id;
+            }
+            rt_log("[input] %llu ms: %s %s\n", (unsigned long long)now,
+                a->kind == A_INTERACT ? "interact" : g_nav.untarget ? "untarget" : "target", a->text);
+            break;
+        }
+        case A_NETTRACE: g_net_trace = a->a; break;
+        case A_STOP: break;
+        case A_TRACE: g_nav_trace = a->a; break;
         case A_KEY: push_key(win, a->a, a->b); break;
         case A_PAD:
             g_pad.buttons = a->b ? (uint16_t)(g_pad.buttons | a->a) : (uint16_t)(g_pad.buttons & ~a->a);
@@ -395,12 +1056,20 @@ const char* autoinput_frame(void)
             fflush(NULL);
             _Exit(0);
         }
-        if (a->kind == A_LOG)
+        if (a->kind >= A_WALKTO)
+            ;
+        else if (a->kind == A_LOG)
             rt_log("[input] %llu ms: %s\n", (unsigned long long)now, a->text);
         else if (a->kind != A_MOVE && a->kind != A_SHOT)
             rt_log("[input] %llu ms: %s %d %d %.2f %.2f\n", (unsigned long long)now,
                 (const char*[]){ "key", "pad", "stick", "trigger", "move", "button", "shot", "log", "quit" }[a->kind], a->a,
                 a->b, a->x, a->y);
+    }
+    if (g_nav_held && g_nav.mode != NAV_WALK)
+    {
+        g_nav_held = 0;
+        if (!g_nav.mode)
+            nav_stick(0, 0);
     }
     if (pad_changed)
         input_vpad_set(&g_pad);
