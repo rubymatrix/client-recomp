@@ -57,6 +57,9 @@ int input_xpad(int index, XPad* out);
 /* Rumble: motor speeds 0..65535 (XINPUT_VIBRATION), until the next call. */
 void input_rumble(int index, uint16_t low, uint16_t high);
 
+/* The scripted pad's state (autoinput.c), added to pad 0. */
+void input_vpad_set(const XPad* x);
+
 int input_pad_count(void);
 int input_pad_state(int index, PadState* out);
 const char* input_pad_name(int index);

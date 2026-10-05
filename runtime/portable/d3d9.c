@@ -862,6 +862,7 @@ extern uint32_t thunk_prof_thread;
 void thunk_prof_report(void);
 void thunk_lock_report(void);
 void xiv_ui_report(void); /* xiv_ui.c: the interface's animation counters (XIV_ANIMLOG) */
+const char* autoinput_frame(void); /* autoinput.c */
 static void prof_noop(uint64_t ns) { (void)ns; }
 static uint64_t g_present_ns; /* time in g9_present, in all */
 
@@ -872,6 +873,26 @@ static void present(void)
     G9Tex* t = bb ? surface_gpu(bb, &f, &l) : NULL;
     if (bb)
         debug_shot(t, bb->width, bb->height);
+    {
+        /* XIV_INPUT_SCRIPT (autoinput.c): this frame's scripted input, and a screenshot it asks for */
+        const char* shot = autoinput_frame();
+        if (shot && t)
+        {
+            uint32_t w = bb->width, h = bb->height;
+            uint8_t* px = (uint8_t*)malloc((size_t)w * h * 4);
+            g9_tex_read(t, 0, 0, px, w * 4);
+            FILE* f = fopen(shot, "wb");
+            if (f)
+            {
+                fprintf(f, "P6\n%u %u\n255\n", w, h);
+                for (size_t i = 0; i < (size_t)w * h; ++i)
+                    fputc(px[i * 4 + 2], f), fputc(px[i * 4 + 1], f), fputc(px[i * 4], f);
+                fclose(f);
+                rt_log("[input] shot %s\n", shot);
+            }
+            free(px);
+        }
+    }
     uint64_t p0 = rt_monotonic_ns();
     g9_present(t);
     g_present_ns += rt_monotonic_ns() - p0;

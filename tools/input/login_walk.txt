@@ -1,0 +1,14 @@
+# Title -> Start -> "A Word to Our Players" (Yes) -> character select -> first character -> world,
+# then a short walk. Times are ms since the first frame; +ms is after the previous line.
+# Timings measured on an M1 Max against a local Meteor server (title menu up by ~20 s, character
+# select ~16 s after Yes); raise them if a shot shows the step was early.
+20000 shot 01_title
+22000 key Return            # Start
++2500 key Left              # the dialog opens on No: move to Yes
++700  shot 02_dialog
++300  key Return            # Yes
++20000 shot 03_charaselect
++500  key Return            # the first character (highlighted on entry): straight to loading
++40000 shot 04_world        # zoned in by now (check with ./xivctl wait)
++500  stick l 0 1 3000      # walk forward 3 s (left stick up)
++3500 shot 05_walked

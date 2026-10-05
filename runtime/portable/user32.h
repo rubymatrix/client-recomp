@@ -45,6 +45,12 @@ extern void (*user32_quit_hook)(void);
 #define USER32_MOUSE_GIVEN 8
 int user32_mouse_given(int i, float* fx, float* fy);
 void user32_press_key(uint32_t vk);
+/* Scripted input (autoinput.c): the game's window (SDL window ID, size in points; 0 if none), the
+ * SDL scancode of a virtual key, and a cursor GetCursorPos reports instead of the real one (window
+ * points). */
+uint32_t user32_game_window(int* w, int* h);
+int user32_scancode_of_vk(uint32_t vk);
+void user32_force_cursor(int on, float x, float y);
 /* comctl32 window subclassing (SetWindowSubclass / RemoveWindowSubclass / DefSubclassProc) */
 int user32_set_subclass(uint32_t hwnd, uint32_t proc, uint32_t id, uint32_t ref);
 int user32_remove_subclass(uint32_t hwnd, uint32_t proc, uint32_t id);
