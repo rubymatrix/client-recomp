@@ -1163,7 +1163,8 @@ static void pixel_program(Ctx* c)
             emit(c, "    float4 c%u [[color(%u)]];\n", i, i);
     if (!info->color_outputs)
         emit(c, "    float4 c0 [[color(0)]];\n");
-    if (info->writes_depth)
+    int depth_out = info->writes_depth && !(c->opts && c->opts->no_depth_out);
+    if (depth_out)
         emit(c, "    float depth [[depth(any)]];\n");
     emit(c, "};\n\n");
 
@@ -1217,7 +1218,7 @@ static void pixel_program(Ctx* c)
             emit(c, "    out.c%u = oC[%u];\n", i, i);
     if (!info->color_outputs)
         emit(c, "    out.c0 = oC[0];\n");
-    if (info->writes_depth)
+    if (depth_out)
         emit(c, "    out.depth = oDepth;\n");
     emit(c, "    return out;\n}\n");
 }

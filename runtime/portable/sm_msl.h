@@ -77,6 +77,8 @@ typedef struct SmOpts
     uint8_t attr_int[16]; /* vertex: v# fed from a non-normalized integer format: 1 signed, 2 unsigned
                            * (Metal passes those as integers; the shader sees them as floats) */
     uint16_t depth_mask;  /* pixel: samplers bound to depth textures read as values (INTZ, DF24) */
+    uint8_t no_depth_out; /* pixel: no depth buffer is bound, so oDepth goes nowhere (D3D9 drops it;
+                           * Metal refuses a pipeline whose shader writes depth with no attachment) */
 } SmOpts;
 
 /* The auxiliary values both stages read (buffer SM_BUF_AUX). */

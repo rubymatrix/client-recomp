@@ -1352,7 +1352,8 @@ static uint32_t g_trace_ncubes;
 
 static void trace_cube(G9Tex* t)
 {
-    if (!t || t->type != G9_TEX_CUBE || t->fmt != F_A8R8G8B8)
+    /* cube maps, and 2D render targets the frame samples (their contents at the frame's end) */
+    if (!t || t->fmt != F_A8R8G8B8 || !(t->type == G9_TEX_CUBE || (t->type == G9_TEX_2D && t->use == G9_USE_RT)))
         return;
     for (uint32_t i = 0; i < g_trace_ncubes; ++i)
         if (g_trace_cubes[i] == t)
@@ -1377,8 +1378,8 @@ static void trace_dump_cubes(void)
             uint32_t w, h, d;
             level_dims(t, l, &w, &h, &d);
             uint8_t* px = (uint8_t*)malloc((size_t)w * h * 4);
-            fprintf(f, "%p L%u %ux%u:", (void*)t, l, w, h);
-            for (uint32_t face = 0; face < 6; ++face)
+            fprintf(f, "%p L%u %ux%u%s:", (void*)t, l, w, h, t->type == G9_TEX_CUBE ? "" : " rt");
+            for (uint32_t face = 0; face < (t->type == G9_TEX_CUBE ? 6u : 1u); ++face)
             {
                 memset(px, 0, (size_t)w * h * 4);
                 g9_tex_read(t, face, l, px, w * 4);
@@ -1392,7 +1393,8 @@ static void trace_dump_cubes(void)
                 if (l == 0)
                 {
                     char q[1024];
-                    snprintf(q, sizeof q, "%s/cube_%p_f%u.ppm", g_trace_dir, (void*)t, face);
+                    snprintf(q, sizeof q, "%s/%s_%p_f%u.ppm", g_trace_dir, t->type == G9_TEX_CUBE ? "cube" : "rt",
+                        (void*)t, face);
                     FILE* pf = fopen(q, "wb");
                     if (pf)
                     {
@@ -1403,6 +1405,18 @@ static void trace_dump_cubes(void)
                             fwrite(rgb, 1, 3, pf);
                         }
                         fclose(pf);
+                    }
+                    if (t->type != G9_TEX_CUBE)
+                    {
+                        /* and its alpha */
+                        snprintf(q, sizeof q, "%s/rt_%p_alpha.pgm", g_trace_dir, (void*)t);
+                        if ((pf = fopen(q, "wb")))
+                        {
+                            fprintf(pf, "P5 %u %u 255\n", w, h);
+                            for (uint32_t k = 0; k < w * h; ++k)
+                                fwrite(&px[4 * k + 3], 1, 1, pf);
+                            fclose(pf);
+                        }
                     }
                 }
             }
@@ -1466,14 +1480,17 @@ static void trace_draw(const G9Draw* d, const SmOpts* vo, const SmOpts* po, cons
 {
     const SmInfo *vi = &d->vs->info, *pi = &d->ps->info;
     fprintf(g_trace, "#%u vs %08x ps %08x prim %u n %u inst %u rt %d/%d/%d/%d ds %d srgbw %d blend %d %d %d %d "
-        "z %d/%d/%d cull %d atest %d/%u mask %x vp %ux%u",
+        "z %d/%d/%d cull %d atest %d/%u mask %x vp %ux%u dbias %g/%g st %d/%u/%u%u%u ref %u",
         g_trace_draw, vi->hash, pi->hash, d->prim, d->count, d->instances, (int)k->color[0], (int)k->color[1],
         (int)k->color[2], (int)k->color[3], (int)k->depth, d->rs.srgb_write, d->rs.blend, d->rs.src, d->rs.dst,
         d->rs.op, d->rs.zenable, d->rs.zwrite, d->rs.zfunc, d->rs.cull, d->rs.alpha_func, d->rs.alpha_ref,
-        d->rs.write_mask[0], d->vp.w, d->vp.h);
+        d->rs.write_mask[0], d->vp.w, d->vp.h, d->rs.depth_bias, d->rs.slope_bias, d->rs.stencil, d->rs.sfunc,
+        d->rs.sfail, d->rs.szfail, d->rs.spass, d->rs.stencil_ref);
     if (g_rt[0])
         fprintf(g_trace, " rt0 %p %ux%u fmt %u face %u level %u", (void*)g_rt[0], g_rt[0]->w, g_rt[0]->h, g_rt[0]->fmt,
             g_rt_face[0], g_rt_level[0]);
+    if (g_ds)
+        fprintf(g_trace, " ds0 %p %ux%u fmt %u", (void*)g_ds, g_ds->w, g_ds->h, g_ds->fmt);
     trace_cube(g_rt[0]);
     for (uint32_t s = 0; s < G9_PS_SAMPLERS; ++s)
     {
@@ -1601,6 +1618,9 @@ void g9_draw(const G9Draw* d)
                 vo.vs_extra[vo.nvs_extra++] = pi->in[i];
         }
         po.alpha_func = d->rs.alpha_func;
+        /* a pixel shader's oDepth with no depth buffer bound: D3D9 drops it (the effects' projection
+         * map pass draws so, e.g. the ground circles of Ifrit's Radiant Plume and Eruption) */
+        po.no_depth_out = pi->writes_depth && !g_ds;
         for (uint32_t s = 0; s < G9_PS_SAMPLERS; ++s)
             if (is_depth_format(d->tex[s]) && pi->sampler[s] == 2)
             {
