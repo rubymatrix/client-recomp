@@ -8,8 +8,8 @@ and Winsock.
 
 ![Title screen](screenshots/ffxiv-title-screen.png)
 
-It connects to private servers: [Project Meteor](https://github.com/Ioncannon/project-meteor-server)
-and [Garlemald](https://github.com/swstegall/Garlemald-Server).
+It connects to private servers: [Project Meteor](https://github.com/Ioncannon/project-meteor-server),
+[Bahamut](https://github.com/BahamutXIV/bahamut-launcher) and [Garlemald](https://github.com/swstegall/Garlemald-Server).
 
 ## How it works
 
@@ -21,7 +21,7 @@ and [Garlemald](https://github.com/swstegall/Garlemald-Server).
   only.
 - `meta/ffxivgame.1.23b.apply.json` — small code patches translated into the game (the same ones the
   Garlemald launcher applies to the file, plus a few host hooks such as the frame-rate target).
-- `runtime/` — the guest machine (registers, memory at host `0x300000000 + VA`, threads, fibers) and
+- `runtime/` — the guest machine (registers, memory at host `0x20000000000 + VA`, threads, fibers) and
   `runtime/portable/`, the Win32/D3D9/XAudio2/Winsock shims. Direct3D 9 runs on Metal; the window
   and input go through SDL3.
 - `tests/xivboot.c` — the host that loads the translation and starts the game.
@@ -31,7 +31,7 @@ and [Garlemald](https://github.com/swstegall/Garlemald-Server).
 - An Apple silicon Mac, Xcode command-line tools, Python 3.
 - Your own retail FINAL FANTASY XIV install, patched to 1.23b (for example with
   [XIV-1.0-Apple-Silicon-Installer](https://github.com/swstegall/XIV-1.0-Apple-Silicon-Installer)
-  and [Garlemald Client](https://github.com/swstegall/Garlemald-Client)). The build reads
+  and [Garlemald Client](https://github.com/swstegall/Garlemald-Client) or [Bahamut Launcher](https://github.com/BahamutXIV/bahamut-launcher). The build reads
   `ffxivgame.exe` and the game data from it.
 - A running 1.23b server.
 
@@ -55,9 +55,15 @@ python3 -m venv .venv && .venv/bin/pip install pycryptodome
 ```
 
 `xiv_login.py` signs in through the server's web login (Project Meteor's PHP pages with `--meteor`,
-Garlemald's front end otherwise; `--signup` creates the account first), then starts the game with
-the session. The password is asked for on the terminal (or read from `XIV_PASSWORD`) and only sent
-to `--server`.
+Bahamut's format with `--bahamut`, or Garlemald's front end otherwise; `--signup` creates the account
+first), then starts the game with the session. The password is asked for on the terminal (or read
+from `XIV_PASSWORD`) and only sent to `--server`. You can set an alternate lobby endpoint via the CLI
+by passing `--lobby`. For example, on the public Bahamut server, you can login with:
+
+```sh
+.venv/bin/python tools/xiv_login.py --bahamut --server https://bahamut.stegall.me:443 --lobby bahamut.stegall.me \
+--user NAME --game "/path/to/FINAL FANTASY XIV"
+```
 
 Useful environment switches: `XIV_SERIAL=1` (guest threads take turns), `FFXI_RECOMP_TRACE=1`
 (log every shim call), `XIV_SAMPLE=<file>` (sampling profiler, report with `tools/xiv_sample.py`).
