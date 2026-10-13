@@ -35,7 +35,7 @@ WRAPS = ','.join('ui_%s=%s' % m for m in re.findall(r'^ANIM\((\w+), (0x[0-9a-f]+
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'runtime/portable/xiv_ui_wraps.h')).read(), re.M))  # Garlemald Client's code patches, translated in
 WRAPS += ',key_repeat=0xd429b0'  # the keyboard's auto-repeat counter, paced in time (xiv_ui.c)
 GEN = 'generated/ffxivgame'
-CFLAGS = ['-O2', '-mcpu=apple-m1', '-std=c11', '-g', '-DRT_GUEST_WINDOW', '-DRT_GUEST_FIXED=0x300000000ull', '-fno-strict-aliasing', '-I', 'runtime', '-I',
+CFLAGS = ['-O2', '-mcpu=apple-m1', '-std=c11', '-g', '-DRT_GUEST_WINDOW', '-DRT_GUEST_FIXED=0x20000000000ull', '-fno-strict-aliasing', '-I', 'runtime', '-I',
           'runtime/portable', '-I', GEN]
 GEN_FLAGS = ['-O3', '-mcpu=apple-m1', '-flto=thin', '-w']  # speed over build time: these are the game's code
 PORTABLE = ['runtime/runtime.c', 'runtime/portable/plat_posix.c', 'runtime/portable/gwin.c',
