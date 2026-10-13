@@ -43,7 +43,7 @@ WRAPS += ',net_ctor=0x4e0dc0,net_tick=0x4e30a0'
 WRAPS += ''.join(',lb_%s=0x%s' % (a, a) for a in re.findall(r'^LB\((\w+),', open(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'runtime/portable/xiv_probe_binds.h')).read(), re.M))
 GEN = 'generated/ffxivgame'
-CFLAGS = ['-O2', '-mcpu=apple-m1', '-std=c11', '-g', '-DRT_GUEST_WINDOW', '-DRT_GUEST_FIXED=0x300000000ull', '-fno-strict-aliasing', '-I', 'runtime', '-I',
+CFLAGS = ['-O2', '-mcpu=apple-m1', '-std=c11', '-g', '-DRT_GUEST_WINDOW', '-DRT_GUEST_FIXED=0x20000000000ull', '-fno-strict-aliasing', '-I', 'runtime', '-I',
           'runtime/portable', '-I', GEN]
 GEN_FLAGS = ['-O3', '-mcpu=apple-m1', '-flto=thin', '-w']  # speed over build time: these are the game's code
 PORTABLE = ['runtime/runtime.c', 'runtime/portable/plat_posix.c', 'runtime/portable/gwin.c',

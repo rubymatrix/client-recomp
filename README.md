@@ -9,8 +9,8 @@ The game's 32-bit x86 executable is statically translated to C on your machine, 
 install, and compiled as an arm64 macOS app. Windows, Direct3D 9, audio, input and networking are
 replaced by a macOS platform layer (Direct3D 9 runs on Metal).
 
-It connects to 1.23b private servers such as
-[Project Meteor](https://github.com/Ioncannon/project-meteor-server).
+It connects to 1.23b private servers: [Project Meteor](https://github.com/Ioncannon/project-meteor-server),
+[Bahamut](https://github.com/BahamutXIV/bahamut-launcher) and [Garlemald](https://github.com/swstegall/Garlemald-Server).
 
 ## Requirements
 
@@ -35,7 +35,14 @@ This produces `build/xivboot`.
     --game "/path/to/FINAL FANTASY XIV"
 ```
 
-Signs in through the server's web login and starts the game.
+Signs in through the server's web login and starts the game: Project Meteor with `--meteor`,
+Bahamut with `--bahamut`, Garlemald otherwise. `--lobby` sets the lobby host. On the public Bahamut
+server:
+
+```sh
+.venv/bin/python tools/xiv_login.py --bahamut --server https://bahamut.stegall.me:443 --lobby bahamut.stegall.me \
+    --user NAME --game "/path/to/FINAL FANTASY XIV"
+```
 
 ## No game files here
 

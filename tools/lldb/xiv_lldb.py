@@ -2,7 +2,7 @@
 
     command script import tools/lldb/xiv_lldb.py      (tools/xivdbg.sh does this)
 
-Guest memory is mapped at host 0x300000000 + VA. Every translated function is f_XXXXXXXX (its
+Guest memory is mapped at host 0x20000000000 + VA. Every translated function is f_XXXXXXXX (its
 original VA) taking Guest* g; in the -g debug build each generated source line sits under a
 /* XXXXXXXX: x86 */ comment, which is how guest instruction addresses are recovered.
 
@@ -26,7 +26,7 @@ import subprocess
 
 import lldb
 
-GUEST_BASE = 0x300000000
+GUEST_BASE = 0x20000000000
 IMAGE_BASE = 0x00400000
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GEN = os.path.join(ROOT, 'generated', 'ffxivgame')
