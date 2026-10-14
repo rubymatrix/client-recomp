@@ -3,6 +3,9 @@
   python3 tools/xiv_login.py [--server http://127.0.0.1:54993] [--lobby 127.0.0.1] [--user NAME]
                              [--signup] [--meteor] [--game <FINAL FANTASY XIV folder>] [-- extra xivboot args]
 
+--bahamut signs in through Bahamut's JSON auth API (POST /api/v1/sessions on the auth service,
+e.g. --server http://127.0.0.1:8080); the session id it returns is the same 56 hex digits.
+
 --meteor signs in through Project Meteor's PHP pages instead (--server is then the site root,
 e.g. http://127.0.0.1:8000): POST login/ answers with a page holding <x-sqexauth sid="<56 hex>">,
 and sign-up posts login_su/create_user.php.
@@ -15,6 +18,7 @@ password is asked for on the terminal (or XIV_PASSWORD) and sent only to --serve
 """
 import argparse
 import getpass
+import json
 import os
 import re
 import subprocess
@@ -69,6 +73,32 @@ def sign_in(server, user, password, signup=False):
     return m.group(1)
 
 
+def post_json(url, fields):
+    req = urllib.request.Request(url, data=json.dumps(fields).encode(), method='POST',
+                                 headers={'Content-Type': 'application/json'})
+    try:
+        r = urllib.request.urlopen(req, timeout=15)
+        return r.status, json.loads(r.read() or b'{}')
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b'{}')
+        except ValueError:
+            return e.code, {}
+
+
+def sign_in_bahamut(server, user, password, signup=False):
+    base = server.rstrip('/') + '/api/v1'
+    if signup:
+        status, body = post_json(base + '/accounts', {'username': user, 'password': password})
+        if status >= 300:
+            raise SystemExit('sign-up refused: %s %s' % (status, body))
+    status, body = post_json(base + '/sessions', {'username': user, 'password': password})
+    sid = body.get('session_id', '')
+    if status != 200 or not re.fullmatch(r'[0-9A-Fa-f]{56}', sid):
+        raise SystemExit('sign-in refused: %s %s' % (status, body))
+    return sid
+
+
 def sign_in_meteor(server, user, password, signup=False):
     base = server.rstrip('/')
     if signup:
@@ -92,6 +122,7 @@ def main():
     ap.add_argument('--lobby', default='127.0.0.1', help="the lobby server's host name (19 characters at most)")
     ap.add_argument('--user')
     ap.add_argument('--signup', action='store_true', help='create the account first')
+    ap.add_argument('--bahamut', action='store_true', help="sign in through Bahamut's auth API (--server is then its auth URL, e.g. http://127.0.0.1:8080)")
     ap.add_argument('--meteor', action='store_true', help="sign in through Project Meteor's PHP login pages")
     ap.add_argument('--game', default=DEFAULT_GAME, help='the FINAL FANTASY XIV folder')
     ap.add_argument('--tick', type=lambda s: int(s, 0), default=xiv_args.DEFAULT_TICK)
@@ -100,7 +131,7 @@ def main():
     a = ap.parse_args()
     user = a.user or input('Username: ')
     password = os.environ.get('XIV_PASSWORD') or getpass.getpass('Password: ')
-    session = (sign_in_meteor if a.meteor else sign_in)(a.server, user, password, a.signup)
+    session = (sign_in_bahamut if a.bahamut else sign_in_meteor if a.meteor else sign_in)(a.server, user, password, a.signup)
     arg = xiv_args.build(session, a.tick)
     print('signed in as %s (session %s...)' % (user, session[:8]))
     if a.print:
