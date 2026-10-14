@@ -91,30 +91,34 @@ static GuestFn lookup_uncached(uint32_t target)
 }
 
 /* The binary searches above were 5.7% of the game thread on an Xbox One X (every indirect call and
- * virtual method comes through here), so the translations found are cached: per thread (no locking),
- * direct-mapped, and dropped whenever the image or a module is placed (g_lookup_gen). A target with
- * no translation (an import, a thunk) is not cached: it keeps taking the cheap range checks. */
-#if defined(_MSC_VER)
-#define LOOKUP_TLS __declspec(thread)
-#else
-#define LOOKUP_TLS _Thread_local
-#endif
-#define LOOKUP_CACHE 4096u /* entries; a power of two */
-typedef struct
-{
-    uint32_t target, gen;
-    GuestFn fn;
-} LookupEnt;
-static LOOKUP_TLS LookupEnt t_lookup[LOOKUP_CACHE];
+ * virtual method comes through here), so the translations found are cached: direct-mapped and
+ * shared by all threads. An entry is one 64-bit word (the target, and the function as a 4-byte
+ * aligned offset from this one), so threads read and write it whole without locking; a per-thread
+ * cache cost a thread-local access (a call on macOS) on every lookup. The cache is dropped whenever
+ * the image or a module is placed (g_lookup_gen). A target with no translation (an import, a
+ * thunk) is not cached: it keeps taking the cheap range checks. */
+#define LOOKUP_CACHE 16384u /* entries; a power of two */
+static uint64_t g_lookup[LOOKUP_CACHE];
+static uint32_t g_lookup_seen;
 
 GuestFn rt_lookup_any(uint32_t target)
 {
-    LookupEnt* e = &t_lookup[(target ^ (target >> 12)) & (LOOKUP_CACHE - 1)];
-    if (e->target == target && e->gen == g_lookup_gen && e->fn)
-        return e->fn;
+    if (__atomic_load_n(&g_lookup_seen, __ATOMIC_RELAXED) != g_lookup_gen)
+    {
+        memset(g_lookup, 0, sizeof g_lookup);
+        __atomic_store_n(&g_lookup_seen, g_lookup_gen, __ATOMIC_RELEASE);
+    }
+    uint64_t* slot = &g_lookup[(target ^ (target >> 12)) & (LOOKUP_CACHE - 1)];
+    uint64_t e = __atomic_load_n(slot, __ATOMIC_RELAXED);
+    if ((uint32_t)(e >> 32) == target && target)
+        return (GuestFn)((uintptr_t)rt_lookup_any + ((intptr_t)(int32_t)(uint32_t)e << 2));
     GuestFn fn = lookup_uncached(target);
     if (fn)
-        e->target = target, e->gen = g_lookup_gen, e->fn = fn;
+    {
+        intptr_t d = (intptr_t)(uintptr_t)fn - (intptr_t)(uintptr_t)rt_lookup_any;
+        if (!(d & 3) && d >> 2 == (int32_t)(d >> 2))
+            __atomic_store_n(slot, ((uint64_t)target << 32) | (uint32_t)(int32_t)(d >> 2), __ATOMIC_RELAXED);
+    }
     return fn;
 }
 

@@ -699,6 +699,9 @@ static void texture_sample(Ctx* c, const Ins* in, const char* coord_expr, unsign
             type == 3 ? "gradientcube" : type == 4 ? "gradient3d" : "gradient2d", ddx, cc, ddy, cc);
     else if (extra_mode)
         snprintf(v, sizeof v, "t%u.sample(s%u, (%s)%s, %s)", s, s, coord_expr, cc, extra_mode);
+    else if (c->info->pixel)
+        snprintf(v, sizeof v, "t%u.sample(s%u, (%s)%s, bias(aux.lod_bias[%u].%s))", s, s, coord_expr, cc, (s & 15) >> 2,
+            comp(s));
     else
         snprintf(v, sizeof v, "t%u.sample(s%u, (%s)%s)", s, s, coord_expr, cc);
     store(c, in, v);
@@ -752,7 +755,7 @@ static void one(Ctx* c, unsigned idx)
     case OP_EXPP: snprintf(v, sizeof v, "float4(exp2((%s).x))", s0); break;
     case OP_LOG:
     case OP_LOGP: snprintf(v, sizeof v, "float4(log2(abs((%s).x)))", s0); break;
-    case OP_POW: snprintf(v, sizeof v, "float4(powr(abs((%s).x), (%s).x))", s0, s1); break;
+    case OP_POW: snprintf(v, sizeof v, "float4(Pow((%s).x, (%s).x))", s0, s1); break;
     case OP_FRC: snprintf(v, sizeof v, "fract(%s)", s0); break;
     case OP_ABS: snprintf(v, sizeof v, "abs(%s)", s0); break;
     case OP_SGN: snprintf(v, sizeof v, "sign(%s)", s0); break;
@@ -817,7 +820,7 @@ static void one(Ctx* c, unsigned idx)
         else if (in->ctl == 2) /* texldb */
         {
             char b[600];
-            snprintf(b, sizeof b, "bias((%s).w)", coord);
+            snprintf(b, sizeof b, "bias((%s).w + aux.lod_bias[%u].%s)", coord, (s & 15) >> 2, comp(s));
             texture_sample(c, in, coord, s, b, NULL, NULL);
         }
         else
@@ -952,7 +955,10 @@ static void translate_range(Ctx* c, unsigned from, unsigned to)
 static void prelude(Ctx* c)
 {
     emit(c, "#include <metal_stdlib>\nusing namespace metal;\n\n");
-    emit(c, "struct SmAux { float4 half_pixel; float4 alpha_ref; };\n");
+    emit(c, "struct SmAux { float4 half_pixel; float4 alpha_ref; float4 lod_bias[4]; float4 clip[6]; "
+            "uint4 clip_on; float4 rscale; };\n");
+    /* D3D9 hardware gives pow(x, 0) = 1, 0^0 included (powr(0, 0) is NaN) */
+    emit(c, "static inline float Pow(float x, float y) { return y == 0.0 ? 1.0 : powr(abs(x), y); }\n");
     emit(c, "static inline float4 Nrm(float4 v) { float d = dot(v.xyz, v.xyz); return d > 0.0 ? v * rsqrt(d) : v; }\n");
     emit(c, "static inline float4 Lit(float4 s) { float4 r = float4(1.0, 0.0, 0.0, 1.0); if (s.x > 0.0) { r.y = s.x; "
             "if (s.y > 0.0) r.z = powr(s.y, clamp(s.w, -127.9961, 127.9961)); } return r; }\n");
@@ -1014,7 +1020,8 @@ static void vertex_program(Ctx* c)
         if (c->in_used[r])
         {
             unsigned k = c->opts ? c->opts->attr_int[r] : 0;
-            emit(c, "    %s v%u [[attribute(%u)]];\n", k == 1 ? "int4" : k == 2 ? "uint4" : "float4", r, r);
+            emit(c, "    %s v%u [[attribute(%u)]];\n",
+                k == 1 ? "int4" : k == 2 ? "uint4" : k >= 3 ? "uint" : "float4", r, r);
         }
     emit(c, "};\n\n");
     for (unsigned r = 0; r < 16; ++r)
@@ -1050,6 +1057,7 @@ static void vertex_program(Ctx* c)
     }
     if (!has_pos)
         emit(c, "    float4 position0 [[position]];\n");
+    emit(c, "    float clip_distance [[clip_distance]] [6];\n");
     if (c->opts)
         for (unsigned i = 0; i < c->opts->nvs_extra; ++i)
         {
@@ -1069,8 +1077,19 @@ static void vertex_program(Ctx* c)
     emit(c, "    float4 oPos = float4(0.0, 0.0, 0.0, 1.0), oD[2] = {}, oT[8] = {}; float oFog = 0.0, oPts = 1.0;\n");
     emit(c, "    (void)a0; (void)a0f; (void)aL; (void)p0; (void)oPts; (void)oFog;\n");
     for (unsigned r = 0; r < 16; ++r)
-        if (c->in_used[r])
+    {
+        if (!c->in_used[r])
+            continue;
+        unsigned k = c->opts ? c->opts->attr_int[r] : 0;
+        if (k == 3) /* UDEC3 */
+            emit(c, "    v[%u] = float4(float3(uint3(vin.v%u, vin.v%u >> 10, vin.v%u >> 20) & 1023u), 1.0);\n", r, r, r,
+                r);
+        else if (k == 4) /* DEC3N: each signed 10 bits over 511 */
+            emit(c, "    v[%u] = float4(max(float3(int3(uint3(vin.v%u, vin.v%u >> 10, vin.v%u >> 20) << 22) >> 22) / 511.0, "
+                    "-1.0), 1.0);\n", r, r, r, r);
+        else
             emit(c, "    v[%u] = float4(vin.v%u);\n", r, r);
+    }
     /* the main program ends at the first ret before any label */
     unsigned end = c->nins;
     for (unsigned i = 0; i < c->nins; ++i)
@@ -1119,6 +1138,8 @@ static void vertex_program(Ctx* c)
                 emit(c, "    out.%s = float4(0.0);\n", sm_semantic(d->usage, d->index, name));
         }
     (void)has_psize;
+    emit(c, "    for (uint i = 0; i < 6; ++i)\n"
+            "        out.clip_distance[i] = (aux.clip_on.x >> i) & 1u ? dot(out.position0, aux.clip[i]) : 1.0;\n");
     /* D3D9's pixel centres: the half-pixel shift Direct3D 10+ and Metal do not have */
     emit(c, "    out.position0.xy += aux.half_pixel.xy * out.position0.w;\n");
     emit(c, "    return out;\n}\n");
@@ -1174,7 +1195,7 @@ static void pixel_program(Ctx* c)
     emit(c, "    float4 r[32] = {}; float4 v[16] = {}; float4 tc[8] = {}; float4 oC[4] = {}; float oDepth = pin.position0.z;\n");
     emit(c, "    int aL = 0; bool4 p0 = false; int4 a0 = 0; (void)aL; (void)p0; (void)a0;\n");
     if (c->vpos)
-        emit(c, "    float4 vpos = float4(pin.position0.xy - 0.5, 0.0, 0.0);\n");
+        emit(c, "    float4 vpos = float4(pin.position0.xy * aux.rscale.xy - 0.5, 0.0, 0.0);\n");
     if (c->vface)
         emit(c, "    float4 vface = float4(front ? 1.0 : -1.0);\n");
     if (sm3)

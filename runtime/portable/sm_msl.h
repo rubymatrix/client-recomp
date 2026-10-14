@@ -12,13 +12,15 @@
  *                   TEXCOORD#/COLOR#. A pixel shader may read a semantic the vertex shader does not
  *                   write: translate the vertex shader again with it in SmOpts.vs_extra (written 0).
  *   constants       buffer SM_BUF_FLOAT: float4[256] (vs) / [224] (ps); SM_BUF_INT: int4[16];
- *                   SM_BUF_BOOL: uint[16]; SM_BUF_AUX: SmAux (the half-pixel offset, alpha ref).
+ *                   SM_BUF_BOOL: uint[16]; SM_BUF_AUX: SmAux (the half-pixel offset, alpha ref,
+ *                   sampler LOD bias, user clip planes).
  *   textures        sampler s# is [[texture(#)]] and [[sampler(#)]] (vertex texture fetch too).
  *
  * D3D9 behaviours folded in: the half-pixel offset of vertex positions (SmAux.half_pixel, from
- * the viewport), rsq/log/pow on |x|, cmp/cnd/lrp/sincos/nrm semantics, sampler types from dcl,
- * alpha test as an epilogue (SmOpts.alpha_func), depth-compare sampling for samplers bound to
- * depth textures (SmOpts.shadow_mask: the hardware shadow-map lookup D3D9 drivers do).
+ * the viewport), rsq/log/pow on |x| (pow(x, 0) = 1), cmp/cnd/lrp/sincos/nrm semantics, sampler
+ * types from dcl, alpha test as an epilogue (SmOpts.alpha_func), depth-compare sampling for
+ * samplers bound to depth textures (SmOpts.shadow_mask: the hardware shadow-map lookup D3D9
+ * drivers do), sampler LOD bias and user clip planes (SmAux).
  */
 #pragma once
 
@@ -75,7 +77,9 @@ typedef struct SmOpts
     SmDecl vs_extra[16];  /* vertex: semantics to write as 0 (what a pixel shader reads beyond them) */
     unsigned nvs_extra;
     uint8_t attr_int[16]; /* vertex: v# fed from a non-normalized integer format: 1 signed, 2 unsigned
-                           * (Metal passes those as integers; the shader sees them as floats) */
+                           * (Metal passes those as integers; the shader sees them as floats); 3 UDEC3
+                           * and 4 DEC3N, fetched as one uint and unpacked to (x, y, z, 1): Metal has no
+                           * unnormalized 10:10:10 format, and its normalized one gives w from bits 30-31 */
     uint16_t depth_mask;  /* pixel: samplers bound to depth textures read as values (INTZ, DF24) */
     uint8_t no_depth_out; /* pixel: no depth buffer is bound, so oDepth goes nowhere (D3D9 drops it;
                            * Metal refuses a pipeline whose shader writes depth with no attachment) */
@@ -86,6 +90,11 @@ typedef struct SmAux
 {
     float half_pixel[4]; /* 1/width, -1/height of the viewport: D3D9's pixel centres */
     float alpha_ref[4];  /* x: D3DRS_ALPHAREF / 255 */
+    float lod_bias[16];  /* pixel: D3DSAMP_MIPMAPLODBIAS per sampler (Metal samplers have no bias) */
+    float clip[6][4];    /* vertex: the user clip planes, in clip space as D3D9 takes them with shaders */
+    uint32_t clip_on[4]; /* x: D3DRS_CLIPPLANEENABLE */
+    float rscale[4];     /* pixel: the game's pixels per target pixel (a target made smaller than the
+                          * game thinks: upscaling), for vPos */
 } SmAux;
 
 /* Parses the declarations only (what SmInfo describes); 0 if the tokens are not a shader this

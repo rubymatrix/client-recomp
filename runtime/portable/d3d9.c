@@ -867,6 +867,18 @@ void xiv_probe_frame(void);        /* xiv_probe.c */
 static void prof_noop(uint64_t ns) { (void)ns; }
 static uint64_t g_present_ns; /* time in g9_present, in all */
 
+/* --pgo gen builds (tools/build_xiv.py): the profile is written once XIV_PGO_FRAMES frames are
+ * drawn, as the game is usually stopped rather than quit */
+extern int __llvm_profile_write_file(void) __attribute__((weak_import));
+static void pgo_dump(uint64_t frames)
+{
+    static uint64_t at = ~0ull;
+    if (at == ~0ull)
+        at = getenv("XIV_PGO_FRAMES") ? strtoull(getenv("XIV_PGO_FRAMES"), NULL, 0) : 0;
+    if (at && frames == at && __llvm_profile_write_file)
+        rt_log("[d3d9] profile written after %llu frames (%d)\n", (unsigned long long)frames, __llvm_profile_write_file());
+}
+
 static void present(void)
 {
     uint32_t f, l;
@@ -897,6 +909,7 @@ static void present(void)
     }
     uint64_t p0 = rt_monotonic_ns();
     g9_present(t);
+    pgo_dump(g_dev.frames);
     g_present_ns += rt_monotonic_ns() - p0;
     g_dev.frames++;
     /* XIV_PEEK=base+off,...: logs rd32(rd32(base) + off) every 300 frames (debugging) */
@@ -2223,6 +2236,31 @@ static int prepare(G9Draw* d, uint32_t vfirst, uint32_t vcount)
     d->rs = states();
     d->vp = viewport();
     memcpy(d->scissor, s->scissor, sizeof d->scissor);
+    memcpy(d->clip, s->clip, sizeof d->clip);
+    d->clip_on = s->rs[152] & 0x3F;
+    /* XIV_GFX_NO=lodbias,clip: draw without them (comparing against before they were honoured) */
+    static int no_bias = -1, no_clip, seen_bias, seen_clip;
+    if (no_bias < 0)
+    {
+        const char* no = getenv("XIV_GFX_NO");
+        no_bias = no && strstr(no, "lodbias"), no_clip = no && strstr(no, "clip");
+    }
+    for (int i = 0; i < G9_PS_SAMPLERS; ++i)
+        if (d->samp[i].lod_bias != 0.0f)
+        {
+            if (!seen_bias++)
+                rt_log("[d3d9] sampler %d LOD bias %g (first)%s\n", i, d->samp[i].lod_bias, no_bias ? ": ignored" : "");
+            if (no_bias)
+                d->samp[i].lod_bias = 0.0f;
+        }
+    if (d->clip_on)
+    {
+        if (!seen_clip++)
+            rt_log("[d3d9] clip planes %02x, plane 0 (%g %g %g %g) (first)%s\n", d->clip_on, d->clip[0][0], d->clip[0][1],
+                d->clip[0][2], d->clip[0][3], no_clip ? ": ignored" : "");
+        if (no_clip)
+            d->clip_on = 0;
+    }
     apply_targets();
     return 1;
 }

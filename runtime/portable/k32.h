@@ -44,3 +44,5 @@ unsigned k32_cpus(void);
 void k32_skip_sleep_at(uint32_t ret);
 /* Sleep calls returning to `ret` sleep until one period after the last such call woke */
 void k32_pace_sleep_at(uint32_t ret, uint64_t period_ns);
+/* QueryPerformanceCounter called from ret counts in whole quanta (quantum_ns() == 0: the real clock) */
+void k32_quantize_qpc_at(uint32_t ret, uint64_t (*quantum_ns)(void));

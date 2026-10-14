@@ -115,6 +115,8 @@ static void write_default_config(const char* docs)
 
 void xiv_misc_init(void);
 void xiv_ui_init(void);
+void xiv_native_init(void); /* xiv_native.c */
+void xiv_direct_login_init(void); /* xiv_direct_login.c */
 void xiv_probe_init(void);
 void sampler_start(void);
 void user32_main_tick(void);
@@ -147,6 +149,10 @@ static void game_thread(void* arg)
     printf("entry point returned %u\n", code);
     *(volatile int*)arg = 1;
 }
+
+extern void (*g9_pace_hook)(uint32_t fps); /* gfx9.h */
+uint64_t g9_pace_refresh_ns(void);
+static void xiv_pace_fps(uint32_t fps) { wr32(0x137DF00, fps); }
 
 int main(int argc, char** argv)
 {
@@ -197,6 +203,8 @@ int main(int argc, char** argv)
     k32_xiv_init();
     xiv_misc_init();
     xiv_ui_init();
+    xiv_native_init();
+    xiv_direct_login_init();
     xiv_probe_init();
     ole_init();
     user32_init();
@@ -240,6 +248,14 @@ int main(int argc, char** argv)
         const char* cap = getenv("XIV_FPSCAP");
         int fps = cap ? atoi(cap) : 60;
         wr32(0x137DF00, fps > 0 ? (uint32_t)fps : 100000u); /* uncapped: a 10 us period, no Sleep */
+        /* without a cap of its own, the limiter follows the rate presents are paced to: a whole
+         * number of the display's refreshes per frame */
+        if (!cap)
+            g9_pace_hook = xiv_pace_fps;
+        /* Framework::Idle's frame delta (its QueryPerformanceCounter read) in whole refreshes: the
+         * player, camera and animations move by it */
+        if (!getenv("XIV_RAWDELTA"))
+            k32_quantize_qpc_at(0xA4FE24, g9_pace_refresh_ns);
         /* a frame that ran over its period: the limiter's Sleep(1) becomes a yield */
         k32_skip_sleep_at(0x4E8F72);
         const char* hz = getenv("XIV_TICKHZ");

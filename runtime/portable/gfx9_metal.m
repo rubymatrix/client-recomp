@@ -146,6 +146,11 @@ struct G9Tex
     int type, use;
     uint32_t fmt, w, h, d, levels;
     Fmt f;
+    /* upscaling (gfx9_upscale.h): a scene target's texture is made at the render scale; w x h stay
+     * the game's size and rw x rh are the texture's. full: its texture at the game's size */
+    uint32_t rw, rh;
+    id<MTLTexture> full;
+    int scene;
 };
 
 struct G9Buf
@@ -154,10 +159,18 @@ struct G9Buf
     uint32_t size;
 };
 
+/* A translated function or a pipeline, ready or still compiling (gfx9_metal.m "background
+ * compiles"): state 0 compiling, 1 done (obj nil if it failed). */
+typedef struct Compiled
+{
+    id obj;
+    volatile int state;
+} Compiled;
+
 typedef struct Variant
 {
     uint64_t key;
-    id<MTLFunction> fn;
+    Compiled* fn; /* shared through g_fns */
 } Variant;
 
 struct G9Shader
@@ -167,6 +180,7 @@ struct G9Shader
     SmInfo info;
     Variant* var;
     uint32_t nvar, capvar;
+    uint64_t content; /* the tokens' hash (shader_variant's shared cache), 0 until needed */
 };
 
 /* --- the device ------------------------------------------------------------------------------- */
@@ -396,6 +410,8 @@ __attribute__((constructor)) static void cover_register(void)
     user32_cover_screen = cover_screen; /* before the device: the game goes full screen first */
 }
 
+static void* g_sdl_window;
+
 int g9_init(void* sdl_window, int vsync)
 {
     @autoreleasepool
@@ -404,6 +420,7 @@ int g9_init(void* sdl_window, int vsync)
         if (!g_dev)
             return 0;
         g_queue = [g_dev newCommandQueue];
+        g_sdl_window = sdl_window;
         g_view = SDL_Metal_CreateView((SDL_Window*)sdl_window);
         g_layer = (CAMetalLayer*)SDL_Metal_GetLayer(g_view);
         g_layer.device = g_dev;
@@ -474,6 +491,9 @@ static void fit_drawable(G9Tex* bb)
 
 /* --- textures --------------------------------------------------------------------------------- */
 
+static void up_track(G9Tex* t); /* gfx9_upscale.h */
+static void up_forget(G9Tex* t);
+
 G9Tex* g9_tex_create(int type, uint32_t fmt, uint32_t w, uint32_t h, uint32_t d, uint32_t levels, int use)
 {
     @autoreleasepool
@@ -520,6 +540,8 @@ G9Tex* g9_tex_create(int type, uint32_t fmt, uint32_t w, uint32_t h, uint32_t d,
             free(t);
             return NULL;
         }
+        t->rw = (uint32_t)t->tex.width, t->rh = (uint32_t)t->tex.height;
+        up_track(t);
         return t;
     }
 }
@@ -533,6 +555,7 @@ void g9_tex_destroy(G9Tex* t)
             g_rt[i] = NULL, g_targets_changed = 1;
     if (g_ds == t)
         g_ds = NULL, g_targets_changed = 1;
+    up_forget(t);
     [t->tex release];
     [t->srgb release];
     free(t);
@@ -567,6 +590,28 @@ static void level_dims(const G9Tex* t, uint32_t level, uint32_t* w, uint32_t* h,
     if (!*h)
         *h = 1;
     *d = t->type == G9_TEX_3D ? (t->d >> level ? t->d >> level : 1) : 1;
+}
+
+/* A rectangle in the game's pixels of t's level 0, in its texture's (a scene target made at the
+ * render scale: gfx9_upscale.h) */
+static void scale_rect(const G9Tex* t, int32_t r[4])
+{
+    if (t->rw == t->w && t->rh == t->h)
+        return;
+    uint32_t h = t->type == G9_TEX_CUBE ? t->w : t->h;
+    for (int i = 0; i < 4; ++i)
+    {
+        int64_t num = i & 1 ? t->rh : t->rw, den = i & 1 ? h : t->w;
+        r[i] = (int32_t)(((int64_t)r[i] * num + den / 2) / den);
+    }
+}
+
+static void real_dims(const G9Tex* t, uint32_t level, uint32_t* w, uint32_t* h)
+{
+    uint32_t d;
+    level_dims(t, level, w, h, &d);
+    if (t->rw != t->w || t->rh != t->h)
+        *w = t->rw, *h = t->rh;
 }
 
 static id<MTLBlitCommandEncoder> blit(void)
@@ -641,6 +686,18 @@ void g9_tex_read(G9Tex* t, uint32_t face, uint32_t level, void* dst, uint32_t pi
 {
     if (!t || level >= t->levels || t->f.depth)
         return;
+    if (t->rw != t->w || t->rh != t->h)
+    {
+        /* a scene target at the render scale: read at the game's size */
+        G9Tex* full = g9_tex_create(G9_TEX_2D, t->fmt, t->w, t->h, 1, 1, G9_USE_SAMPLE);
+        if (full)
+        {
+            g9_stretch(t, 0, 0, NULL, full, 0, 0, NULL, 1);
+            g9_tex_read(full, 0, 0, dst, pitch);
+            g9_tex_destroy(full);
+        }
+        return;
+    }
     @autoreleasepool
     {
         uint32_t w, h, d;
@@ -728,50 +785,100 @@ void g9_shader_destroy(G9Shader* s)
 {
     if (!s)
         return;
-    for (uint32_t i = 0; i < s->nvar; ++i)
-        [s->var[i].fn release];
-    free(s->var);
+    free(s->var); /* the functions stay in g_fns: the game makes the same shaders again */
     free(s->tokens);
     free(s);
 }
 
-static id<MTLFunction> shader_variant(G9Shader* s, const SmOpts* o)
+/* Translated functions by shader content and variant, across shader objects: the game creates the
+ * same shaders again as it loads things.
+ *
+ * Background compiles: Metal takes tens of milliseconds for a shader or a pipeline, and the game
+ * meets new ones whenever something comes into view (turning the camera in town). A draw of the 3D
+ * scene compiles what it needs in the background and is skipped until it is ready (the object
+ * appears a frame or so later); every other draw (the interface, copies, effects) waits for its
+ * compile, so it is never missing. */
+static Cache g_fns;
+static uint32_t g_compiles, g_fn_reuse;
+
+static int compiled_ready(Compiled* c, int wait)
+{
+    while (!__atomic_load_n(&c->state, __ATOMIC_ACQUIRE))
+    {
+        if (!wait)
+            return 0;
+        struct timespec ts = { 0, 100000 };
+        nanosleep(&ts, NULL);
+    }
+    return 1;
+}
+
+static void compiled_set(Compiled* c, id obj)
+{
+    c->obj = obj;
+    __atomic_store_n(&c->state, 1, __ATOMIC_RELEASE);
+}
+
+static Compiled* shader_variant(G9Shader* s, const SmOpts* o, int background)
 {
     uint64_t key = fnv64(o, sizeof *o);
     for (uint32_t i = 0; i < s->nvar; ++i)
         if (s->var[i].key == key)
             return s->var[i].fn;
-    static char src[1 << 20];
-    char err[256];
-    SmInfo info;
-    id<MTLFunction> fn = nil;
-    if (sm_translate(s->tokens, s->ntokens, o, &info, src, sizeof src, err, sizeof err))
+    if (!s->content)
+        s->content = fnv64(s->tokens, 4ull * s->ntokens);
+    struct { uint64_t content, opts; uint32_t ntokens, pad; } fk = { s->content, key, s->ntokens, 0 };
+    uint64_t fh;
+    Compiled* c = (Compiled*)cache_get(&g_fns, &fk, sizeof fk, &fh);
+    if (c)
+        g_fn_reuse++;
+    else
     {
-        @autoreleasepool
+        c = (Compiled*)calloc(1, sizeof *c);
+        cache_put(&g_fns, &fk, sizeof fk, fh, (id)c);
+        if (++g_compiles % 100 == 0)
+            rt_log("[gfx9] %u shader variants compiled (%u reused from other shader objects)\n", g_compiles, g_fn_reuse);
+        static char src[1 << 20];
+        char err[256];
+        SmInfo info;
+        if (sm_translate(s->tokens, s->ntokens, o, &info, src, sizeof src, err, sizeof err))
         {
-            NSError* e = nil;
-            MTLCompileOptions* co = [[MTLCompileOptions new] autorelease];
-            co.languageVersion = MTLLanguageVersion3_0;
-            co.mathMode = MTLMathModeSafe; /* D3D9's IEEE behaviour: no reassociation, NaN and inf kept */
-            id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src) options:co error:&e];
-            if (lib)
+            @autoreleasepool
             {
-                fn = [lib newFunctionWithName:info.pixel ? @"pmain" : @"vmain"];
-                [lib release];
+                MTLCompileOptions* co = [[MTLCompileOptions new] autorelease];
+                co.languageVersion = MTLLanguageVersion3_0;
+                co.mathMode = MTLMathModeSafe; /* D3D9's IEEE behaviour: no reassociation, NaN and inf kept */
+                NSString* name = info.pixel ? @"pmain" : @"vmain";
+                uint32_t hash = s->info.hash;
+                void (^done)(id<MTLLibrary>, NSError*) = ^(id<MTLLibrary> lib, NSError* e) {
+                    if (!lib)
+                        rt_log("[gfx9] shader %08x: %s\n", hash, e.localizedDescription.UTF8String);
+                    compiled_set(c, lib ? [lib newFunctionWithName:name] : nil);
+                };
+                if (background)
+                    [g_dev newLibraryWithSource:@(src) options:co completionHandler:done];
+                else
+                {
+                    NSError* e = nil;
+                    id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src) options:co error:&e];
+                    done(lib, e);
+                    [lib release];
+                }
             }
-            else
-                rt_log("[gfx9] shader %08x: %s\n", s->info.hash, e.localizedDescription.UTF8String);
+        }
+        else
+        {
+            rt_log("[gfx9] shader %08x: %s\n", s->info.hash, err);
+            compiled_set(c, nil);
         }
     }
-    else
-        rt_log("[gfx9] shader %08x: %s\n", s->info.hash, err);
     if (s->nvar == s->capvar)
     {
         s->capvar = s->capvar ? s->capvar * 2 : 4;
         s->var = (Variant*)realloc(s->var, s->capvar * sizeof *s->var);
     }
-    s->var[s->nvar++] = (Variant){ key, fn };
-    return fn;
+    s->var[s->nvar++] = (Variant){ key, c };
+    return c;
 }
 
 /* --- render passes ------------------------------------------------------------------------------ */
@@ -811,6 +918,23 @@ static void target_size(uint32_t* w, uint32_t* h)
         return;
     }
     *w = *h = 1;
+}
+
+/* the bound targets' size in their textures' pixels, and per game pixel (a scene target made at
+ * the render scale: gfx9_upscale.h) */
+static void target_real_size(uint32_t* w, uint32_t* h, float* sx, float* sy)
+{
+    uint32_t lw, lh;
+    target_size(&lw, &lh);
+    *w = lw, *h = lh;
+    const G9Tex* t = NULL;
+    for (int i = 0; i < G9_MAX_RT && !t; ++i)
+        t = g_rt[i];
+    if (!t)
+        t = g_ds;
+    if (t && t->type == G9_TEX_2D && (t->rw != t->w || t->rh != t->h))
+        real_dims(t, 0, w, h);
+    *sx = (float)*w / lw, *sy = (float)*h / lh;
 }
 
 static int begin_pass(void)
@@ -975,7 +1099,10 @@ void g9_clear(uint32_t nrects, const int32_t* rects, uint32_t flags, uint32_t co
     [g_enc setStencilReferenceValue:stencil];
     [g_enc setCullMode:MTLCullModeNone];
     [g_enc setTriangleFillMode:MTLTriangleFillModeFill];
-    MTLViewport mv = { 0, 0, tw, th, 0, 1 };
+    uint32_t rw, rh;
+    float sx, sy;
+    target_real_size(&rw, &rh, &sx, &sy);
+    MTLViewport mv = { 0, 0, rw, rh, 0, 1 };
     [g_enc setViewport:mv];
     float zz[4] = { z, 0, 0, 0 };
     [g_enc setFragmentBytes:col length:16 atIndex:0];
@@ -994,6 +1121,9 @@ void g9_clear(uint32_t nrects, const int32_t* rects, uint32_t flags, uint32_t co
             if (r > scissor[2]) r = scissor[2];
             if (b > scissor[3]) b = scissor[3];
         }
+        l = (int32_t)lroundf(l * sx), t = (int32_t)lroundf(t * sy), r = (int32_t)lroundf(r * sx), b = (int32_t)lroundf(b * sy);
+        if (r > (int32_t)rw) r = (int32_t)rw;
+        if (b > (int32_t)rh) b = (int32_t)rh;
         if (r <= l || b <= t)
             continue;
         MTLScissorRect sr = { (NSUInteger)l, (NSUInteger)t, (NSUInteger)(r - l), (NSUInteger)(b - t) };
@@ -1003,7 +1133,7 @@ void g9_clear(uint32_t nrects, const int32_t* rects, uint32_t flags, uint32_t co
         [g_enc setVertexBytes:uv length:16 atIndex:1];
         [g_enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     }
-    MTLScissorRect full = { 0, 0, tw, th };
+    MTLScissorRect full = { 0, 0, rw, rh };
     [g_enc setScissorRect:full];
 }
 
@@ -1025,13 +1155,18 @@ void g9_stretch(G9Tex* src, uint32_t sface, uint32_t slevel, const int32_t sr[4]
         memcpy(s, sr, sizeof s);
     if (dr)
         memcpy(d, dr, sizeof d);
+    /* the rectangles in the game's pixels, in the textures' (scene targets at the render scale) */
+    scale_rect(src, s);
+    scale_rect(dst, d);
+    real_dims(src, slevel, &sw, &sh);
+    real_dims(dst, dlevel, &dw, &dh);
     @autoreleasepool
     {
         if ((s[2] - s[0] == d[2] - d[0] && s[3] - s[1] == d[3] - d[1] && src->tex.pixelFormat == dst->tex.pixelFormat) ||
             src->f.depth)
         {
             /* same size and format (and every depth copy): a blit */
-            if (src->tex.pixelFormat != dst->tex.pixelFormat)
+            if (src->tex.pixelFormat != dst->tex.pixelFormat || s[2] - s[0] != d[2] - d[0] || s[3] - s[1] != d[3] - d[1])
                 return;
             id<MTLBlitCommandEncoder> b = blit();
             [b copyFromTexture:src->tex
@@ -1131,8 +1266,8 @@ static MTLVertexFormat vertex_format(uint32_t type, uint8_t* is_int)
     case 10: return MTLVertexFormatShort4Normalized;
     case 11: return MTLVertexFormatUShort2Normalized;
     case 12: return MTLVertexFormatUShort4Normalized;
-    case 13: return MTLVertexFormatUInt1010102Normalized;
-    case 14: return MTLVertexFormatInt1010102Normalized;
+    case 13: *is_int = 3; return MTLVertexFormatUInt; /* UDEC3, DEC3N: unpacked by the shader */
+    case 14: *is_int = 4; return MTLVertexFormatUInt;
     case 15: return MTLVertexFormatHalf2;
     case 16: return MTLVertexFormatHalf4;
     default: return MTLVertexFormatInvalid;
@@ -1319,7 +1454,7 @@ typedef struct PipeKey
     MTLPixelFormat color[G9_MAX_RT], depth;
     uint8_t blend, src, dst, op, sep, src_a, dst_a, op_a;
     uint8_t mask[G9_MAX_RT];
-    uint8_t srgb, pad[3];
+    uint8_t srgb, topology, pad[2];
 } PipeKey;
 
 static int is_depth_format(const G9Tex* t) { return t && t->f.depth; }
@@ -1340,6 +1475,7 @@ static void draw_prim(MTLPrimitiveType* mp, uint32_t prim, uint32_t count, uint3
 static uint32_t g_draw_errors;
 
 #include "gfx9_fx.h"
+#include "gfx9_upscale.h"
 
 /* --- one-frame draw trace (XIV_GFXTRACE=<dir>; touch <dir>/req to trace the next frame) ---------
  * <dir>/draws.txt: a line per draw (shaders, targets, blend, samplers); <dir>/consts.bin: per draw
@@ -1546,7 +1682,6 @@ void g9_draw(const G9Draw* d)
         memset(&po, 0, sizeof po);
         PipeKey k;
         memset(&k, 0, sizeof k);
-        MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
         uint32_t streams_used = 0;
         const SmInfo* vi = &d->vs->info;
         for (uint32_t i = 0; i < vi->nin; ++i)
@@ -1569,9 +1704,6 @@ void g9_draw(const G9Draw* d)
                 uint8_t is_int;
                 MTLVertexFormat f = vertex_format(e->type, &is_int);
                 vo.attr_int[reg] = is_int;
-                vd.attributes[reg].format = f;
-                vd.attributes[reg].offset = e->offset;
-                vd.attributes[reg].bufferIndex = e->stream;
                 streams_used |= 1u << e->stream;
                 k.attr[reg].fmt = (uint8_t)f, k.attr[reg].stream = e->stream, k.attr[reg].offset = e->offset;
                 k.attr[reg].attr = 1;
@@ -1579,9 +1711,6 @@ void g9_draw(const G9Draw* d)
             else
             {
                 /* nothing supplies it: (0, 0, 0, 1) from the default buffer */
-                vd.attributes[reg].format = MTLVertexFormatFloat4;
-                vd.attributes[reg].offset = 0;
-                vd.attributes[reg].bufferIndex = 15;
                 streams_used |= 1u << 15;
                 k.attr[reg].attr = 2;
             }
@@ -1590,22 +1719,10 @@ void g9_draw(const G9Draw* d)
             if (streams_used & (1u << s))
             {
                 if (s == 15 && !(d->stream[15].stride))
-                {
-                    vd.layouts[15].stepFunction = MTLVertexStepFunctionConstant;
-                    vd.layouts[15].stepRate = 0;
-                    vd.layouts[15].stride = 16;
-                    k.stride[15] = 0;
                     continue;
-                }
-                uint32_t stride = d->stream[s].stride;
-                vd.layouts[s].stride = (stride + 3) & ~3u;
-                k.stride[s] = stride;
+                k.stride[s] = d->stream[s].stride;
                 if (d->stream[s].freq & 0x80000000u) /* D3DSTREAMSOURCE_INSTANCEDATA */
-                {
-                    vd.layouts[s].stepFunction = MTLVertexStepFunctionPerInstance;
-                    vd.layouts[s].stepRate = d->stream[s].freq & 0x3FFFFFFFu ? d->stream[s].freq & 0x3FFFFFFFu : 1;
                     k.step_instance[s] = 1;
-                }
             }
         /* what the pixel shader reads that the vertex shader does not write */
         const SmInfo* pi = &d->ps->info;
@@ -1629,7 +1746,11 @@ void g9_draw(const G9Draw* d)
                 else
                     po.shadow_mask |= (uint16_t)(1u << s);
             }
-        id<MTLFunction> vf = shader_variant(d->vs, &vo), pf = shader_variant(d->ps, &po);
+        int background = d->rs.zenable && g_ds; /* a draw of the 3D scene: background compiles */
+        Compiled *vc = shader_variant(d->vs, &vo, background), *pc = shader_variant(d->ps, &po, background);
+        if (!compiled_ready(vc, !background) || !compiled_ready(pc, !background))
+            return;
+        id<MTLFunction> vf = vc->obj, pf = pc->obj;
         if (!vf || !pf)
             return;
         k.vs = fnv64(&vo, sizeof vo) ^ ((uint64_t)vi->hash << 32);
@@ -1650,14 +1771,51 @@ void g9_draw(const G9Draw* d)
                 k.src_a = d->rs.src_a, k.dst_a = d->rs.dst_a, k.op_a = d->rs.op_a;
         }
 
+        k.topology = d->prim == 1 ? 1 : d->prim <= 3 ? 2 : 3;
+
         /* --- the pipeline --- */
         uint64_t h;
-        id<MTLRenderPipelineState> pipe = cache_get(&g_pipes, &k, sizeof k, &h);
-        if (!pipe)
+        Compiled* pcomp = (Compiled*)cache_get(&g_pipes, &k, sizeof k, &h);
+        if (!pcomp)
         {
+            pcomp = (Compiled*)calloc(1, sizeof *pcomp);
+            cache_put(&g_pipes, &k, sizeof k, h, (id)pcomp);
             MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor new] autorelease];
             pd.vertexFunction = vf;
             pd.fragmentFunction = pf;
+            /* the vertex layout, made only for a new pipeline: allocating one each draw was a
+             * tenth of the render thread */
+            MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
+            for (uint32_t r = 0; r < sizeof k.attr / sizeof k.attr[0]; ++r)
+                if (k.attr[r].attr == 1)
+                {
+                    vd.attributes[r].format = (MTLVertexFormat)k.attr[r].fmt;
+                    vd.attributes[r].offset = k.attr[r].offset;
+                    vd.attributes[r].bufferIndex = k.attr[r].stream;
+                }
+                else if (k.attr[r].attr == 2)
+                {
+                    vd.attributes[r].format = MTLVertexFormatFloat4;
+                    vd.attributes[r].offset = 0;
+                    vd.attributes[r].bufferIndex = 15;
+                }
+            for (uint32_t s = 0; s < G9_MAX_STREAMS; ++s)
+                if (streams_used & (1u << s))
+                {
+                    if (s == 15 && !(d->stream[15].stride))
+                    {
+                        vd.layouts[15].stepFunction = MTLVertexStepFunctionConstant;
+                        vd.layouts[15].stepRate = 0;
+                        vd.layouts[15].stride = 16;
+                        continue;
+                    }
+                    vd.layouts[s].stride = (k.stride[s] + 3) & ~3u;
+                    if (k.step_instance[s])
+                    {
+                        vd.layouts[s].stepFunction = MTLVertexStepFunctionPerInstance;
+                        vd.layouts[s].stepRate = d->stream[s].freq & 0x3FFFFFFFu ? d->stream[s].freq & 0x3FFFFFFFu : 1;
+                    }
+                }
             pd.vertexDescriptor = vd;
             for (int i = 0; i < G9_MAX_RT; ++i)
             {
@@ -1692,12 +1850,29 @@ void g9_draw(const G9Draw* d)
             pd.inputPrimitiveTopology = d->prim == 1 ? MTLPrimitiveTopologyClassPoint
                                         : d->prim <= 3 ? MTLPrimitiveTopologyClassLine
                                                        : MTLPrimitiveTopologyClassTriangle;
-            NSError* e = nil;
-            pipe = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
-            if (!pipe && g_draw_errors++ < 20)
-                rt_log("[gfx9] pipeline (vs %08x, ps %08x): %s\n", vi->hash, pi->hash, e.localizedDescription.UTF8String);
-            cache_put(&g_pipes, &k, sizeof k, h, pipe);
+            static uint32_t made;
+            if (++made % 100 == 0)
+                rt_log("[gfx9] %u pipelines made\n", made);
+            uint32_t vh = vi->hash, ph = pi->hash;
+            Compiled* pc2 = pcomp;
+            void (^done)(id<MTLRenderPipelineState>, NSError*) = ^(id<MTLRenderPipelineState> p, NSError* e) {
+                if (!p && g_draw_errors++ < 20)
+                    rt_log("[gfx9] pipeline (vs %08x, ps %08x): %s\n", vh, ph, e.localizedDescription.UTF8String);
+                compiled_set(pc2, [p retain]);
+            };
+            if (background)
+                [g_dev newRenderPipelineStateWithDescriptor:pd completionHandler:done];
+            else
+            {
+                NSError* e = nil;
+                id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+                done(p, e);
+                [p release];
+            }
         }
+        if (!compiled_ready(pcomp, !background))
+            return;
+        id<MTLRenderPipelineState> pipe = pcomp->obj;
         if (!pipe)
             return;
 
@@ -1713,16 +1888,21 @@ void g9_draw(const G9Draw* d)
         [enc setDepthBias:d->rs.depth_bias * 16777215.0f slopeScale:d->rs.slope_bias clamp:0];
         uint32_t bf = d->rs.blend_factor;
         [enc setBlendColorRed:((bf >> 16) & 255) / 255.0f green:((bf >> 8) & 255) / 255.0f blue:(bf & 255) / 255.0f alpha:(bf >> 24) / 255.0f];
+        /* the game's pixels in the targets' (scene targets at the render scale: gfx9_upscale.h) */
         uint32_t tw, th;
-        target_size(&tw, &th);
-        MTLViewport mv = { d->vp.x, d->vp.y, d->vp.w, d->vp.h, d->vp.minz, d->vp.maxz };
+        float sx, sy;
+        target_real_size(&tw, &th, &sx, &sy);
+        float vw = d->vp.w * sx, vh = d->vp.h * sy;
+        MTLViewport mv = { d->vp.x * sx, d->vp.y * sy, vw, vh, d->vp.minz, d->vp.maxz };
         [enc setViewport:mv];
         MTLScissorRect sc = { 0, 0, tw, th };
         if (d->rs.scissor)
         {
-            int32_t l = d->scissor[0] > 0 ? d->scissor[0] : 0, t = d->scissor[1] > 0 ? d->scissor[1] : 0;
-            int32_t r = d->scissor[2] < (int32_t)tw ? d->scissor[2] : (int32_t)tw;
-            int32_t b = d->scissor[3] < (int32_t)th ? d->scissor[3] : (int32_t)th;
+            int32_t s0 = (int32_t)lroundf(d->scissor[0] * sx), s1 = (int32_t)lroundf(d->scissor[1] * sy);
+            int32_t s2 = (int32_t)lroundf(d->scissor[2] * sx), s3 = (int32_t)lroundf(d->scissor[3] * sy);
+            int32_t l = s0 > 0 ? s0 : 0, t = s1 > 0 ? s1 : 0;
+            int32_t r = s2 < (int32_t)tw ? s2 : (int32_t)tw;
+            int32_t b = s3 < (int32_t)th ? s3 : (int32_t)th;
             if (r <= l || b <= t)
                 return; /* nothing visible */
             sc = (MTLScissorRect){ (NSUInteger)l, (NSUInteger)t, (NSUInteger)(r - l), (NSUInteger)(b - t) };
@@ -1738,8 +1918,13 @@ void g9_draw(const G9Draw* d)
         [enc setFragmentBytes:d->psb length:16 * 4 atIndex:SM_BUF_BOOL];
         /* D3D9's pixel centres are on integer coordinates, Metal's on half-integers: geometry moves half a
          * pixel right and down (+1/w, -1/h in clip space; as wined3d and DXVK do) */
-        SmAux aux = { { 1.0f / (d->vp.w ? d->vp.w : 1), -1.0f / (d->vp.h ? d->vp.h : 1), 0, 0 },
+        SmAux aux = { { 1.0f / (vw >= 1.0f ? vw : 1.0f), -1.0f / (vh >= 1.0f ? vh : 1.0f), 0, 0 },
                       { (d->rs.alpha_ref & 255) / 255.0f, 0, 0, 0 } };
+        for (uint32_t s = 0; s < G9_PS_SAMPLERS; ++s)
+            aux.lod_bias[s] = d->samp[s].lod_bias;
+        memcpy(aux.clip, d->clip, sizeof aux.clip);
+        aux.clip_on[0] = d->clip_on;
+        up_draw_aux(d, &aux, sx, sy);
         [enc setVertexBytes:&aux length:sizeof aux atIndex:SM_BUF_AUX];
         [enc setFragmentBytes:&aux length:sizeof aux atIndex:SM_BUF_AUX];
 
@@ -1780,7 +1965,22 @@ void g9_draw(const G9Draw* d)
                 [enc setVertexBuffer:g_default_attr offset:0 atIndex:15];
                 continue;
             }
-            if (st->buf && !(st->offset & 3))
+            if (st->stride & 3)
+            {
+                /* Metal strides are multiples of 4: copy the vertices out at the layout's padded stride */
+                if (!st->data)
+                    return;
+                uint32_t padded = (st->stride + 3) & ~3u, n = st->size / st->stride;
+                id<MTLBuffer> rb;
+                uint32_t off;
+                uint8_t* p = (uint8_t*)ring(n * padded, 16, &rb, &off);
+                if (!p)
+                    return;
+                for (uint32_t v = 0; v < n; ++v)
+                    memcpy(p + v * padded, (const uint8_t*)st->data + v * st->stride, st->stride);
+                [enc setVertexBuffer:rb offset:off atIndex:s];
+            }
+            else if (st->buf && !(st->offset & 3))
                 [enc setVertexBuffer:st->buf->buf offset:st->offset atIndex:s];
             else if (st->data)
             {
@@ -1885,6 +2085,172 @@ static int fps_text(uint32_t* out)
     return n;
 }
 
+/* XIV_FRAMELOG=1: frame pacing, every 600 frames: the time between presents, and how many of the
+ * display's refreshes each frame stayed on screen (Core Animation's presentedTime). A frame rate can
+ * be high and still judder when frames alternate between one and two refreshes. */
+#define FL_N 600
+static int g_framelog = -1;
+static double g_fl_cpu[FL_N], g_fl_shown[FL_N];
+static volatile uint32_t g_fl_ncpu, g_fl_nshown, g_fl_dropped;
+
+static int fl_cmp(const void* a, const void* b)
+{
+    double x = *(const double*)a, y = *(const double*)b;
+    return x < y ? -1 : x > y;
+}
+
+static void fl_stats(const char* what, double* v, uint32_t n, double refresh)
+{
+    if (!n)
+        return;
+    qsort(v, n, sizeof *v, fl_cmp);
+    double sum = 0, sq = 0;
+    for (uint32_t i = 0; i < n; ++i)
+        sum += v[i], sq += v[i] * v[i];
+    double mean = sum / n, sd = sqrt(fmax(0, sq / n - mean * mean));
+    char hist[160] = "";
+    if (refresh > 0)
+    {
+        /* frames per whole number of refreshes they spanned */
+        uint32_t bins[7] = { 0 };
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            long k = lround(v[i] / refresh);
+            bins[k < 0 ? 0 : k > 6 ? 6 : k]++;
+        }
+        int o = snprintf(hist, sizeof hist, " | refreshes:");
+        for (int k = 0; k < 7; ++k)
+            if (bins[k])
+                o += snprintf(hist + o, sizeof hist - (size_t)o, " %s%d=%u", k == 6 ? ">=" : "", k, bins[k]);
+    }
+    rt_log("[pace] %s ms: mean %.2f sd %.2f p50 %.2f p95 %.2f p99 %.2f max %.2f%s\n", what, mean * 1e3, sd * 1e3,
+           v[n / 2] * 1e3, v[n * 95 / 100] * 1e3, v[n * 99 / 100] * 1e3, v[n - 1] * 1e3, hist);
+}
+
+static void framelog(id<CAMetalDrawable> drawable)
+{
+    static double last_cpu;
+    double now = CACurrentMediaTime();
+    if (last_cpu)
+        g_fl_cpu[g_fl_ncpu++ % FL_N] = now - last_cpu;
+    last_cpu = now;
+    if (drawable)
+        [drawable addPresentedHandler:^(id<MTLDrawable> d) {
+            /* on one Core Animation queue, in present order */
+            static double last;
+            double t = d.presentedTime;
+            if (t == 0)
+            {
+                __atomic_fetch_add(&g_fl_dropped, 1, __ATOMIC_RELAXED);
+                return;
+            }
+            if (last)
+                g_fl_shown[__atomic_fetch_add(&g_fl_nshown, 1, __ATOMIC_RELAXED) % FL_N] = t - last;
+            last = t;
+        }];
+    if (g_fl_ncpu < FL_N)
+        return;
+    float hz = 0;
+    SDL_DisplayID disp = g_sdl_window ? SDL_GetDisplayForWindow((SDL_Window*)g_sdl_window) : 0;
+    const SDL_DisplayMode* dm = disp ? SDL_GetCurrentDisplayMode(disp) : NULL;
+    if (dm)
+        hz = dm->refresh_rate;
+    double refresh = hz > 0 ? 1.0 / hz : 0;
+    static double cpu[FL_N], shown[FL_N];
+    uint32_t ns = g_fl_nshown < FL_N ? g_fl_nshown : FL_N;
+    memcpy(cpu, g_fl_cpu, sizeof cpu);
+    memcpy(shown, g_fl_shown, ns * sizeof *shown);
+    rt_log("[pace] %.0f Hz display, %u not shown\n", hz, g_fl_dropped);
+    fl_stats("cpu  ", cpu, FL_N, refresh);
+    fl_stats("shown", shown, ns, refresh);
+    g_fl_ncpu = g_fl_nshown = g_fl_dropped = 0;
+}
+
+/* Pacing (XIV_PACE=1, with vsync; off by default: the game's main thread is the limit, and a frame
+ * time near a refresh multiple held it a step lower): every frame stays on screen the same whole
+ * number of refreshes k, and the game's frame limiter is told refresh/k (g9_pace_hook). Without it a
+ * game at 60 fps on a 100 Hz display shows frames for 2, 2, 1 refreshes: smooth numbers, juddering
+ * motion. k goes up when over a tenth of a half second's frames miss their refresh, and is tried one
+ * lower after a run with no misses (backing off when that fails again). */
+void (*g9_pace_hook)(uint32_t fps);
+static int g_pace = -1;
+static double g_refresh;
+static volatile uint32_t g_pace_k = 1, g_pace_frames, g_pace_misses;
+
+/* the display's refresh in ns while presents are paced, else 0 */
+uint64_t g9_pace_refresh_ns(void)
+{
+    return g_pace > 0 && g_refresh > 0 ? (uint64_t)(g_refresh * 1e9 + 0.5) : 0;
+}
+
+static void pace_shown(double dt)
+{
+    double r = g_refresh;
+    if (r <= 0)
+        return;
+    __atomic_fetch_add(&g_pace_frames, 1, __ATOMIC_RELAXED);
+    if (dt > (__atomic_load_n(&g_pace_k, __ATOMIC_RELAXED) + 0.5) * r)
+        __atomic_fetch_add(&g_pace_misses, 1, __ATOMIC_RELAXED);
+}
+
+static void pace_set(uint32_t k, const char* why)
+{
+    __atomic_store_n(&g_pace_k, k, __ATOMIC_RELAXED);
+    uint32_t fps = (uint32_t)ceil(1.0 / (g_refresh * k));
+    rt_log("[pace] %.0f Hz / %u: %u fps (%s)\n", 1.0 / g_refresh, k, fps, why);
+    if (g9_pace_hook)
+        g9_pace_hook(fps);
+}
+
+/* once a frame: the display's rate, and k from the last half second's misses */
+static void pace_update(void)
+{
+    static double window_at, probe_at, probe_wait = 4, probed_from;
+    double now = CACurrentMediaTime();
+    if (!window_at || now - window_at >= 0.5)
+    {
+        float hz = 0;
+        SDL_DisplayID disp = g_sdl_window ? SDL_GetDisplayForWindow((SDL_Window*)g_sdl_window) : 0;
+        const SDL_DisplayMode* dm = disp ? SDL_GetCurrentDisplayMode(disp) : NULL;
+        if (dm)
+            hz = dm->refresh_rate;
+        if (hz < 20)
+            hz = 60;
+        uint32_t frames = __atomic_exchange_n(&g_pace_frames, 0, __ATOMIC_RELAXED);
+        uint32_t misses = __atomic_exchange_n(&g_pace_misses, 0, __ATOMIC_RELAXED);
+        uint32_t k = g_pace_k;
+        if (fabs(1.0 / hz - g_refresh) > 1e-4)
+        {
+            /* a new display: start at the game's 60 fps, rounded to whole refreshes */
+            g_refresh = 1.0 / hz;
+            k = (uint32_t)ceil(hz / 60.0 - 0.05);
+            pace_set(k ? k : 1, "display");
+            probe_at = now + probe_wait;
+        }
+        /* never paced below about 30 fps: a frame time that varies (a town full of people) misses
+         * at any k, and each step down tells the game's limiter to wait longer still */
+        else if (frames >= 4 && misses * 10 > frames && k < (uint32_t)fmax(1.0, floor(hz / 30.0)))
+        {
+            if (probed_from && now - probed_from < 1.5)
+                probe_wait = fmin(probe_wait * 2, 64);
+            probed_from = 0;
+            pace_set(k + 1, "missed refreshes");
+            probe_at = now + probe_wait;
+        }
+        else if (misses)
+            probe_at = now + probe_wait;
+        else if (k > 1 && now >= probe_at && 1.0 / (g_refresh * (k - 1)) <= 120.5)
+        {
+            probed_from = now;
+            pace_set(k - 1, "trying faster");
+            probe_at = now + probe_wait;
+        }
+        else if (probed_from && now - probed_from >= 1.5)
+            probed_from = 0, probe_wait = fmax(4, probe_wait / 2);
+        window_at = now;
+    }
+}
+
 void g9_present(G9Tex* bb)
 {
     @autoreleasepool
@@ -1894,6 +2260,25 @@ void g9_present(G9Tex* bb)
         end_pass();
         fit_drawable(bb);
         id<CAMetalDrawable> drawable = [g_layer nextDrawable];
+        if (g_framelog < 0)
+            g_framelog = getenv("XIV_FRAMELOG") && strcmp(getenv("XIV_FRAMELOG"), "0");
+        if (g_framelog)
+            framelog(drawable);
+        if (g_pace < 0)
+            g_pace = g_layer.displaySyncEnabled && getenv("XIV_PACE") && strcmp(getenv("XIV_PACE"), "0");
+        if (g_pace)
+        {
+            pace_update();
+            if (drawable)
+                [drawable addPresentedHandler:^(id<MTLDrawable> d) {
+                    static double last;
+                    double t = d.presentedTime;
+                    if (t && last)
+                        pace_shown(t - last);
+                    if (t)
+                        last = t;
+                }];
+        }
         if (drawable && bb)
         {
             MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1930,10 +2315,14 @@ void g9_present(G9Tex* bb)
                 [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
             }
             [e endEncoding];
-            [cmd() presentDrawable:drawable];
+            if (g_pace && g_refresh > 0)
+                [cmd() presentDrawable:drawable afterMinimumDuration:(g_pace_k - 0.5) * g_refresh];
+            else
+                [cmd() presentDrawable:drawable];
         }
         g9_flush_frame(0);
         trace_frame_end();
+        up_frame_end(bb);
         fx_frame_end(bb);
     }
 }

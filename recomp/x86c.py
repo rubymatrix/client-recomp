@@ -68,6 +68,29 @@ def x87_locals(lines):
     return out
 
 
+def xmm_locals(lines):
+    """A function's text with the XMM registers it uses in locals (sse.h, "XMM in locals") instead
+    of g->xmm. g has them at every REGS_STORE and gives them back at every REGS_LOAD (calls, returns
+    and hooks), so callees and the runtime see the same state as before."""
+    used = sorted({int(m) for line in lines if isinstance(line, str) for m in re.findall(r'\bX\(([0-7])\)', line)})
+    if not used:
+        return lines
+    decl = 'X128 %s;' % ', '.join('xl%d' % i for i in used)
+    load = ' '.join('xl%d = g->xmm[%d];' % (i, i) for i in used)
+    store = ' '.join('g->xmm[%d] = xl%d;' % (i, i) for i in used)
+    store_re = re.compile(r'(REGS_STORE(?:_TO_[0-9a-f]{8}|_RET|_NOFLAGS|_CUT\(0x[0-9a-f]+\))?;)')
+    out = []
+    for line in lines:
+        if not isinstance(line, str) or line.lstrip().startswith('/*'):
+            out.append(line)
+            continue
+        s = re.sub(r'\bX\(([0-7])\)', r'xl\1', line)
+        s = s.replace('REGS_DECL;', 'REGS_DECL; ' + decl).replace('REGS_LOAD;', 'REGS_LOAD; ' + load)
+        s = store_re.sub(store.replace('\\', '\\\\') + r' \1', s)
+        out.append(s)
+    return out
+
+
 def mask(bits):
     return (1 << bits) - 1
 
@@ -207,6 +230,116 @@ class FunctionTranslator:
                     calls.append((i.address, tgt, la, nxt_call))
             out[mode] = {'calls': calls, 'entry': bool(insns) and live[idx.get(self.entry, 0)]}
         self.flaginfo = out
+
+    # ------------------------------------------------------------------ registers across calls
+
+    # bit per 32-bit register, in Guest's order
+    REGBIT = {'eax': 1, 'ecx': 2, 'edx': 4, 'ebx': 8, 'esp': 16, 'ebp': 32, 'esi': 64, 'edi': 128}
+    SUBREG = {'al': 'eax', 'ah': 'eax', 'ax': 'eax', 'cl': 'ecx', 'ch': 'ecx', 'cx': 'ecx', 'dl': 'edx', 'dh': 'edx',
+              'dx': 'edx', 'bl': 'ebx', 'bh': 'ebx', 'bx': 'ebx', 'sp': 'esp', 'bp': 'ebp', 'si': 'esi', 'di': 'edi'}
+    ABI_CLOBBER = 1 | 2 | 4 | 16   # what any callee may change: eax, ecx, edx (and esp)
+    ABI_READ = 1 | 2 | 4 | 16      # what an unknown callee may take: this/fastcall registers, eax, the stack
+
+    def reg_analysis(self):
+        """Each instruction's register reads and writes as bit masks, and how control leaves it, for
+        recomp.py's whole-program register liveness: which registers a function reads on entry and
+        which it may return changed, so a call stores and reloads only those (REGS_STORE_TO /
+        REGS_STORE_RET). The registers a function saves in its prologue and restores before every
+        exit (push r ... pop r; ret) are returned unchanged whatever it does in between."""
+        insns = self.insns
+        idx = {i.address: k for k, i in enumerate(insns)}
+        rb, sub = self.REGBIT, self.SUBREG
+        out = []
+        targets = set()
+        unsafe = bool(self.unimpl)
+        for i in insns:
+            mn = i.mnemonic.split(' ')[-1]
+            try:
+                rd_ids, wr_ids = i.regs_access()
+            except Exception:
+                unsafe = True
+                rd_ids, wr_ids = (), ()
+            r = w = 0
+            for x in rd_ids:
+                n = i.reg_name(x)
+                r |= rb.get(n, 0) | rb.get(sub.get(n, ''), 0)
+            for x in wr_ids:
+                n = i.reg_name(x)
+                if n in rb:
+                    w |= rb[n]
+                elif n in sub:
+                    w |= rb[sub[n]]
+                    r |= rb[sub[n]]  # a partial write keeps the rest of the register
+            if self.ctx.hooks.get(i.address):
+                unsafe = True
+            nxt = i.address + i.size
+            kind, tgt, succ = 0, None, []
+            if mn.startswith('ret'):
+                kind = 3
+            elif mn == 'call':
+                op = i.operands[0] if i.operands else None
+                t = op.imm & 0xFFFFFFFF if op is not None and op.type == X.X86_OP_IMM else None
+                if t is not None and t == nxt:
+                    pass  # call $+5 (get EIP): a push
+                elif t is not None and t in self.ctx.entries and not self.inline_stub(t):
+                    kind, tgt = 1, t
+                else:
+                    kind = 2  # through a pointer, an import, a stub: the ABI
+                if nxt in idx:
+                    succ.append(idx[nxt])
+            else:
+                jt = self.jump_targets(i)
+                if mn not in ('jmp', 'int3') and nxt in idx:
+                    succ.append(idx[nxt])
+                for t in jt:
+                    if t in idx:
+                        succ.append(idx[t])
+                        targets.add(t)
+                    elif t in self.ctx.entries:
+                        kind, tgt = 4, t  # a tail jump into another function
+                    else:
+                        unsafe = True
+                if mn == 'jmp' and not jt:
+                    kind = 5  # out through a pointer
+            out.append((r, w, kind, tgt, succ))
+        # registers saved at entry and restored before every exit
+        preserved = 0
+        if insns and idx.get(self.entry) == 0:
+            for name in ('ebx', 'ebp', 'esi', 'edi'):
+                bit = rb[name]
+                ok = False
+                for k, i in enumerate(insns):  # the entry block: push before any write
+                    if k and (insns[k].address in targets or out[k - 1][2] or out[k - 1][4] != [k]):
+                        break
+                    if i.mnemonic == 'push' and i.op_str == name:
+                        ok = True
+                        break
+                    if out[k][1] & bit:
+                        break
+                if not ok:
+                    continue
+                for k, (r, w, kind, tgt, succ) in enumerate(out):
+                    if kind not in (3, 4, 5):
+                        continue
+                    j, found = k - 1, False
+                    while j >= 0 and insns[j + 1].address not in targets:
+                        ij = insns[j]
+                        if (ij.mnemonic == 'pop' and ij.op_str == name) or (name == 'ebp' and ij.mnemonic == 'leave'):
+                            found = True
+                            break
+                        if out[j][1] & bit or out[j][2] or out[j][4] != [j + 1]:
+                            break
+                        j -= 1
+                    if not found:
+                        ok = False
+                        break
+                if ok:
+                    preserved |= bit
+        own = 0
+        for r, w, kind, tgt, succ in out:
+            own |= w
+        self.reginfo = {'insns': out, 'entry': idx.get(self.entry, 0), 'preserved': preserved,
+                        'own': own & ~preserved, 'unsafe': unsafe or not insns or self.entry not in idx}
 
     def jump_targets(self, ins):
         """Direct intra-procedural control transfers out of an instruction, and the return point of
@@ -389,7 +522,7 @@ class FunctionTranslator:
         if prev_falls_to is not None:
             body.append('    ' + self.goto(prev_falls_to, None))
 
-        out = ['void %s%08x(Guest* g)' % (self.ctx.prefix, self.entry), '{', '    REGS_DECL;', '    REGS_LOAD;']
+        out = ['void %s%08x(Guest* RT_RESTRICT g)' % (self.ctx.prefix, self.entry), '{', '    REGS_DECL;', '    REGS_LOAD;']
         if self.insns and self.insns[0].address != self.entry:
             out.append('    goto L_%08x;' % self.entry)
             self.labels.add(self.entry)
@@ -401,7 +534,8 @@ class FunctionTranslator:
             else:
                 out.append(item)
         out.append('}')
-        return x87_locals(out) if self.uses_x87 else out
+        self.reg_analysis()
+        return xmm_locals(x87_locals(out) if self.uses_x87 else out)
 
     ATOMIC_RMW = ('add', 'sub', 'and', 'or', 'xor', 'inc', 'dec', 'not', 'neg')
 
@@ -439,6 +573,20 @@ class FunctionTranslator:
             return None
         name = getattr(self.ctx, 'imports', {}).get(op.mem.disp & 0xFFFFFFFF)
         return self.INLINE_IMPORTS.get(name)
+
+    def inline_stub(self, va):
+        """A call to a linker stub `jmp [IAT]` is a call to the import (ffxivgame.exe calls its
+        D3DPERF markers this way, around every scene node it draws)."""
+        imports = getattr(self.ctx, 'imports', None)
+        if not imports:
+            return None
+        try:
+            b = self.ctx.read(va, 6)
+        except Exception:
+            return None
+        if len(b) < 6 or b[0] != 0xFF or b[1] != 0x25:
+            return None
+        return self.INLINE_IMPORTS.get(imports.get(int.from_bytes(b[2:6], 'little')))
 
     def one(self, ins):
         """Returns (C statements, falls_through). Guest threads run in parallel (the runtime's
@@ -736,7 +884,7 @@ class FunctionTranslator:
                     cases.append('case %s: %s' % (hexu(tgt), self.goto(tgt, ins.address)))
                 return pro + ['switch (rd32(A) - RD) {'] + ['    ' + c for c in cases] + \
                     ['    default: RT_BADJUMP(%s);' % hexu(ins.address), '}'], False
-            return pro + ['{ uint32_t t = %s; REGS_STORE; rt_call_indirect(g, t); return; }' % self.rd(ins, t, 32)], False
+            return pro + ['{ uint32_t t = %s; REGS_STORE; RT_CALL_IC(t); return; }' % self.rd(ins, t, 32)], False
         if mn[0] == 'j' and mn[1:] in CC:
             t, = ops
             return ['if (%s) %s' % (CC[mn[1:]], self.goto(t.imm & 0xFFFFFFFF, ins.address))], True
@@ -753,6 +901,9 @@ class FunctionTranslator:
                 tgt = t.imm & 0xFFFFFFFF
                 if tgt == nxt:  # call $+5 ; pop r  (get EIP)
                     return ['esp -= 4; wr32(esp, %s + RD);' % hexu(nxt)], True
+                inl = self.inline_stub(tgt)
+                if inl:
+                    return [inl], True
                 if tgt not in self.ctx.entries:
                     # A call to code no function starts at (an SEH __finally block, or code past
                     # a body Ghidra cut short): it becomes an entry of its own, translated too.
@@ -766,7 +917,7 @@ class FunctionTranslator:
             inl = self.inline_import(t)
             if inl:
                 return [inl], True
-            return pro + ['{ uint32_t t = %s; esp -= 4; wr32(esp, %s + RD); REGS_STORE_NOFLAGS; rt_call_indirect(g, t); REGS_LOAD; }'
+            return pro + ['{ uint32_t t = %s; esp -= 4; wr32(esp, %s + RD); REGS_STORE_NOFLAGS; RT_CALL_IC(t); REGS_LOAD; }'
                           % (self.rd(ins, t, 32), hexu(nxt))], True
         if mn == 'ret':
             n = ops[0].imm if ops else 0

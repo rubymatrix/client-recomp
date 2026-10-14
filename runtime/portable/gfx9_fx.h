@@ -23,9 +23,13 @@
 
 #include <sys/stat.h>
 
+static void up_apply(G9Tex* t); /* gfx9_upscale.h */
+static int up_mode(void);
+
 static struct
 {
     float fx, aa, sharpen, bloom, threshold, rays, rays_decay, rays_length, grade, sat, contrast, aniso, debug;
+    float upscale, render_scale, up_debug, up_jitter, up_jx, up_jy, up_mv; /* gfx9_upscale.h */
 } g_xfs;
 
 static const struct
@@ -47,6 +51,13 @@ static const struct
     { "contrast", offsetof(__typeof__(g_xfs), contrast), 0.12f },
     { "aniso", offsetof(__typeof__(g_xfs), aniso), 16.0f },
     { "debug", offsetof(__typeof__(g_xfs), debug), 0.0f },
+    { "upscale", offsetof(__typeof__(g_xfs), upscale), 0.0f },
+    { "render_scale", offsetof(__typeof__(g_xfs), render_scale), 0.67f },
+    { "up_debug", offsetof(__typeof__(g_xfs), up_debug), 0.0f },
+    { "up_jitter", offsetof(__typeof__(g_xfs), up_jitter), 1.0f },
+    { "up_jx", offsetof(__typeof__(g_xfs), up_jx), 1.0f },
+    { "up_jy", offsetof(__typeof__(g_xfs), up_jy), 1.0f },
+    { "up_mv", offsetof(__typeof__(g_xfs), up_mv), 1.0f },
 };
 
 static const char XFX_MSL[] =
@@ -248,7 +259,8 @@ static void xfx_write_defaults(const char* path)
     if (!f)
         return;
     fprintf(f, "# FFXIV recomp scene effects: edit while the game runs (read again within half a second).\n"
-               "# fx = 0 turns them all off. aa: 0 none, 1 FXAA. debug: 1 bloom, 2 rays' source, 3 rays, 4 outline the scene.\n");
+               "# fx = 0 turns them all off. aa: 0 none, 1 FXAA. debug: 1 bloom, 2 rays' source, 3 rays, 4 outline the scene.\n"
+               "# upscale: 0 off, 1 MetalFX spatial, 2 MetalFX temporal; render_scale: the scene's size per axis.\n");
     for (size_t i = 0; i < sizeof XFX_SETTINGS / sizeof XFX_SETTINGS[0]; ++i)
         fprintf(f, "%s = %g\n", XFX_SETTINGS[i].key, *(float*)((char*)&g_xfs + XFX_SETTINGS[i].at));
     fclose(f);
@@ -425,7 +437,7 @@ static int invert4(const float* m, float* out)
 static void fx_note_draw(const G9Draw* d)
 {
     G9Tex* final = g_xfx.ui ? g_xfx.ui : g_xfx.bb;
-    if (g_xfs.fx == 0.0f || !final || !g_rt[0] || !g_ds || !d->rs.zenable || g_rt[0]->w != final->w ||
+    if ((g_xfs.fx == 0.0f && up_mode() != 2) || !final || !g_rt[0] || !g_ds || !d->rs.zenable || g_rt[0]->w != final->w ||
         g_rt[0]->h != final->h)
         return;
     g_xfx.ds = g_ds;
@@ -525,7 +537,7 @@ static void fx_apply(G9Tex* t)
 
         /* the scene as it is (anti-aliased), for the passes to read */
         id<MTLTexture> a = xfx_tex(&g_xfx.a, s.pixelFormat, w, h);
-        xfx_pass(a, g_xfs.aa >= 1.0f ? g_xfx.fxaa : g_xfx.copy, &s, 1, &u, NULL);
+        xfx_pass(a, g_xfs.aa >= 1.0f && up_mode() != 2 ? g_xfx.fxaa : g_xfx.copy, &s, 1, &u, NULL); /* temporal upscaling anti-aliases */
 
         id<MTLTexture> b1 = nil, b2 = nil, ry = nil, rm = nil;
         if (g_xfs.bloom > 0.0f)
@@ -565,11 +577,12 @@ static void fx_apply(G9Tex* t)
 }
 
 /* Before a draw: the first into the back buffer this frame copies the finished scene there, the
- * interface after it. The scene is the full-size render target it samples. */
+ * interface after it. The scene is the full-size render target it samples (made smaller when
+ * upscaling, and upscaled here). */
 static void fx_hook(const G9Draw* d)
 {
     G9Tex* final = g_xfx.ui ? g_xfx.ui : g_xfx.bb;
-    if (g_xfs.fx == 0.0f || g_xfx.done || !final || g_rt[0] != final)
+    if ((g_xfs.fx == 0.0f && !up_mode()) || g_xfx.done || !final || g_rt[0] != final)
         return;
     g_xfx.done = 1;
     const SmInfo* pi = &d->ps->info;
@@ -579,7 +592,9 @@ static void fx_hook(const G9Draw* d)
         if (pi->sampler[s] && t && t != final && t->use == G9_USE_RT && t->type == G9_TEX_2D &&
             t->w == final->w && t->h == final->h && !t->f.depth)
         {
-            fx_apply(t);
+            up_apply(t); /* the scene at the game's size first: the effects run on that */
+            if (g_xfs.fx != 0.0f)
+                fx_apply(t);
             return;
         }
     }

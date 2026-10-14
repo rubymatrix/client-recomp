@@ -101,7 +101,8 @@ uint32_t thunk_for(const char* dll, const char* name)
     strcpy(t->name, full);
     t->shim = find_shim(dll, name);
     t->nolock = is_nolock(name);
-    t->d3d = !strncmp(dll, "d3d", 3);
+    /* the D3DPERF markers touch no device state: the game thread calls them while the renderer holds the lock */
+    t->d3d = !strncmp(dll, "d3d", 3) && strncmp(name, "D3DPERF_", 8);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     return THUNK_BASE + g_count++ * THUNK_STRIDE;
 }

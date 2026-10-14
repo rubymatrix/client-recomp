@@ -35,6 +35,10 @@ WRAPS = ','.join('ui_%s=%s' % m for m in re.findall(r'^ANIM\((\w+), (0x[0-9a-f]+
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'runtime/portable/xiv_ui_wraps.h')).read(), re.M))  # Garlemald Client's code patches, translated in
 WRAPS += ',key_repeat=0xd429b0'  # the keyboard's auto-repeat counter, paced in time (xiv_ui.c)
 WRAPS += ',pad_repeat=0xd42940'  # the gamepad's auto-repeat counter, paced in time (xiv_ui.c)
+# hot functions run natively (runtime/portable/xiv_native.c)
+WRAPS += ',crt_memcpy=0x9d4600,crt_memmove=0x9d5110,crt_memset=0x9d2110,const_cache_a=0x423b90,const_cache_b=0x423a40,mat4_vec4=0x42ec50'
+# the dev ticket login: NetworkModule's ctor and Update (runtime/portable/xiv_direct_login.c, XIV_DIRECT_LOGIN)
+WRAPS += ',net_ctor=0x4e0dc0,net_tick=0x4e30a0'
 # the client's Lua C++ bindings, watched by the probe (runtime/portable/xiv_probe.c, XIV_PROBE)
 WRAPS += ''.join(',lb_%s=0x%s' % (a, a) for a in re.findall(r'^LB\((\w+),', open(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'runtime/portable/xiv_probe_binds.h')).read(), re.M))
@@ -48,14 +52,15 @@ PORTABLE = ['runtime/runtime.c', 'runtime/portable/plat_posix.c', 'runtime/porta
             'runtime/portable/kobj.c', 'runtime/portable/k32_io.c',
             'runtime/portable/reg.c', 'runtime/portable/ole.c',
             'runtime/portable/k32_misc.c', 'runtime/portable/k32_xiv.c',
-            'runtime/portable/xiv_misc.c', 'runtime/portable/fiber.c', 'runtime/portable/xiv_ui.c', 'runtime/portable/xiv_probe.c', 'runtime/portable/sampler_posix.c']
+            'runtime/portable/xiv_misc.c', 'runtime/portable/fiber.c', 'runtime/portable/xiv_ui.c', 'runtime/portable/xiv_probe.c', 'runtime/portable/sampler_posix.c',
+            'runtime/portable/xiv_native.c', 'runtime/portable/xiv_direct_login.c']
 
 
 # Win32 shims on SDL3 (windowing, input, timers, sockets, audio) shared with FFXI.
 HOST = ['runtime/portable/user32.c', 'runtime/portable/input.c', 'runtime/portable/autoinput.c', 'runtime/portable/ws2.c',
         'runtime/portable/dinput.c', 'runtime/portable/dsound.c', 'runtime/portable/d3d9.c', 'runtime/portable/d3dx9.c', 'runtime/portable/xaudio2.c',
         'runtime/portable/sm_msl.c', 'runtime/portable/gfx9_metal.m']
-GFX_LIBS = ['-framework', 'Metal', '-framework', 'QuartzCore', '-framework', 'Foundation']
+GFX_LIBS = ['-framework', 'Metal', '-framework', 'QuartzCore', '-framework', 'Foundation', '-weak_framework', 'MetalFX']
 
 
 def run(cmd):
@@ -119,7 +124,7 @@ def translate(exe):
          GEN, '--all', '--wraps', WRAPS])
 
 
-def xivboot(exe, run_it, extra, debug=False, opt='-O1'):
+def xivboot(exe, run_it, extra, debug=False, opt='-O1', pgo=None):
     if not os.path.exists(os.path.join(ROOT, GEN, 'table.c')):
         translate(exe)
     gen = sorted(os.path.relpath(p, ROOT) for p in glob.glob(os.path.join(ROOT, GEN, '*.c')))
@@ -135,12 +140,31 @@ def xivboot(exe, run_it, extra, debug=False, opt='-O1'):
         if run_it:
             run(['build/xivboot-dbg', exe] + extra)
         return
-    objs = compile_stale(gen, 'build/xiv/gen')
+    # profile-guided optimization of the translation (--pgo gen, play, --pgo use): branchy code
+    # whose hot paths the compiler cannot guess. gen builds into build/xiv-pgo and writes
+    # build/pgo/*.profraw when XIV_PGO_FRAMES frames have been drawn; use merges them.
+    pgo_flags, gendir = [], 'build/xiv/gen'
+    if pgo == 'gen':
+        os.makedirs(os.path.join(ROOT, 'build/pgo'), exist_ok=True)
+        pgo_flags, gendir = ['-fprofile-generate=' + os.path.join(ROOT, 'build/pgo')], 'build/xiv-pgo/gen'
+    elif pgo == 'use':
+        prof = os.path.join(ROOT, 'build/pgo/merged.profdata')
+        raws = glob.glob(os.path.join(ROOT, 'build/pgo/*.profraw'))
+        if raws:
+            run(['xcrun', 'llvm-profdata', 'merge', '-o', prof] + raws)
+        if not os.path.exists(prof):
+            raise SystemExit('--pgo use: no profile (build/pgo/merged.profdata); run a --pgo gen build first')
+        pgo_flags, gendir = ['-fprofile-use=' + prof, '-Wno-profile-instr-out-of-date', '-Wno-profile-instr-unprofiled'], 'build/xiv-pgouse/gen'
+    objs = compile_stale(gen, gendir, gen_flags=GEN_FLAGS + pgo_flags)
     thirdparty.build('sdl3')
     objs += compile_stale(PORTABLE + HOST + ['tests/xivboot.c'], 'build/xiv/obj', thirdparty.flags('sdl3'))
     # ThinLTO: the translated functions call each other across 291 files; inlining the small ones
     # into their callers needs the whole program (cache: relinks reuse unchanged modules)
-    run(['clang', '-o', 'build/xivboot', '-flto=thin', '-O3', '-mcpu=apple-m1',
+    # -U: d3d9.c's profile dump finds the profile runtime only in --pgo gen builds
+    # XIV_INLINE=<threshold>: LTO inlining experiments (import limit and inline threshold)
+    inl = os.environ.get('XIV_INLINE')
+    inl_flags = ['-Wl,-mllvm,-import-instr-limit=%d' % (int(inl) * 2), '-Wl,-mllvm,-inline-threshold=%s' % inl] if inl else []
+    run(['clang', '-o', 'build/xivboot', '-flto=thin', '-O3', '-mcpu=apple-m1', '-Wl,-U,___llvm_profile_write_file'] + pgo_flags + inl_flags + [
          '-Wl,-cache_path_lto,build/xiv/lto-cache', '-Wl,-mllvm,-threads=%d' % (os.cpu_count() or 4)]
         + objs + thirdparty.libs('sdl3') + GFX_LIBS + ['-lm', '-lpthread'])
     xiv_bundle()
@@ -189,6 +213,7 @@ def main():
     ap.add_argument('--run', action='store_true')
     ap.add_argument('--debug', action='store_true', help='build/xivboot-dbg: -g translation, no LTO (for lldb)')
     ap.add_argument('--opt', default='-O1', help='optimization for the translation in --debug builds (-O0 keeps every register local visible but runs slowly)')
+    ap.add_argument('--pgo', choices=('gen', 'use'), help='profile-guided optimization: an instrumented build, or one using its profile')
     ap.add_argument('rest', nargs='*')
     a = ap.parse_args()
     exe = os.path.abspath(a.exe)
@@ -197,7 +222,7 @@ def main():
     elif a.target == 'translate':
         translate(exe)
     else:
-        xivboot(exe, a.run, a.rest, a.debug, a.opt)
+        xivboot(exe, a.run, a.rest, a.debug, a.opt, a.pgo)
 
 
 if __name__ == '__main__':
