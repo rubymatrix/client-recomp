@@ -336,8 +336,12 @@ class FunctionTranslator:
                 if ok:
                     preserved |= bit
         own = 0
-        for r, w, kind, tgt, succ in out:
+        for k, (r, w, kind, tgt, succ) in enumerate(out):
             own |= w
+            # saving or restoring a preserved register is no use of its value
+            i = insns[k]
+            if i.mnemonic in ('push', 'pop') and preserved & rb.get(i.op_str, 0):
+                out[k] = (r & ~rb[i.op_str], w & ~rb[i.op_str], kind, tgt, succ)
         self.reginfo = {'insns': out, 'entry': idx.get(self.entry, 0), 'preserved': preserved,
                         'own': own & ~preserved, 'unsafe': unsafe or not insns or self.entry not in idx}
 
