@@ -42,7 +42,10 @@ OBSTACLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'obstacles.
 NPC_CLEAR = 1.4   # distance kept from NPCs and objects: the navmesh does not have them, the client does
 
 LUA = r"""
-local nm = player.CurrentArea.navMesh
+local nm = nil
+pcall(function() nm = player.CurrentArea.navMesh end)
+-- a private area has no mesh of its own: walk its parent zone's
+if nm == nil then pcall(function() nm = player.CurrentArea:GetParentZone().navMesh end) end
 if nm == nil then return "nomesh" end
 local p = player:GetPos()
 local fx, fy, fz = %s
