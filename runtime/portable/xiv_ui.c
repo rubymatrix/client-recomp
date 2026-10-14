@@ -100,9 +100,71 @@ static void w_key_repeat(Guest* g)
     rt_return(g, 0, 12);
 }
 
+/* The gamepad's auto-repeat (FUN_00d42940, thiscall (held, row) -> repeat bits; also the mouse's)
+ * has the same frame count: Rapture's tick limiter asks for 30 Hz but measures from before its own
+ * sleep, so with exact sleeps the tick runs at ~60 Hz and held d-pad/stick directions repeated after
+ * 0.15 s, then 30 a second. The pad's call (from FUN_00d32a30) counts in time instead, one count per
+ * 1/60 s x XIV_PAD_REPEAT_SCALE (default 2: the 30 Hz tick the counter's delay/reset values were
+ * made for, as the keyboard gets: first repeat after 0.3 s, then 15 a second). The mouse's call
+ * keeps the frame count. */
+#define PAD_REPEAT_CALLER 0xd32d2fu
+static void w_pad_repeat(Guest* g)
+{
+    if (rd32(g->esp) != PAD_REPEAT_CALLER)
+    {
+        rt_orig_pad_repeat(g);
+        return;
+    }
+    static uint64_t tick_ns;
+    if (!tick_ns)
+    {
+        const char* e = getenv("XIV_PAD_REPEAT_SCALE");
+        double s = e ? atof(e) : 0;
+        tick_ns = (uint64_t)(1e9 / 60 * (s > 0.05 && s < 20 ? s : 2.0));
+    }
+    static struct
+    {
+        uint32_t self, row;
+        uint64_t last, acc;
+    } slot[8];
+    uint32_t self = g->ecx, held = rt_arg(g, 0), row = rt_arg(g, 1);
+    int k = 0;
+    while (k < 7 && slot[k].self && (slot[k].self != self || slot[k].row != row))
+        ++k;
+    slot[k].self = self, slot[k].row = row;
+    uint64_t now = rt_monotonic_ns();
+    slot[k].acc += slot[k].last ? now - slot[k].last : tick_ns;
+    slot[k].last = now;
+    unsigned ticks = (unsigned)(slot[k].acc / tick_ns);
+    slot[k].acc -= ticks * tick_ns;
+    if (ticks > 4)
+        ticks = 4;
+    int16_t n = (int16_t)rd16(self + 4);
+    uint32_t counters = rd32(self + 8) + (uint32_t)n * row, out = 0;
+    uint8_t delay = rd8(self + 0xc), rearm = rd8(self + 0xd);
+    for (int i = 0; i < n && i < 32; ++i)
+    {
+        if (!(held & (1u << i)))
+        {
+            wr8(counters + (uint32_t)i, 0);
+            continue;
+        }
+        uint8_t c = rd8(counters + (uint32_t)i);
+        for (unsigned t = 0; t < ticks; ++t)
+            if (++c > delay)
+            {
+                out |= 1u << i;
+                c = rearm;
+            }
+        wr8(counters + (uint32_t)i, c);
+    }
+    rt_return(g, out, 8);
+}
+
 void xiv_ui_init(void)
 {
     rt_wrap_key_repeat = w_key_repeat;
+    rt_wrap_pad_repeat = w_pad_repeat;
     if (getenv("XIV_ANIMLOG"))
     {
 #define ANIM(n, a) rt_wrap_ui_##n = w_##n;
