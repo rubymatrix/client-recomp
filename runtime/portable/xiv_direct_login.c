@@ -1,4 +1,4 @@
-/* Dev login: title screen straight into the world, no lobby menus or character select.
+/* Dev login: from start-up straight into the world, no title, lobby menus or character select.
  *
  * XIV_DIRECT_LOGIN=<character id> turns it on; unset, nothing here runs. The client still has the
  * developers' ticket login (NetworkModule's "net_debug_*" config, a lobby request 0x1F5 that
@@ -8,10 +8,12 @@
  *     XIV_LOBBY_HOST:XIV_LOBBY_PORT, the ticket at the character id, the world name at
  *     XIV_WORLD_NAME and the lobby-less fallback at XIV_FRONT_HOST:XIV_FRONT_PORT (World), with few
  *     retries so a lobby that does not answer falls back to World quickly;
- *   - NetworkModule::Update: once BootupManager's title is up and idle, start the ticket login;
- *     when it has opened the World connection, post BootupManager's "enter game" command (what
- *     the game posts after character select: bootup UI teardown, then PhaseGame), or change to
- *     PhaseGame directly when the bootup objects that command touches are missing.
+ *   - NetworkModule's session login (the retail lobby login the title starts): skipped, since it
+ *     first resets the network module and would cancel ours;
+ *   - NetworkModule::Update: on its first tick (logo phase) start the ticket login; when it has
+ *     opened the World connection, change straight to PhaseGame, skipping whatever start-up
+ *     phase (logos, title) is showing. PhaseGame itself is passive: World's packets build the
+ *     world, as after character select.
  *
  * Decomp notes: decomp/docs/lobby_protocol.md, "Patching the ticket login in recomp". */
 #include <stdio.h>
@@ -22,19 +24,20 @@
 #include "runtime.h"
 
 #define CFG_NET 4 /* SystemConfig category of the net_* keys */
-#define PHASE_BOOTUP 10
 #define PHASE_GAME 0x15
-#define CMD_ENTER_GAME 0x39
 
 static struct
 {
     int on;
     uint32_t chara;
-    int stage; /* 0 wait for the title, 1 login started, 2 game phase asked for, 3 done */
-    uint64_t ready_since, stage_t;
+    int stage; /* 0 not started, 1 login started, 2 game phase asked for, 3 done */
+    uint64_t stage_t;
     uint32_t last_state, last_mod_state, last_phase;
-    int used_fallback;
 } S = { .last_state = ~0u, .last_mod_state = ~0u, .last_phase = ~0u };
+
+static uint64_t g_t0;
+/* stamped with seconds since start-up, to see where the time to the world goes */
+#define LOG(fmt, ...) rt_log("[direct-login %7.3f] " fmt, (double)(rt_monotonic_ns() - g_t0) / 1e9, ##__VA_ARGS__)
 
 static const char* env_or(const char* name, const char* def)
 {
@@ -80,7 +83,7 @@ static void cfg_str(Guest* g, uint32_t cfg, uint32_t idx, const char* v)
         call_this(g, f_004489c0, s, 1, (uint32_t[]){ sva });
     *g = save;
     if (!s)
-        rt_log("[direct-login] config %u/%u is not registered\n", CFG_NET, idx);
+        LOG("config %u/%u is not registered\n", CFG_NET, idx);
 }
 
 static void w_net_ctor(Guest* g)
@@ -105,125 +108,93 @@ static void w_net_ctor(Guest* g)
     cfg_int(g, cfg, 12, 0);      /* zone id, name and city unset: request 0x1F5, not 0x1F6 */
     cfg_str(g, cfg, 13, "");
     cfg_int(g, cfg, 14, 0);
-    rt_log("[direct-login] config set: ticket %s, lobby %s:%u, world \"%s\", fallback World %s:%u\n", ticket, lobby, lport,
+    LOG("config set: ticket %s, lobby %s:%u, world \"%s\", fallback World %s:%u\n", ticket, lobby, lport,
            world, front, fport);
     rt_orig_net_ctor(g);
 }
 
-/* BootupManager's phase interface (the controller's current phase object) when the title runs */
-static uint32_t bootup_phase(uint32_t ctl)
+/* The title's start-up commands begin the retail lobby login, which first tears down any
+ * connection in progress (ours). Report it started and leave ours be. */
+static void w_net_session_login(Guest* g)
 {
-    if (rd32(ctl + 0x94) != PHASE_BOOTUP || rd32(ctl + 0x98))
-        return 0;
-    return rd32(ctl + 0xa0);
-}
-
-/* nothing running or queued in BootupManager's command queue */
-static int bootup_idle(uint32_t bp) { return !rd32(bp + 0x44) && !rd32(bp + 0x50); }
-
-static void enter_game(Guest* g, uint32_t ctl)
-{
-    uint32_t bp = bootup_phase(ctl);
-    /* the enter-game command tears down title/lobby UI through these: the UI and model managers
-     * (title start, loaded by its first command), the fade and the owning MainModule */
-    int ok = bp && bootup_idle(bp) && rd32(bp + 0x24) && rd32(bp + 0x2c) && rd32(bp + 0x30) && rd32(bp - 0x30);
-    if (ok)
-    {
-        uint32_t bm = bp - 0x34;
-        call_this(g, f_006a9620, bm, 0, NULL); /* close the bootup loaders, as the game does first */
-        call_this(g, f_006ae490, bm, 1, (uint32_t[]){ CMD_ENTER_GAME });
-        rt_log("[direct-login] posted bootup command 0x%x (enter game)\n", CMD_ENTER_GAME);
-    }
-    else
-    {
-        rt_log("[direct-login] bootup not ready for its enter-game command (phase %u, cmd %u): changing to PhaseGame\n",
-               rd32(ctl + 0x94), bp ? rd32(bp + 0x44) : 0);
-        call_this(g, f_00565aa0, ctl, 1, (uint32_t[]){ PHASE_GAME });
-        S.used_fallback = 1;
-    }
+    LOG("title's lobby login skipped\n");
+    rt_return(g, 1, 12);
 }
 
 static void w_net_tick(Guest* g)
 {
     uint32_t nm = g->ecx;
-    uint32_t main_ = rd32(nm + 8), ctl = main_ ? rd32(main_ + 0x4bc) : 0;
+    /* the phase manager hangs off MainModule's element-owner base (MainModule + 0x10), which is
+     * what phases hold as their "main" */
+    uint32_t main_ = rd32(nm + 8), ctl = main_ ? rd32(main_ + 0x10 + 0x4bc) : 0;
     uint64_t now = rt_monotonic_ns();
-    if (S.stage == 0 && ctl)
+    /* started, then reset before reaching World (state back to 0 with no request): again */
+    if (S.stage == 1 && rd32(nm + 0x250) == 0 && !rd32(nm + 0x23c) && !rd32(nm + 0x234))
     {
-        uint32_t bp = bootup_phase(ctl);
-        /* the title's first command has run (its UI managers are fetched) and nothing is queued */
-        if (bp && rd32(bp + 0x24) && rd32(bp + 0x30) && bootup_idle(bp))
-        {
-            if (!S.ready_since)
-            {
-                S.ready_since = now;
-                rt_log("[direct-login] title up\n");
-            }
-            if (now - S.ready_since > 1500000000ull)
-            {
-                uint32_t ok = call_this(g, f_004dfaa0, nm, 1, (uint32_t[]){ nm + 0x254 }) & 0xff;
-                rt_log("[direct-login] ticket login started: %s, state %u, %s\n", ok ? "ok" : "refused", rd32(nm + 0x250),
-                       rd32(nm + 0x23c) ? "via lobby" : "no lobby, straight to World");
-                S.stage = ok ? 1 : 3;
-                S.stage_t = now;
-            }
-        }
-        else
-            S.ready_since = 0;
+        LOG("network module was reset: starting again\n");
+        *GUEST_PTR(nm + 0x2d0) = 0; /* the retail lobby login's pending session */
+        S.stage = 0;
+    }
+    if (S.stage == 0 && ctl && rd32(nm + 0x250) == 0)
+    {
+        uint32_t ok = call_this(g, f_004dfaa0, nm, 1, (uint32_t[]){ nm + 0x254 }) & 0xff;
+        LOG("ticket login started in phase %u: %s, %s\n", rd32(ctl + 0x94), ok ? "ok" : "refused",
+            rd32(nm + 0x23c) ? "via lobby" : "no lobby, straight to World");
+        S.stage = ok ? 1 : 3;
     }
     rt_orig_net_tick(g);
-    if (S.stage == 0 || S.stage == 3)
+    if (S.stage == 0)
         return;
     uint32_t st = rd32(nm + 0x250), mod = rd32(nm + 0x23c), ms = mod ? rd32(mod + 0x394) : ~0u;
     if (st != S.last_state)
     {
-        rt_log("[direct-login] network state %u -> %u\n", S.last_state, st);
+        LOG("network state %u -> %u\n", S.last_state, st);
         S.last_state = st;
     }
     if (ms != S.last_mod_state)
     {
         if (mod)
-            rt_log("[direct-login] lobby request state %u (0 send, 1 sent, 2 answered, 3/4 closed)\n", ms);
+            LOG("lobby request state %u (0 send, 1 sent, 2 answered, 3/4 closed)\n", ms);
         else if (S.last_mod_state != ~0u)
-            rt_log("[direct-login] lobby done%s\n", rd32(nm + 0x2a8) ? ", falling back to the front host" : "");
+            LOG("lobby done%s\n", rd32(nm + 0x2a8) ? ", falling back to the front host" : "");
         S.last_mod_state = ms;
     }
+    uint32_t ph = ctl ? rd32(ctl + 0x94) : 0;
+    if (ph != S.last_phase)
+    {
+        LOG("phase %u\n", ph);
+        S.last_phase = ph;
+    }
+    /* the World connection is open: the game screen builds the rest from World's packets */
     if (S.stage == 1 && st >= 3)
     {
         if (!rd32(nm + 0x234))
         {
-            rt_log("[direct-login] no World connection was opened; staying at the title\n");
+            LOG("no World connection was opened\n");
             S.stage = 3;
             return;
         }
-        enter_game(g, ctl);
+        LOG("World connection open: changing from phase %u to PhaseGame\n", ph);
+        call_this(g, f_00565aa0, ctl, 1, (uint32_t[]){ PHASE_GAME });
         S.stage = 2;
         S.stage_t = now;
     }
-    else if (S.stage == 2 && ctl)
+    else if (S.stage == 2 && ph == PHASE_GAME)
     {
-        uint32_t ph = rd32(ctl + 0x94);
-        if (ph != S.last_phase)
-        {
-            rt_log("[direct-login] phase %u\n", ph);
-            S.last_phase = ph;
-        }
-        if (ph == PHASE_GAME)
-        {
-            rt_log("[direct-login] in PhaseGame\n");
-            S.stage = 3;
-        }
-        else if (!S.used_fallback && rd32(ctl + 0x98) != PHASE_GAME && now - S.stage_t > 10000000000ull)
-        {
-            rt_log("[direct-login] still in phase %u after 10 s: changing to PhaseGame\n", ph);
-            call_this(g, f_00565aa0, ctl, 1, (uint32_t[]){ PHASE_GAME });
-            S.used_fallback = 1;
-        }
+        LOG("in PhaseGame\n");
+        S.stage = 3;
+    }
+    else if (S.stage == 2 && rd32(ctl + 0x98) != PHASE_GAME && now - S.stage_t > 2000000000ull)
+    {
+        LOG("phase %u did not change: asking for PhaseGame again\n", ph);
+        call_this(g, f_00565aa0, ctl, 1, (uint32_t[]){ PHASE_GAME });
+        S.stage_t = now;
     }
 }
 
 void xiv_direct_login_init(void)
 {
+    g_t0 = rt_monotonic_ns();
     const char* v = getenv("XIV_DIRECT_LOGIN");
     if (!v || !*v)
         return;
@@ -231,12 +202,13 @@ void xiv_direct_login_init(void)
     unsigned long id = strtoul(v, &end, 10);
     if (*end || !id || id > 0xffffffffu)
     {
-        rt_log("[direct-login] XIV_DIRECT_LOGIN=%s is not a character id; off\n", v);
+        LOG("XIV_DIRECT_LOGIN=%s is not a character id; off\n", v);
         return;
     }
     S.on = 1;
     S.chara = (uint32_t)id;
     rt_wrap_net_ctor = w_net_ctor;
     rt_wrap_net_tick = w_net_tick;
-    rt_log("[direct-login] on: character %u\n", S.chara);
+    rt_wrap_net_session_login = w_net_session_login;
+    LOG("on: character %u\n", S.chara);
 }

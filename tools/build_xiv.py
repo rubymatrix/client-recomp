@@ -38,7 +38,7 @@ WRAPS += ',pad_repeat=0xd42940'  # the gamepad's auto-repeat counter, paced in t
 # hot functions run natively (runtime/portable/xiv_native.c)
 WRAPS += ',crt_memcpy=0x9d4600,crt_memmove=0x9d5110,crt_memset=0x9d2110,const_cache_a=0x423b90,const_cache_b=0x423a40,mat4_vec4=0x42ec50'
 # the dev ticket login: NetworkModule's ctor and Update (runtime/portable/xiv_direct_login.c, XIV_DIRECT_LOGIN)
-WRAPS += ',net_ctor=0x4e0dc0,net_tick=0x4e30a0'
+WRAPS += ',net_ctor=0x4e0dc0,net_tick=0x4e30a0,net_session_login=0x4e1eb0'
 # the client's Lua C++ bindings, watched by the probe (runtime/portable/xiv_probe.c, XIV_PROBE)
 WRAPS += ''.join(',lb_%s=0x%s' % (a, a) for a in re.findall(r'^LB\((\w+),', open(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'runtime/portable/xiv_probe_binds.h')).read(), re.M))
