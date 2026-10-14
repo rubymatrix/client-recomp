@@ -863,6 +863,7 @@ void thunk_prof_report(void);
 void thunk_lock_report(void);
 void xiv_ui_report(void); /* xiv_ui.c: the interface's animation counters (XIV_ANIMLOG) */
 const char* autoinput_frame(void); /* autoinput.c */
+void xiv_probe_frame(void);        /* xiv_probe.c */
 static void prof_noop(uint64_t ns) { (void)ns; }
 static uint64_t g_present_ns; /* time in g9_present, in all */
 
@@ -876,6 +877,7 @@ static void present(void)
     {
         /* XIV_INPUT_SCRIPT (autoinput.c): this frame's scripted input, and a screenshot it asks for */
         const char* shot = autoinput_frame();
+        xiv_probe_frame();
         if (shot && t)
         {
             uint32_t w = bb->width, h = bb->height;

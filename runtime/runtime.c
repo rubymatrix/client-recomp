@@ -151,6 +151,8 @@ static RtFatalHook g_fatal_hook;
 
 void rt_set_log(FILE* f) { g_log = f; }
 void rt_set_fatal_hook(RtFatalHook h) { g_fatal_hook = h; }
+static void (*g_log_hook)(const char* line);
+void rt_set_log_hook(void (*h)(const char* line)) { g_log_hook = h; }
 
 void rt_log(const char* fmt, ...)
 {
@@ -164,6 +166,14 @@ void rt_log(const char* fmt, ...)
         vfprintf(g_log, fmt, ap);
         va_end(ap);
         fflush(g_log);
+    }
+    if (g_log_hook)
+    {
+        char line[1024];
+        va_start(ap, fmt);
+        vsnprintf(line, sizeof line, fmt, ap);
+        va_end(ap);
+        g_log_hook(line);
     }
 }
 

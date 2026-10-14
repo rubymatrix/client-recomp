@@ -35,6 +35,9 @@ WRAPS = ','.join('ui_%s=%s' % m for m in re.findall(r'^ANIM\((\w+), (0x[0-9a-f]+
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'runtime/portable/xiv_ui_wraps.h')).read(), re.M))  # Garlemald Client's code patches, translated in
 WRAPS += ',key_repeat=0xd429b0'  # the keyboard's auto-repeat counter, paced in time (xiv_ui.c)
 WRAPS += ',pad_repeat=0xd42940'  # the gamepad's auto-repeat counter, paced in time (xiv_ui.c)
+# the client's Lua C++ bindings, watched by the probe (runtime/portable/xiv_probe.c, XIV_PROBE)
+WRAPS += ''.join(',lb_%s=0x%s' % (a, a) for a in re.findall(r'^LB\((\w+),', open(
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'runtime/portable/xiv_probe_binds.h')).read(), re.M))
 GEN = 'generated/ffxivgame'
 CFLAGS = ['-O2', '-mcpu=apple-m1', '-std=c11', '-g', '-DRT_GUEST_WINDOW', '-DRT_GUEST_FIXED=0x300000000ull', '-fno-strict-aliasing', '-I', 'runtime', '-I',
           'runtime/portable', '-I', GEN]
@@ -45,7 +48,7 @@ PORTABLE = ['runtime/runtime.c', 'runtime/portable/plat_posix.c', 'runtime/porta
             'runtime/portable/kobj.c', 'runtime/portable/k32_io.c',
             'runtime/portable/reg.c', 'runtime/portable/ole.c',
             'runtime/portable/k32_misc.c', 'runtime/portable/k32_xiv.c',
-            'runtime/portable/xiv_misc.c', 'runtime/portable/fiber.c', 'runtime/portable/xiv_ui.c', 'runtime/portable/sampler_posix.c']
+            'runtime/portable/xiv_misc.c', 'runtime/portable/fiber.c', 'runtime/portable/xiv_ui.c', 'runtime/portable/xiv_probe.c', 'runtime/portable/sampler_posix.c']
 
 
 # Win32 shims on SDL3 (windowing, input, timers, sockets, audio) shared with FFXI.

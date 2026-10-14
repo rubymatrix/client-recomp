@@ -115,6 +115,7 @@ static void write_default_config(const char* docs)
 
 void xiv_misc_init(void);
 void xiv_ui_init(void);
+void xiv_probe_init(void);
 void sampler_start(void);
 void user32_main_tick(void);
 void xiv_set_documents(const char* host_dir);
@@ -196,6 +197,7 @@ int main(int argc, char** argv)
     k32_xiv_init();
     xiv_misc_init();
     xiv_ui_init();
+    xiv_probe_init();
     ole_init();
     user32_init();
     d3d9_init();

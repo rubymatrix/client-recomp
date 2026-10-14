@@ -64,6 +64,25 @@ Useful environment switches: `XIV_SERIAL=1` (guest threads take turns), `FFXI_RE
 A call into untranslated code stops with `[recomp] FATAL at <addr>` plus registers and the guest
 stack.
 
+### Test probe
+
+`XIV_PROBE=7979` opens a JSON endpoint on 127.0.0.1:7979 for automated tests: what the client's
+scripts do (every Lua binding call: message lines, cutscenes, widgets, targets), the event messages
+on the world connection, the player's position and target, and whether a message line waits for
+input. It also acts: interact with an actor by id, accept message lines (`auto_advance`), skip the
+playing cutscene, walk, press keys.
+
+```sh
+tools/xivprobe.py state
+tools/xivprobe.py events --type net,state --follow
+tools/xivprobe.py act interact actor=4670001B
+tools/xivprobe.py act skip_cutscene
+```
+
+Details and the client functions it relies on: `decomp/docs/xivprobe.md`. The binding list
+(`runtime/portable/xiv_probe_binds.h`) is compiled in as `recomp.py --wraps`: after changing it, run
+`build_xiv.py translate` before building.
+
 ## Rules
 
 - **No Square Enix bytes in this repo, ever.** No executables, no DLLs, no game data and **no

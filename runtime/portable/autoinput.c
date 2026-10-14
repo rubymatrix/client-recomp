@@ -556,6 +556,25 @@ static int my_pos(float* x, float* y, float* z, float* r)
     return el && nav_rdf(el + 0x9c, x) && nav_rdf(el + 0xa0, y) && nav_rdf(el + 0xa4, z) && nav_rdf(el + 0xac, r);
 }
 
+/* For xiv_probe.c: an actor's position, rotation and target from its CharaElement (id 0: my
+ * player; id 0xFFFFFFFF: *target = my player's actor id). 0 if the client has no element for it. */
+int autoinput_actor(uint32_t id, float* x, float* y, float* z, float* r, uint32_t* target)
+{
+    if (id == 0xFFFFFFFFu)
+    {
+        uint32_t mgr;
+        return nav_rd32(NAV_MGR_GLOBAL, &mgr) && nav_rd32(mgr + NAV_MGR_MYID, target);
+    }
+    uint32_t el = element_of(id);
+    if (!el)
+        return 0;
+    if (x && !(nav_rdf(el + 0x9c, x) && nav_rdf(el + 0xa0, y) && nav_rdf(el + 0xa4, z) && nav_rdf(el + 0xac, r)))
+        return 0;
+    if (target && !nav_rd32(el + 0x12c, target))
+        *target = 0;
+    return 1;
+}
+
 static float wrap(float a)
 {
     while (a > NAV_PI)
@@ -1021,6 +1040,8 @@ static struct
     uint32_t len, cap;
 } g_stream[64][2];
 
+void xiv_probe_net(int out, uint16_t op, uint32_t src, const uint8_t* p, uint32_t n); /* xiv_probe.c */
+
 static void net_msg(int out, const uint8_t* sub, uint32_t size)
 {
     NetMsg* m = &g_net[g_net_seq % NET_RING];
@@ -1031,6 +1052,7 @@ static void net_msg(int out, const uint8_t* sub, uint32_t size)
     m->plen = size - 0x20;
     memcpy(m->pay, sub + 0x20, m->plen < sizeof m->pay ? m->plen : sizeof m->pay);
     m->seq = ++g_net_seq;
+    xiv_probe_net(out, m->op, m->src, sub + 0x20, size - 0x20);
     if (g_net_trace && m->op != 0x00CA && m->op != 0x00CF && m->op != 0x0001 && m->op != 0x0002)
     {
         char hex[3 * 24 + 1] = "";
