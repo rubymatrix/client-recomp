@@ -786,7 +786,8 @@ def main():
         def to_store(mm):  # noqa: F811
             t = int(mm.group(1), 16)
             return 'REGS_STORE;' if t in flags_in else 'REGS_STORE_CUT(0x%08x);' % t
-    regs_mod, regs_in = register_liveness(reginfo) if not (bisect or os.environ.get('RECOMP_NOREGS')) else ({}, {})
+    # RECOMP_REGS=1: not yet run in game, so off by default
+    regs_mod, regs_in = register_liveness(reginfo) if os.environ.get('RECOMP_REGS') and not bisect else ({}, {})
     call_re = re.compile(r'REGS_STORE_TO_([0-9a-f]{8});(.*?)REGS_LOAD;')
 
     def call_regs(mm):
