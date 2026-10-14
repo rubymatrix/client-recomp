@@ -5,6 +5,7 @@
  * DirectInput's mouse is. Gamepads are SDL gamepads, presented in the layout an Xbox controller
  * has under DirectInput (the one FFXI's gamepad configuration is written around). */
 #include <SDL3/SDL.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "input.h"
@@ -273,6 +274,35 @@ void input_set_notify(int kind, void (*fn)(int kind))
 }
 
 /* --- gamepads -------------------------------------------------------------------------------------- */
+/* The scripted pad (autoinput.c): pad 0 shows as connected from the start whenever XIV_INPUT_SCRIPT
+ * or XIV_VPAD is set, and what the script holds is added to a real pad 0, if there is one. */
+static XPad g_vpad;
+static int g_vpad_on = -1;
+
+static int vpad_on(void)
+{
+    if (g_vpad_on < 0)
+    {
+        const char* v = getenv("XIV_VPAD");
+        g_vpad_on = v ? atoi(v) != 0 : getenv("XIV_INPUT_SCRIPT") != NULL;
+    }
+    return g_vpad_on;
+}
+
+void input_vpad_set(const XPad* x)
+{
+    lock();
+    g_vpad = *x;
+    unlock();
+}
+
+static void vpad_get(XPad* x)
+{
+    lock();
+    *x = g_vpad;
+    unlock();
+}
+
 static SDL_Gamepad* pad(int index)
 {
     int n = 0;
@@ -286,13 +316,13 @@ int input_pad_count(void)
 {
     int n = 0;
     SDL_free(SDL_GetGamepads(&n));
-    return n;
+    return n < 1 && vpad_on() ? 1 : n;
 }
 
 const char* input_pad_name(int index)
 {
     SDL_Gamepad* p = pad(index);
-    return p ? SDL_GetGamepadName(p) : NULL;
+    return p ? SDL_GetGamepadName(p) : index == 0 && vpad_on() ? "Scripted pad" : NULL;
 }
 
 static int16_t flip(int16_t v) { return v == -32768 ? 32767 : (int16_t)-v; }
@@ -301,8 +331,15 @@ int input_xpad(int index, XPad* x)
 {
     SDL_Gamepad* p = pad(index);
     memset(x, 0, sizeof *x);
-    if (!p)
+    if (index == 0 && vpad_on())
+    {
+        vpad_get(x);
+        if (!p)
+            return 1;
+    }
+    else if (!p)
         return 0;
+    XPad v = *x;
     static const struct
     {
         SDL_GamepadButton b;
@@ -325,6 +362,13 @@ int input_xpad(int index, XPad* x)
     x->ly = flip(SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_LEFTY)); /* SDL: down is positive */
     x->rx = SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_RIGHTX);
     x->ry = flip(SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_RIGHTY));
+    x->buttons |= v.buttons; /* the script's, over the real pad's */
+    x->lt = v.lt > x->lt ? v.lt : x->lt;
+    x->rt = v.rt > x->rt ? v.rt : x->rt;
+    if (v.lx || v.ly)
+        x->lx = v.lx, x->ly = v.ly;
+    if (v.rx || v.ry)
+        x->rx = v.rx, x->ry = v.ry;
     return 1;
 }
 
@@ -340,6 +384,24 @@ int input_pad_state(int index, PadState* s)
     SDL_Gamepad* p = pad(index);
     memset(s, 0, sizeof *s);
     s->pov = 0xFFFFFFFFu;
+    if (!p && index == 0 && vpad_on())
+    {
+        /* the scripted pad alone, in DirectInput's layout (Y down) */
+        XPad v;
+        vpad_get(&v);
+        s->x = v.lx, s->y = flip(v.ly), s->rx = v.rx, s->ry = flip(v.ry);
+        s->z = (v.lt - v.rt) * 128;
+        static const uint16_t bit[11] = { 0x1000, 0x2000, 0x4000, 0x8000, 0x0100, 0x0200, 0x0020, 0x0010, 0x0040, 0x0080, 0 };
+        for (int i = 0; i < 11; ++i)
+            s->buttons[i] = bit[i] && (v.buttons & bit[i]) ? 0x80 : 0;
+        int dx = !!(v.buttons & 8) - !!(v.buttons & 4), dy = !!(v.buttons & 2) - !!(v.buttons & 1);
+        if (dx || dy)
+        {
+            static const uint32_t angle[3][3] = { { 31500, 0, 4500 }, { 27000, 0xFFFFFFFFu, 9000 }, { 22500, 18000, 13500 } };
+            s->pov = angle[dy + 1][dx + 1];
+        }
+        return 1;
+    }
     if (!p)
         return 0;
     s->x = SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_LEFTX);

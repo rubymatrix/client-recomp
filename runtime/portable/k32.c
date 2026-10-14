@@ -668,9 +668,35 @@ static void sh_QueryPerformanceFrequency(Guest* g)
     RET(1, 1);
 }
 
+/* A frame clock: QueryPerformanceCounter called from one place (a game's frame-delta read) moves
+ * in whole display refreshes, staying within half of one of the real clock. Motion is integrated
+ * over the delta, and a frame is on screen a whole number of refreshes: a delta measured on the CPU
+ * between frames the display shows evenly moved things unevenly. */
+static uint32_t g_qpc_at;
+static uint64_t (*g_qpc_quantum)(void);
+
+void k32_quantize_qpc_at(uint32_t ret, uint64_t (*quantum_ns)(void))
+{
+    g_qpc_at = ret;
+    g_qpc_quantum = quantum_ns;
+}
+
+static uint64_t frame_clock(uint64_t now)
+{
+    static uint64_t virt;
+    uint64_t q = g_qpc_quantum();
+    if (!q || !virt || now < virt || now - virt > 1000000000ull)
+        return virt = now;
+    virt += (now - virt + q / 2) / q * q;
+    return virt;
+}
+
 static void sh_QueryPerformanceCounter(Guest* g)
 {
-    wr64(ARG(0), rt_monotonic_ns() / 100u);
+    uint64_t now = rt_monotonic_ns();
+    if (g_qpc_at && rd32(g->esp) == g_qpc_at)
+        now = frame_clock(now);
+    wr64(ARG(0), now / 100u);
     RET(1, 1);
 }
 
@@ -703,6 +729,26 @@ void k32_pace_sleep_at(uint32_t ret, uint64_t period_ns)
     g_pace_ns = period_ns;
 }
 
+/* XIV_FRAMELOG: the paced loop's tick-to-tick times, every 600 ticks */
+static void tick_log(uint64_t ns)
+{
+    static int on = -1;
+    static uint64_t n, sum, lo = ~0ull, hi, late;
+    if (on < 0)
+        on = getenv("XIV_FRAMELOG") && strcmp(getenv("XIV_FRAMELOG"), "0");
+    if (!on || !ns)
+        return;
+    n++, sum += ns, lo = ns < lo ? ns : lo, hi = ns > hi ? ns : hi;
+    if (ns > g_pace_ns + g_pace_ns / 4)
+        late++;
+    if (n == 600)
+    {
+        rt_log("[pace] tick ms: period %.2f mean %.2f min %.2f max %.2f, %llu late by over a quarter period\n",
+               g_pace_ns / 1e6, sum / 600 / 1e6, lo / 1e6, hi / 1e6, (unsigned long long)late);
+        n = sum = hi = late = 0, lo = ~0ull;
+    }
+}
+
 static int paced_sleep(uint32_t ret)
 {
     for (int i = 0; i < g_npaced; ++i)
@@ -718,7 +764,9 @@ static int paced_sleep(uint32_t ret)
             }
             else
                 plat_yield();
-            g_paced_woke = rt_monotonic_ns();
+            uint64_t woke = rt_monotonic_ns();
+            tick_log(g_paced_woke ? woke - g_paced_woke : 0);
+            g_paced_woke = woke;
             gt_reacquire(held);
             return 1;
         }

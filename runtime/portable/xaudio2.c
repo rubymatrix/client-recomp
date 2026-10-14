@@ -552,7 +552,11 @@ static void audio_thread(void* arg)
         {
             tried = 1;
             rate = g_v[g_master].rate ? g_v[g_master].rate : 48000;
-            if (!SDL_InitSubSystem(SDL_INIT_AUDIO))
+            /* XIV_MUTE: never open the device; the mixer still runs on the wall clock so the
+             * game's audio timing is unchanged. */
+            if (getenv("XIV_MUTE"))
+                rt_log("[xaudio2] muted (XIV_MUTE)\n");
+            else if (!SDL_InitSubSystem(SDL_INIT_AUDIO))
                 rt_log("[xaudio2] SDL audio: %s\n", SDL_GetError());
             else
             {
@@ -590,6 +594,20 @@ static void audio_thread(void* arg)
         gt_lock();
         pass(n, rate);
         gt_unlock();
+        {
+            /* XIV_VOLUME=<0..1>: master gain on the final mix */
+            static float gain = -1.0f;
+            if (gain < 0.0f)
+            {
+                const char* v = getenv("XIV_VOLUME");
+                gain = v ? (float)atof(v) : 1.0f;
+                if (gain < 0.0f)
+                    gain = 0.0f;
+            }
+            if (gain != 1.0f)
+                for (uint32_t i = 0; i < n * 2; ++i)
+                    g_out[i] *= gain;
+        }
         if (stream)
             SDL_PutAudioStreamData(stream, g_out, (int)(n * 2 * sizeof(float)));
         if (dump) /* XIV_AUDIODUMP=<file>: the output as raw stereo float32 */

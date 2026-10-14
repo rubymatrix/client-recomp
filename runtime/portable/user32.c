@@ -699,6 +699,11 @@ static void pump(void)
             if (!w)
                 break;
             int on = e.type == SDL_EVENT_WINDOW_FOCUS_GAINED;
+            /* a scripted run (autoinput.c) plays into the game while another app is in front: the
+             * game drops keyboard and pad input when it is not the active window, so it never
+             * hears that it lost focus */
+            if (!on && getenv("XIV_INPUT_SCRIPT") && *getenv("XIV_INPUT_SCRIPT"))
+                break;
             post(w->tid, w->hwnd, WM_ACTIVATEAPP, (uint32_t)on, 0);
             post(w->tid, w->hwnd, WM_ACTIVATE, on ? 1u : 0u, 0);
             post(w->tid, w->hwnd, on ? WM_SETFOCUS : WM_KILLFOCUS, 0, 0);
@@ -1031,12 +1036,24 @@ static void sh_ScreenToClient(Guest* g)
 static volatile float g_cursor_x, g_cursor_y;
 static volatile int g_cursor_known;
 
+static volatile int g_cursor_forced; /* autoinput.c: a scripted cursor, in window points */
+static volatile float g_cursor_fx, g_cursor_fy;
+
 void user32_main_tick(void)
 {
     if (!g_sdl_up)
         return;
     float x = 0, y = 0;
     SDL_GetGlobalMouseState(&x, &y); /* on the main thread: no marshalling */
+    if (g_cursor_forced)
+    {
+        Wnd* w = wnd(g_focus);
+        for (int i = 0; i < MAX_WINDOWS && !w; ++i)
+            if (g_wnds[i].used && g_wnds[i].sdl)
+                w = &g_wnds[i];
+        if (w)
+            x = (float)w->x + g_cursor_fx, y = (float)w->y + g_cursor_fy;
+    }
     g_cursor_x = x, g_cursor_y = y;
     g_cursor_known = 1;
 }
@@ -2324,6 +2341,42 @@ void user32_press_key(uint32_t vk)
     uint32_t scan = scan_of_vk(vk);
     post(w->tid, w->hwnd, WM_KEYDOWN, vk, 1u | ((scan & 0xFFu) << 16));
     post(w->tid, w->hwnd, WM_KEYUP, vk, 1u | ((scan & 0xFFu) << 16) | 0xC0000000u);
+}
+
+/* For autoinput.c: the game's window (the focused one, else the first with an SDL window), its
+ * SDL window ID and size in points; 0 if there is none yet. */
+uint32_t user32_game_window(int* w_out, int* h_out)
+{
+    Wnd* w = wnd(g_focus);
+    if (!w || !w->sdl)
+        w = NULL;
+    for (int i = 0; i < MAX_WINDOWS && !w; ++i)
+        if (g_wnds[i].used && g_wnds[i].sdl)
+            w = &g_wnds[i];
+    if (!w)
+        return 0;
+    int ww = 0, wh = 0;
+    SDL_GetWindowSize((SDL_Window*)w->sdl, &ww, &wh);
+    if (w_out)
+        *w_out = ww;
+    if (h_out)
+        *h_out = wh;
+    return (uint32_t)SDL_GetWindowID((SDL_Window*)w->sdl);
+}
+
+/* The SDL scancode that the pump turns into this virtual key (0 if none). */
+int user32_scancode_of_vk(uint32_t vk)
+{
+    for (int sc = 1; sc < SDL_SCANCODE_COUNT; ++sc)
+        if (vk_of((SDL_Scancode)sc) == vk)
+            return sc;
+    return 0;
+}
+
+void user32_force_cursor(int on, float x, float y)
+{
+    g_cursor_fx = x, g_cursor_fy = y;
+    g_cursor_forced = on;
 }
 
 void* user32_sdl_window(uint32_t hwnd)

@@ -28,10 +28,96 @@
 
 #include <SDL3/SDL.h>
 
+static void write_config_sys(const char* path)
+{
+    static const uint32_t fields[24] = {
+        0x20120419, /* magic */
+        0, 0xD800, 0,
+        0,          /* display mode: windowed */
+        2112, 1188, /* window size */
+        7, 4, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 1,
+    };
+    uint8_t buf[0x2AC] = { 0 };
+    for (int i = 0; i < 24; i++)
+        for (int b = 0; b < 4; b++)
+            buf[4 * i + b] = (uint8_t)(fields[i] >> (8 * b));
+    const char* font = "MS UI Gothic"; /* wchar[32] at 0x60 */
+    for (int i = 0; font[i]; i++)
+        buf[0x60 + 2 * i] = (uint8_t)font[i];
+    FILE* f = fopen(path, "wb");
+    if (f)
+    {
+        fwrite(buf, 1, sizeof buf, f);
+        fclose(f);
+        printf("config.sys: wrote the defaults (2112x1188 window) to %s\n", path);
+    }
+}
+
+/* With no config.sys (what ffxivconfig.exe writes) the game opens a 1280x720 window. The first
+ * start here writes one instead: the game's own defaults (FUN_00405c90, decomp/docs/config_sys.md)
+ * but a 2112x1188 window, 1920x1080 and a tenth. Edit it with tools/xiv_config.py. */
+static void write_default_config(const char* docs)
+{
+    char path[1100];
+    snprintf(path, sizeof path, "%s/My Games", docs);
+    plat_mkdir(path);
+    strncat(path, "/FINAL FANTASY XIV", sizeof path - strlen(path) - 1);
+    plat_mkdir(path);
+    strncat(path, "/config.sys", sizeof path - strlen(path) - 1);
+    FILE* f = fopen(path, "rb");
+    if (f)
+        fclose(f);
+    else
+        write_config_sys(path);
+
+    /* config.pad: the gamepad ffxivconfig.exe picked. With none the game opens no gamepad at all
+     * (FUN_00d33630 matches each DirectInput device's instance and product GUID against it), so
+     * pick the first one as dinput.c reports it: instance "SIGN"+0, an Xbox 360 controller's
+     * product GUID. The rest is what the game fills in without the file (FUN_00d34410). */
+    snprintf(path + strlen(path) - strlen("config.sys"), sizeof path - (strlen(path) - strlen("config.sys")), "config.pad");
+    f = fopen(path, "rb");
+    if (f)
+    {
+        fclose(f);
+        return;
+    }
+    static const uint8_t pad_guids[32] = {
+        0x53, 0x49, 0x47, 0x4E, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,               /* guidInstance */
+        0x5E, 0x04, 0x8E, 0x02, 0, 0, 0, 0, 0, 0, 'P', 'I', 'D', 'V', 'I', 'D', /* guidProduct */
+    };
+    uint8_t pad[0x148] = { 0 };
+    pad[0] = 0x11, pad[1] = 0x02, pad[2] = 0x10, pad[3] = 0x20; /* magic 0x20100211 */
+    memcpy(pad + 4, pad_guids, sizeof pad_guids);
+    pad[0x28] = 2;                       /* stick dead zone (scaled into +0x1d0, FUN_00d34410) */
+    /* which input drives each of the game's 24 pad functions (FUN_00d32a30; -1 none, the game's
+     * default): ffxivconfig.exe's "XInput Compliant Gamepad" preset (.data 0x457408). The inputs
+     * are the game's XInput order (FUN_00d337a0): 0 Start 1 Back 2 LS 3 RS 4 LB 5 RB 6 A 7 B 8 X
+     * 9 Y; then a -/+ pair per axis from 32: D-pad X, D-pad Y, left X, left Y, right X, right Y,
+     * LT (45), RT (47). */
+    static const uint8_t xinput_preset[24] = {
+        0x22, 0x23, 0x20, 0x21,             /* menu navigation: D-pad up, down, left, right */
+        0x26, 0x27, 0x24, 0x25,             /* movement: left stick */
+        0x2A, 0x2B, 0x28, 0x29,             /* camera: right stick */
+        0x09, 0x07, 0x06, 0x08, 0x04, 0x2D, /* Y B A X LB LT */
+        0x02, 0x05, 0x2F, 0x03, 0x00, 0x01, /* LS RB RT RS Start Back */
+    };
+    memcpy(pad + 0x2C, xinput_preset, sizeof xinput_preset);
+    f = fopen(path, "wb");
+    if (f)
+    {
+        fwrite(pad, 1, sizeof pad, f);
+        fclose(f);
+        printf("config.pad: wrote the first gamepad to %s\n", path);
+    }
+}
+
 #define GAME_DIR_GUEST "C:\\Program Files\\SquareEnix\\FINAL FANTASY XIV"
 
 void xiv_misc_init(void);
 void xiv_ui_init(void);
+void xiv_native_init(void); /* xiv_native.c */
+void xiv_direct_login_init(void); /* xiv_direct_login.c */
+void xiv_probe_init(void);
 void sampler_start(void);
 void user32_main_tick(void);
 void xiv_set_documents(const char* host_dir);
@@ -64,6 +150,10 @@ static void game_thread(void* arg)
     *(volatile int*)arg = 1;
 }
 
+extern void (*g9_pace_hook)(uint32_t fps); /* gfx9.h */
+uint64_t g9_pace_refresh_ns(void);
+static void xiv_pace_fps(uint32_t fps) { wr32(0x137DF00, fps); }
+
 int main(int argc, char** argv)
 {
     if (argc < 2)
@@ -88,6 +178,7 @@ int main(int argc, char** argv)
         strncat(docs, "/Documents", sizeof docs - strlen(docs) - 1);
         plat_mkdir(docs);
         xiv_set_documents(docs);
+        write_default_config(docs);
     }
     /* XIV_SERIAL=1: guest threads take turns under one lock instead of running in parallel */
     if (getenv("XIV_SERIAL") && strcmp(getenv("XIV_SERIAL"), "0"))
@@ -112,6 +203,9 @@ int main(int argc, char** argv)
     k32_xiv_init();
     xiv_misc_init();
     xiv_ui_init();
+    xiv_native_init();
+    xiv_direct_login_init();
+    xiv_probe_init();
     ole_init();
     user32_init();
     d3d9_init();
@@ -154,6 +248,14 @@ int main(int argc, char** argv)
         const char* cap = getenv("XIV_FPSCAP");
         int fps = cap ? atoi(cap) : 60;
         wr32(0x137DF00, fps > 0 ? (uint32_t)fps : 100000u); /* uncapped: a 10 us period, no Sleep */
+        /* without a cap of its own, the limiter follows the rate presents are paced to: a whole
+         * number of the display's refreshes per frame */
+        if (!cap)
+            g9_pace_hook = xiv_pace_fps;
+        /* Framework::Idle's frame delta (its QueryPerformanceCounter read) in whole refreshes: the
+         * player, camera and animations move by it */
+        if (!getenv("XIV_RAWDELTA"))
+            k32_quantize_qpc_at(0xA4FE24, g9_pace_refresh_ns);
         /* a frame that ran over its period: the limiter's Sleep(1) becomes a yield */
         k32_skip_sleep_at(0x4E8F72);
         const char* hz = getenv("XIV_TICKHZ");

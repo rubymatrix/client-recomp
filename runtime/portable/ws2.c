@@ -35,6 +35,7 @@ static int host_errno(void) { return errno; }
 #endif
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "gthread.h"
@@ -94,6 +95,7 @@ typedef struct Sock
     uint32_t pending;     /* network events recorded, not yet enumerated */
     uint32_t enabled;     /* which events may be recorded again */
     int errors[10];       /* iErrorCode by FD_*_BIT */
+    int tap;              /* packet tap for the scripted input: 0 not decided, 1 game server, 2 no */
 } Sock;
 
 static Sock g_socks[MAX_SOCKS];
@@ -418,6 +420,29 @@ static void lobby_session(Sock* s, uint8_t* buf, uint32_t len)
         memcpy(buf + 12, g_lobby_hash, 16);
 }
 
+/* The scripted input (autoinput.c) watches the game-server connection's packets: `waitfor` and
+ * `target` read them. Only the world connection (its port: XIV_NETTAP_PORT, default 54992). */
+void autoinput_net(int stream, int out, const uint8_t* buf, uint32_t len);
+
+static void tap(Sock* s, int out, const void* buf, int n)
+{
+    if (n <= 0)
+        return;
+    if (!s->tap)
+    {
+        static int port = -1;
+        if (port < 0)
+            port = getenv("XIV_NETTAP_PORT") ? atoi(getenv("XIV_NETTAP_PORT")) : 54992;
+        struct sockaddr_in peer;
+        socklen_t pl = sizeof peer;
+        if (getpeername(s->h, (struct sockaddr*)&peer, &pl) != 0)
+            return;
+        s->tap = port && ntohs(peer.sin_port) == port ? 1 : 2;
+    }
+    if (s->tap == 1)
+        autoinput_net((int)(s - g_socks), out, (const uint8_t*)buf, (uint32_t)n);
+}
+
 static void sh_send(Guest* g)
 {
     Sock* s = sock(ARG(0));
@@ -437,6 +462,7 @@ static void sh_send(Guest* g)
         io_done(s, FD_WRITE, gt_get_error() == WSAEWOULDBLOCK);
         RET(GUEST_SOCKET_ERROR, 4);
     }
+    tap(s, 1, ARGP(1), n);
     RET((uint32_t)n, 4);
 }
 
@@ -480,6 +506,8 @@ static void sh_recv(Guest* g)
         gt_set_error(wsa_error(e));
         RET(GUEST_SOCKET_ERROR, 4);
     }
+    if (!(ARG(3) & 2)) /* not MSG_PEEK */
+        tap(s, 0, ARGP(1), n);
     RET((uint32_t)n, 4);
 }
 

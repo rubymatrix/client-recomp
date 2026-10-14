@@ -18,6 +18,11 @@ void vfs_mount(const char* guest_prefix, const char* host_prefix);
 int vfs_full_path(const char* guest, char* out, size_t n);
 /* The host path for a guest path. 0 if it maps nowhere. */
 int vfs_host_path(const char* guest, char* host, size_t n);
+/* 1 if a guest path that maps nowhere is still a folder the guest can see: a drive root or an
+ * ancestor of a mount ("C:\Users" when "C:\Users\Player\Documents" is mounted). Windows has
+ * those folders, and code that creates a path one component at a time expects
+ * ERROR_ALREADY_EXISTS from them. */
+int vfs_is_virtual_dir(const char* guest);
 
 /* DAT overlays, as XIPivot does them: a host folder laid out like the install's ROM*\ and sound*\
  * folders. A guest path through "ROM<n>\" or "sound<n>\" whose rest is in an overlay opens the

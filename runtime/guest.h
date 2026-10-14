@@ -77,6 +77,15 @@ typedef struct Guest
 
 typedef void (*GuestFn)(Guest*);
 
+/* Generated functions take g as restrict: a Guest is never in guest memory, so the guest loads
+ * and stores (byte pointers into the guest window) cannot touch it, and the compiler may keep its
+ * fields in registers across them (and forward a caller's stores to an inlined callee's loads). */
+#if defined(_MSC_VER)
+#define RT_RESTRICT __restrict
+#else
+#define RT_RESTRICT restrict
+#endif
+
 /* Where the game image really is. The translation is made at its preferred base (0x10000000),
  * but inside the retail launcher the viewer's DLLs already occupy that address and Windows relocates
  * FFXiMain. Every address constant the image's relocation table covers is emitted as
@@ -121,6 +130,36 @@ extern uint32_t rt_flag_lo, rt_flag_hi;
 /* --- runtime entry points (runtime.c) -------------------------------------------------------- */
 
 void rt_call_indirect(Guest* g, uint32_t target);
+GuestFn rt_lookup_any(uint32_t runtime_addr);
+
+/* An indirect call site's own cache of its last target (most call sites always call the same
+ * virtual method): one 64-bit word, the target and the function as a 4-byte aligned offset from
+ * rt_lookup_any, read and written whole so threads need no lock. */
+RT_INLINE void rt_call_ic(Guest* g, uint32_t t, uint64_t* ic)
+{
+    uint64_t e = __atomic_load_n(ic, __ATOMIC_RELAXED);
+    if ((uint32_t)(e >> 32) == t && t)
+    {
+        ((GuestFn)((uintptr_t)rt_lookup_any + ((intptr_t)(int32_t)(uint32_t)e << 2)))(g);
+        return;
+    }
+    GuestFn fn = rt_lookup_any(t);
+    if (!fn)
+    {
+        rt_call_indirect(g, t); /* an import or a thunk */
+        return;
+    }
+    intptr_t d = (intptr_t)(uintptr_t)fn - (intptr_t)(uintptr_t)rt_lookup_any;
+    if (!(d & 3) && d >> 2 == (int32_t)(d >> 2))
+        __atomic_store_n(ic, ((uint64_t)t << 32) | (uint32_t)(int32_t)(d >> 2), __ATOMIC_RELAXED);
+    fn(g);
+}
+#define RT_CALL_IC(t)                                                                            \
+    do                                                                                           \
+    {                                                                                            \
+        static uint64_t rt_ic_;                                                                  \
+        rt_call_ic(g, (t), &rt_ic_);                                                             \
+    } while (0)
 #if defined(_MSC_VER)
 __declspec(noreturn)
 #elif defined(__GNUC__)

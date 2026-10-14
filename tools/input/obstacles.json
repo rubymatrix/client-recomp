@@ -1,0 +1,25 @@
+{
+  "about": "Spots the client collides with but the Map Server navmesh lets through (navmeshes/params.json, agent radius 0.5). route.py keeps paths NPC_CLEAR (1.4) away from each, as from NPCs. Add one when a `follow` stalls at the same place twice; probe it with a fan of two-point `follow` walks (recomp/docs/scripted-input.md).",
+  "obstacles": [
+    {
+      "x": 111.4,
+      "y": 5.0,
+      "z": -1198.9,
+      "zones": [
+        155,
+        206
+      ],
+      "what": "rocks at the foot of the ramp from the Roost road up to the walkway (Gridania). Probed 2026-10-05 with two-point follow walks: (110.8,-1198.4) cannot be reached, and (111.7,-1197.6) -> ramp (111.6,-1200.9) is blocked, while (113.1,-1197.5), (113.5,-1198.3) and (112.7,-1197.3) -> ramp pass; the navmesh path's corner at (112.5,-1198.6) grazes it"
+    },
+    {
+      "x": 112.2,
+      "y": 5.0,
+      "z": -1198.2,
+      "zones": [
+        155,
+        206
+      ],
+      "what": "same rocks, east edge: follow stalled 3 times at (111.5,4.7,-1197.3) facing south-east (estimated contact (112.1-112.4, -1197.5..-1198.0)) with only the first spot listed"
+    }
+  ]
+}

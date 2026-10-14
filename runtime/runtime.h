@@ -65,6 +65,8 @@ void rt_log(const char* fmt, ...);
 void rt_set_log(FILE* f);
 typedef void (*RtFatalHook)(uint32_t addr, const char* what);
 void rt_set_fatal_hook(RtFatalHook h);
+/* every rt_log line, formatted (xiv_probe.c) */
+void rt_set_log_hook(void (*h)(const char* line));
 
 /* Monotonic nanoseconds, from the platform layer (64-bit hosts: rdtsc is built on it). */
 uint64_t rt_monotonic_ns(void);

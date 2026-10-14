@@ -507,22 +507,125 @@ def image_constants(prog, image_path):
     }
 
 
+REG_NAMES = ('eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi')
+REG_ALL = 0xFF
+REG_ESP = 16
+ABI_CLOBBER = 1 | 2 | 4 | REG_ESP  # what any callee may change (MSVC: eax, ecx, edx)
+ABI_READ = 1 | 2 | 4 | REG_ESP     # what an unknown callee may take
+
+
+def regs_store(mask, flags):
+    """A call's or a return's stores of the registers in mask (esp and the direction flag always)."""
+    mask |= REG_ESP
+    s = ' '.join('g->%s = %s;' % (n, n) for b, n in enumerate(REG_NAMES) if mask >> b & 1)
+    s += ' g->df = (uint8_t)df;'
+    if flags:
+        s += ' g->cf = (uint8_t)cf; g->pf = (uint8_t)pf; g->af = (uint8_t)af; g->zf = (uint8_t)zf; g->sf = (uint8_t)sf; g->of = (uint8_t)of;'
+    return s
+
+
+def regs_load(mask):
+    mask |= REG_ESP
+    return (' '.join('%s = g->%s;' % (n, n) for b, n in enumerate(REG_NAMES) if mask >> b & 1) +
+            ' cf = g->cf; pf = g->pf; af = g->af; zf = g->zf; sf = g->sf; of = g->of; df = g->df;')
+
+
+def register_liveness(reginfo):
+    """Registers across calls (x86c.py reg_analysis): for each function, the registers it may
+    return changed (mod) and the ones it reads on entry (live-in), through its callees. A direct
+    call then stores only the callee's live-in registers and reloads only the ones it changes, and
+    a return stores only what changed: a caller keeps the rest in its own locals. Calls through
+    pointers still store and reload everything, so a function they reach finds its registers in g
+    (and what it does not change stays there). Functions the host wraps or patches, hooks, and
+    anything not understood keep everything."""
+    callers = collections.defaultdict(set)
+    for e, ri in reginfo.items():
+        for r, w, kind, tgt, succ in ri['insns']:
+            if kind in (1, 4):
+                callers[tgt].add(e)
+    mod = {e: (REG_ALL if ri['unsafe'] else ri['own'] | REG_ESP) for e, ri in reginfo.items()}
+    work = set(reginfo)
+    while work:
+        e = work.pop()
+        ri = reginfo[e]
+        if ri['unsafe']:
+            continue
+        m, keep = mod[e], ri['preserved']
+        for r, w, kind, tgt, succ in ri['insns']:
+            if kind == 1:
+                m |= mod.get(tgt, REG_ALL) & ~keep
+            elif kind == 2:
+                m |= ABI_CLOBBER & ~keep
+            elif kind == 4:
+                m |= mod.get(tgt, REG_ALL)
+            elif kind == 5:
+                m |= ABI_CLOBBER
+        if m != mod[e]:
+            mod[e] = m
+            work |= callers[e]
+    live_in = {e: (REG_ALL if ri['unsafe'] else 0) for e, ri in reginfo.items()}
+    work = set(reginfo)
+    while work:
+        e = work.pop()
+        ri = reginfo[e]
+        if ri['unsafe']:
+            continue
+        ins = ri['insns']
+        if not ins:
+            v = REG_ALL
+        else:
+            live = [0] * len(ins)
+            changed = True
+            while changed:
+                changed = False
+                for k in range(len(ins) - 1, -1, -1):
+                    r, w, kind, tgt, succ = ins[k]
+                    after = 0
+                    for x in succ:
+                        after |= live[x]
+                    if kind == 1:
+                        v = (after & ~(mod.get(tgt, REG_ALL) | w)) | live_in.get(tgt, REG_ALL) | r
+                    elif kind == 2:
+                        v = (after & ~(ABI_CLOBBER | w)) | ABI_READ | r
+                    elif kind == 3:
+                        v = ((mod[e] | REG_ESP) & ~w) | r
+                    elif kind == 4:
+                        v = (after & ~w) | live_in.get(tgt, REG_ALL) | mod[e] | REG_ESP | r
+                    elif kind == 5:
+                        v = (after & ~w) | ABI_READ | mod[e] | r
+                    else:
+                        v = (after & ~w) | r
+                    if v != live[k]:
+                        live[k] = v
+                        changed = True
+            v = live[ri['entry']]
+        if v != live_in[e]:
+            live_in[e] = v
+            work |= callers[e]
+    n = len(reginfo)
+    print('registers across calls: %d functions, %.2f registers changed and %.2f read on entry on average'
+          % (n, sum(bin(m).count('1') for m in mod.values()) / max(n, 1),
+             sum(bin(v).count('1') for v in live_in.values()) / max(n, 1)), file=sys.stderr)
+    return mod, live_in
+
+
+
 def gate(prog, e, lines, variants):
     """--wraps and --patches: the translation renamed to <fn>_body; each patched variant as
     <fn>_p_<group>; <fn>_sel picks a variant whose patch is in place, else the body; and the entry
     <fn> itself defers to the host's wrap when there is one, else to the selection."""
     fn = '%s%08x' % (prog.prefix, e)
-    head = 'void %s(Guest* g)' % fn
+    head = 'void %s(Guest* RT_RESTRICT g)' % fn
     if lines[0] != head:
         raise SystemExit('--wraps/--patches: unexpected translation header for %#x' % e)
-    out = ['void %s_body(Guest* g)' % fn] + lines[1:]
+    out = ['void %s_body(Guest* RT_RESTRICT g)' % fn] + lines[1:]
     inner = fn + '_body'
     if variants:
         for group, v in variants:
             if v[0] != head:
                 raise SystemExit('--patches: unexpected translation header for %#x' % e)
             out += ['', '/* recomp.py --patches %s: this function with the patch in place */' % group,
-                    'void %s_p_%s(Guest* g)' % (fn, group)] + v[1:]
+                    'void %s_p_%s(Guest* RT_RESTRICT g)' % (fn, group)] + v[1:]
         out += ['', 'void %s_sel(Guest* g)' % fn, '{']
         for group, _ in variants:
             out.append('    if (rt_patch_%s) { %s_p_%s(g); return; }' % (group, fn, group))
@@ -610,6 +713,7 @@ def main():
     prog.functions_at_start = set(prog.functions)
     done = {}
     flaginfo = {}
+    reginfo = {}
     unimpl = collections.Counter()
     unimpl_funcs = set()
     queue = list(todo)
@@ -621,6 +725,7 @@ def main():
         t = FunctionTranslator(prog, e, prog.functions[e])
         done[e] = t.translate()
         flaginfo[e] = t.flaginfo
+        reginfo[e] = t.reginfo
         variants = []
         for group in patched.get(e, []):
             prog.overlay = prog.patches[group]
@@ -629,6 +734,7 @@ def main():
             variants.append((group, v))
         if e in prog.wraps or variants:
             done[e] = gate(prog, e, done[e], variants)
+            reginfo[e] = dict(reginfo[e], unsafe=True)  # the host or a patch decides what it reads
         for addr, mn, why in t.unimpl:
             unimpl[why if why.startswith('x87') else mn] += 1
             unimpl_funcs.add(e)
@@ -680,10 +786,21 @@ def main():
         def to_store(mm):  # noqa: F811
             t = int(mm.group(1), 16)
             return 'REGS_STORE;' if t in flags_in else 'REGS_STORE_CUT(0x%08x);' % t
+    regs_mod, regs_in = register_liveness(reginfo) if not (bisect or os.environ.get('RECOMP_NOREGS')) else ({}, {})
+    call_re = re.compile(r'REGS_STORE_TO_([0-9a-f]{8});(.*?)REGS_LOAD;')
+
+    def call_regs(mm):
+        t = int(mm.group(1), 16)
+        if t not in regs_in:
+            return to_store(mm) + mm.group(2) + 'REGS_LOAD;'
+        return regs_store(regs_in[t], t in flags_in) + mm.group(2) + regs_load(regs_mod[t])
     for e in done:
-        ret = 'REGS_STORE;' if e in flags_out else ('REGS_STORE_CUT(0x%08x);' % e if bisect else 'REGS_STORE_NOFLAGS;')
-        done[e] = [to_re.sub(to_store, ln).replace('REGS_STORE_RET;', ret) if isinstance(ln, str) else ln
-                   for ln in done[e]]
+        if e in regs_mod:
+            ret = regs_store(regs_mod[e], e in flags_out)
+        else:
+            ret = 'REGS_STORE;' if e in flags_out else ('REGS_STORE_CUT(0x%08x);' % e if bisect else 'REGS_STORE_NOFLAGS;')
+        done[e] = [to_re.sub(to_store, call_re.sub(call_regs, ln)).replace('REGS_STORE_RET;', ret)
+                   if isinstance(ln, str) else ln for ln in done[e]]
 
     os.makedirs(args.out, exist_ok=True)
     entries = sorted(done)

@@ -143,10 +143,15 @@ typedef struct G9Draw
     G9States rs;
     G9Viewport vp;
     int32_t scissor[4];   /* left, top, right, bottom */
+    float clip[6][4];     /* user clip planes (clip space) */
+    uint32_t clip_on;     /* D3DRS_CLIPPLANEENABLE */
 } G9Draw;
 
 void g9_draw(const G9Draw* d);
 /* The frame is done: the back buffer goes to the window. */
 void g9_present(G9Tex* backbuffer);
+/* the frame rate presents are paced to (gfx9_metal.m pace_set): the host passes it to the game's limiter */
+extern void (*g9_pace_hook)(uint32_t fps);
+uint64_t g9_pace_refresh_ns(void); /* the display's refresh while presents are paced, else 0 */
 /* Waits for the GPU. */
 void g9_finish(void);
