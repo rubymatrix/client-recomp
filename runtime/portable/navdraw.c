@@ -1,6 +1,7 @@
-/* Navmesh debug overlay: the data side (navdraw.h). Finds and loads the current zone's .navdraw
- * file (navgen docs/FORMATS.md §6) and expands it into coloured triangles and line segments for the
- * renderer (gfx9_metal.m draws them, depth-tested against the scene). */
+/* Navmesh debug overlay: the data side (navdraw.h). Finds and loads the .navdraw files (navgen
+ * docs/FORMATS.md §6) of the current zone and the other zones of its region near the camera, on a
+ * loader thread, and expands each into coloured triangles and line segments for the renderer
+ * (gfx9_metal.m draws them, depth-tested against the scene). */
 #include "navdraw.h"
 #include "guest.h"
 
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -127,29 +129,48 @@ static uint32_t link_colour(const NdLink* l)
 
 typedef struct Geom
 {
-    NavDrawGeom pub;
+    NavDrawGeom pub; /* first: navdraw_handoff casts back */
     NavDrawVert* tris;
     NavDrawVert* lines;
     uint32_t tris_visible, lines_visible; /* without pruned */
 } Geom;
 
-static Geom g_geom;
-static int g_have_geom;
+/* page-aligned vertex memory, so the renderer can wrap it in a GPU buffer without a copy */
+static void* vmem_alloc(size_t bytes, size_t* rounded)
+{
+    size_t pg = (size_t)getpagesize();
+    size_t n = (bytes + pg - 1) / pg * pg;
+    if (!n)
+        n = pg;
+    void* p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED)
+        return NULL;
+    *rounded = n;
+    return p;
+}
+
+void navdraw_vfree(void* p, size_t bytes)
+{
+    if (p && bytes)
+        munmap(p, bytes);
+}
 
 static void geom_free(Geom* g)
 {
-    free(g->tris);
-    free(g->lines);
+    navdraw_vfree(g->tris, g->pub.tris_bytes);
+    navdraw_vfree(g->lines, g->pub.lines_bytes);
     memset(g, 0, sizeof *g);
+}
+
+static uint64_t geom_bytes(const Geom* g)
+{
+    return (uint64_t)g->pub.tris_bytes + g->pub.lines_bytes;
 }
 
 static void push_line(NavDrawVert** v, uint32_t* n, uint32_t* cap, const float a[3], const float b[3], uint32_t c)
 {
-    if (*n + 2 > *cap)
-    {
-        *cap = *cap ? *cap * 2 : 4096;
-        *v = (NavDrawVert*)realloc(*v, *cap * sizeof **v);
-    }
+    if (*n + 2 > *cap) /* sized for the worst case: not reached */
+        return;
     (*v)[(*n)++] = (NavDrawVert){ a[0], a[1], a[2], c };
     (*v)[(*n)++] = (NavDrawVert){ b[0], b[1], b[2], c };
 }
@@ -242,7 +263,17 @@ static int geom_load(Geom* out, const char* path, const char* zone)
     Geom g;
     memset(&g, 0, sizeof g);
     snprintf(g.pub.zone, sizeof g.pub.zone, "%s", zone);
-    g.tris = (NavDrawVert*)malloc((size_t)h.tris * 3 * sizeof *g.tris + 1);
+    /* lines: 2 vertices an edge; a link is at most 22 segments (16 arc, 2 barbs, 2 crosses of 2) */
+    uint32_t cap = (uint32_t)(h.edges * 2ull + h.links * 44ull);
+    g.tris = (NavDrawVert*)vmem_alloc((size_t)h.tris * 3 * sizeof *g.tris, &g.pub.tris_bytes);
+    g.lines = (NavDrawVert*)vmem_alloc((size_t)cap * sizeof *g.lines, &g.pub.lines_bytes);
+    if (!g.tris || !g.lines)
+    {
+        rt_log("[navdraw] %s: out of memory\n", path);
+        geom_free(&g);
+        free(b);
+        return 0;
+    }
     /* visible triangles first, pruned after */
     uint32_t n = 0;
     for (int pass = 0; pass < 2; ++pass)
@@ -264,7 +295,7 @@ static int geom_load(Geom* out, const char* path, const char* zone)
     }
     g.pub.ntris = n;
 
-    uint32_t nl = 0, cap = 0;
+    uint32_t nl = 0;
     for (int pass = 0; pass < 2; ++pass)
     {
         /* internal edges are many and faint: drawn under the boundaries */
@@ -286,10 +317,19 @@ static int geom_load(Geom* out, const char* path, const char* zone)
         }
     }
     g.pub.nlines = nl;
+    /* give back the unused tail of the lines' worst case */
+    size_t pg = (size_t)getpagesize(), used = ((size_t)nl * sizeof *g.lines + pg - 1) / pg * pg;
+    if (!used)
+        used = pg;
+    if (used < g.pub.lines_bytes)
+    {
+        munmap((uint8_t*)g.lines + used, g.pub.lines_bytes - used);
+        g.pub.lines_bytes = used;
+    }
     g.pub.tris = g.tris;
     g.pub.lines = g.lines;
-    rt_log("[navdraw] %s: %u triangles (%u pruned), %u edges, %u links, %u gates from %s\n", zone, h.tris,
-        h.tris - g.tris_visible / 3, h.edges, h.links, h.gates, path);
+    rt_log("[navdraw] %s: %u triangles (%u pruned), %u edges, %u links, %u gates, %.1f MB from %s\n", zone, h.tris,
+        h.tris - g.tris_visible / 3, h.edges, h.links, h.gates, geom_bytes(&g) / 1048576.0, path);
     free(b);
     *out = g;
     return 1;
@@ -487,45 +527,528 @@ float navdraw_lift(void)
     return lift;
 }
 
+/* --- the region (zones.json) ------------------------------------------------------------------------- */
+
+typedef struct ZoneInfo
+{
+    char name[64];
+    int id, region, same_as;
+} ZoneInfo;
+
+static const char* zones_path(void)
+{
+    static char path[1100];
+    const char* e = getenv("XIV_NAVDRAW_ZONES");
+    if (e && *e)
+        return e;
+    /* draw_dir is <workspace>/navmeshes/draw */
+    snprintf(path, sizeof path, "%s/../../collision/zones.json", draw_dir());
+    return path;
+}
+
+/* zones.json: {"zones": {"<name>": {"zoneId": n, "regionId": n, "sameAs": "<name>", ...}, ...}}. A
+ * small scanner for that shape, not a JSON parser. Returns the count, -1 when it cannot be read. */
+static int zones_read(ZoneInfo* out, int max)
+{
+    FILE* f = fopen(zones_path(), "rb");
+    if (!f)
+        return -1;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* b = size > 0 ? (char*)malloc((size_t)size + 1) : NULL;
+    if (!b || fread(b, 1, (size_t)size, f) != (size_t)size)
+    {
+        fclose(f);
+        free(b);
+        return -1;
+    }
+    fclose(f);
+    b[size] = 0;
+    int n = 0, depth = 0, zones_depth = -1;
+    ZoneInfo* cur = NULL;
+    for (const char* p = b; *p;)
+    {
+        char c = *p;
+        if (c == '"')
+        {
+            char s[64];
+            size_t k = 0;
+            for (++p; *p && *p != '"'; ++p)
+            {
+                if (*p == '\\' && p[1])
+                    ++p;
+                if (k + 1 < sizeof s)
+                    s[k++] = *p;
+            }
+            s[k] = 0;
+            if (*p)
+                ++p;
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+                ++p;
+            if (*p != ':')
+                continue; /* a value */
+            ++p;
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+                ++p;
+            if (depth == 1 && !strcmp(s, "zones") && *p == '{')
+                zones_depth = 2;
+            else if (depth == zones_depth && *p == '{' && n < max)
+            {
+                cur = &out[n++];
+                memset(cur, 0, sizeof *cur);
+                snprintf(cur->name, sizeof cur->name, "%s", s);
+                cur->id = cur->region = -1;
+            }
+            else if (cur && depth == zones_depth + 1)
+            {
+                if (!strcmp(s, "zoneId"))
+                    cur->id = (int)strtol(p, NULL, 10);
+                else if (!strcmp(s, "regionId"))
+                    cur->region = (int)strtol(p, NULL, 10);
+                else if (!strcmp(s, "sameAs"))
+                    cur->same_as = 1;
+            }
+            continue;
+        }
+        if (c == '{' || c == '[')
+            ++depth;
+        else if (c == '}' || c == ']')
+        {
+            --depth;
+            if (depth == zones_depth)
+                cur = NULL;
+            else if (depth < zones_depth)
+                zones_depth = -1;
+        }
+        ++p;
+    }
+    free(b);
+    return n;
+}
+
+/* --- the zones loaded ---------------------------------------------------------------------------------- */
+
+enum { S_NONE, S_LOADING, S_READY, S_FAILED };
+
+typedef struct Slot
+{
+    char zone[64];
+    char file[1100];
+    int current;
+    int have_bounds;
+    float bmin[3], bmax[3];
+    uint64_t estimate; /* bytes of vertices, from the header's counts */
+    int state;
+    uint32_t token;
+    Geom geom;
+} Slot;
+
+static Slot g_slots[NAVDRAW_MAX];
+static int g_nslots;
+static int g_show_neighbours = 1;
+static uint32_t g_ids;
+static NavDrawSet g_set;
+
+/* the loader thread: requests in, geometry out */
+typedef struct Req
+{
+    uint32_t token;
+    int prio;
+    char file[1100], zone[64];
+} Req;
+
+typedef struct Res
+{
+    uint32_t token;
+    int ok;
+    Geom geom;
+} Res;
+
+static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
+static Req g_reqs[NAVDRAW_MAX];
+static int g_nreqs;
+static Res g_res[NAVDRAW_MAX * 2];
+static int g_nres;
+static int g_loader; /* 0 not started, 1 running, -1 none (loads on the caller) */
+
+static void* loader_thread(void* arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&g_mu);
+    for (;;)
+    {
+        while (!g_nreqs || g_nres >= (int)(sizeof g_res / sizeof g_res[0]))
+            pthread_cond_wait(&g_cv, &g_mu);
+        int best = 0;
+        for (int i = 1; i < g_nreqs; ++i)
+            if (g_reqs[i].prio > g_reqs[best].prio)
+                best = i;
+        Req r = g_reqs[best];
+        memmove(&g_reqs[best], &g_reqs[best + 1], (size_t)(g_nreqs - best - 1) * sizeof *g_reqs);
+        --g_nreqs;
+        pthread_mutex_unlock(&g_mu);
+        Res res;
+        memset(&res, 0, sizeof res);
+        res.token = r.token;
+        res.ok = geom_load(&res.geom, r.file, r.zone);
+        pthread_mutex_lock(&g_mu);
+        g_res[g_nres++] = res;
+    }
+    return NULL;
+}
+
+static void request(Slot* s)
+{
+    s->token = ++g_ids;
+    s->state = S_LOADING;
+    if (!g_loader)
+    {
+        const char* e = getenv("XIV_NAVDRAW_SYNC");
+        g_loader = -1;
+        pthread_t t;
+        if (!(e && strcmp(e, "0")) && pthread_create(&t, NULL, loader_thread, NULL) == 0)
+            pthread_detach(t), g_loader = 1;
+    }
+    if (g_loader < 0)
+    {
+        Res res;
+        memset(&res, 0, sizeof res);
+        res.token = s->token;
+        res.ok = geom_load(&res.geom, s->file, s->zone);
+        g_res[g_nres++] = res; /* drained before the next request */
+        return;
+    }
+    pthread_mutex_lock(&g_mu);
+    Req* r = &g_reqs[g_nreqs++];
+    r->token = s->token;
+    r->prio = s->current;
+    snprintf(r->file, sizeof r->file, "%s", s->file);
+    snprintf(r->zone, sizeof r->zone, "%s", s->zone);
+    pthread_cond_signal(&g_cv);
+    pthread_mutex_unlock(&g_mu);
+}
+
+/* drops a slot's geometry, or its load (a load already running finishes and is thrown away) */
+static void slot_drop(Slot* s)
+{
+    if (s->state == S_LOADING)
+    {
+        pthread_mutex_lock(&g_mu);
+        for (int i = 0; i < g_nreqs; ++i)
+            if (g_reqs[i].token == s->token)
+            {
+                memmove(&g_reqs[i], &g_reqs[i + 1], (size_t)(g_nreqs - i - 1) * sizeof *g_reqs);
+                --g_nreqs;
+                break;
+            }
+        pthread_mutex_unlock(&g_mu);
+    }
+    if (s->state == S_READY)
+        rt_log("[navdraw] %s unloaded (%.1f MB)\n", s->zone, geom_bytes(&s->geom) / 1048576.0);
+    geom_free(&s->geom);
+    s->state = S_NONE;
+    s->token = 0;
+}
+
+static void drain(void)
+{
+    if (g_loader > 0)
+        pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_nres; ++i)
+    {
+        Res* r = &g_res[i];
+        Slot* s = NULL;
+        for (int k = 0; k < g_nslots; ++k)
+            if (g_slots[k].state == S_LOADING && g_slots[k].token == r->token)
+                s = &g_slots[k];
+        if (!s)
+        {
+            geom_free(&r->geom); /* dropped while it loaded */
+            continue;
+        }
+        if (r->ok)
+        {
+            s->geom = r->geom;
+            s->geom.pub.id = s->token;
+            s->state = S_READY;
+        }
+        else
+            s->state = S_FAILED;
+    }
+    g_nres = 0;
+    if (g_loader > 0)
+    {
+        pthread_cond_signal(&g_cv);
+        pthread_mutex_unlock(&g_mu);
+    }
+}
+
+static int read_bounds(Slot* s)
+{
+    FILE* f = fopen(s->file, "rb");
+    if (!f)
+        return 0;
+    NdHeader h;
+    int ok = fread(&h, sizeof h, 1, f) == 1 && h.magic == XNVD_MAGIC && h.version == 1;
+    fclose(f);
+    if (!ok)
+        return 0;
+    memcpy(s->bmin, h.bmin, sizeof s->bmin);
+    memcpy(s->bmax, h.bmax, sizeof s->bmax);
+    s->estimate = ((uint64_t)h.tris * 3 + h.edges * 2ull + h.links * 44ull) * sizeof(NavDrawVert);
+    s->have_bounds = 1;
+    return 1;
+}
+
+/* The zones to keep for the current zone: the current one's file, then the file of every other
+ * zone of its region (once each: a sameAs zone names its target's file). */
+static void region_build(const char* cur_zone, const char* cur_file, int cur_id)
+{
+    static char zones[NAVDRAW_MAX][64], files[NAVDRAW_MAX][1100]; /* static: big for a stack */
+    int n = 0, region = -1;
+    snprintf(zones[0], sizeof zones[0], "%s", cur_zone);
+    snprintf(files[0], sizeof files[0], "%s", cur_file);
+    n = 1;
+    static ZoneInfo zi[512];
+    int nz = zones_read(zi, (int)(sizeof zi / sizeof zi[0]));
+    for (int i = 0; i < nz; ++i)
+        if ((cur_id >= 0 && zi[i].id == cur_id) || !strcmp(zi[i].name, cur_zone))
+        {
+            region = zi[i].region;
+            break;
+        }
+    if (nz < 0)
+        rt_log("[navdraw] cannot read %s: the current zone only\n", zones_path());
+    for (int i = 0; region >= 0 && i < nz && n < NAVDRAW_MAX; ++i)
+    {
+        if (zi[i].region != region || zi[i].same_as)
+            continue;
+        char file[1100], zone[128];
+        if (!index_lookup(zi[i].name, -1, file, sizeof file, zone, sizeof zone))
+            continue;
+        int dup = 0;
+        for (int k = 0; k < n; ++k)
+            dup |= !strcmp(files[k], file);
+        if (dup)
+            continue;
+        snprintf(zones[n], sizeof zones[n], "%s", zone);
+        snprintf(files[n], sizeof files[n], "%s", file);
+        ++n;
+    }
+    /* keep what is loaded and still wanted, drop the rest */
+    static Slot old[NAVDRAW_MAX];
+    int nold = g_nslots;
+    memcpy(old, g_slots, sizeof old);
+    memset(g_slots, 0, sizeof g_slots);
+    g_nslots = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        Slot* s = &g_slots[g_nslots++];
+        int kept = 0;
+        for (int k = 0; k < nold && !kept; ++k)
+            if (old[k].file[0] && !strcmp(old[k].file, files[i]))
+            {
+                *s = old[k];
+                old[k].file[0] = 0;
+                kept = 1;
+            }
+        if (!kept)
+        {
+            snprintf(s->file, sizeof s->file, "%s", files[i]);
+            read_bounds(s);
+        }
+        snprintf(s->zone, sizeof s->zone, "%s", zones[i]);
+        s->current = i == 0;
+        snprintf(s->geom.pub.zone, sizeof s->geom.pub.zone, "%s", zones[i]);
+    }
+    for (int k = 0; k < nold; ++k)
+        if (old[k].file[0])
+            slot_drop(&old[k]);
+    if (region >= 0)
+    {
+        char list[1024] = "";
+        for (int i = 1; i < g_nslots; ++i)
+            snprintf(list + strlen(list), sizeof list - strlen(list), " %s", g_slots[i].zone);
+        rt_log("[navdraw] %s: region %d, other zones:%s\n", cur_zone, region, *list ? list : " none");
+    }
+}
+
+/* where the camera is: the point the view-projection maps to x = y = w = 0 (rows 0, 1, 3) */
+static int camera_pos(const float m[16], float p[3])
+{
+    const float *a = m, *b = m + 4, *c = m + 12;
+    float det = a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
+    if (fabsf(det) < 1e-12f)
+        return 0;
+    float r[3] = { -a[3], -b[3], -c[3] };
+    p[0] = (r[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (r[1] * c[2] - b[2] * r[2]) + a[2] * (r[1] * c[1] - b[1] * r[2])) / det;
+    p[1] = (a[0] * (r[1] * c[2] - b[2] * r[2]) - r[0] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * r[2] - r[1] * c[0])) / det;
+    p[2] = (a[0] * (b[1] * r[2] - r[1] * c[1]) - a[1] * (b[0] * r[2] - r[1] * c[0]) + r[0] * (b[0] * c[1] - b[1] * c[0])) / det;
+    return 1;
+}
+
+static float box_dist(const Slot* s, const float p[3])
+{
+    float d2 = 0;
+    for (int i = 0; i < 3; ++i)
+    {
+        float d = p[i] < s->bmin[i] ? s->bmin[i] - p[i] : p[i] > s->bmax[i] ? p[i] - s->bmax[i] : 0;
+        d2 += d * d;
+    }
+    return sqrtf(d2);
+}
+
+static float env_f(const char* name, float def)
+{
+    const char* e = getenv(name);
+    return e && *e ? strtof(e, NULL) : def;
+}
+
 /* --- per frame ---------------------------------------------------------------------------------------- */
 
-const NavDrawGeom* navdraw_frame(void)
+const NavDrawSet* navdraw_frame(void)
 {
     static char cur_name[64];
     static int cur_id = -2;
-    static uint32_t gen;
     static int warned;
+    static float radius = -1, budget;
+    if (radius < 0)
+    {
+        radius = env_f("XIV_NAVDRAW_RADIUS", 1000.0f);
+        budget = env_f("XIV_NAVDRAW_BUDGET_MB", 320.0f) * 1048576.0f;
+    }
     char name[64] = "";
     int id = -1;
     if (!navdraw_get_zone(name, sizeof name, &id))
     {
         if (!warned)
             rt_log("[navdraw] no zone yet (set XIV_NAVDRAW_ZONE, or run the Meteor admin API)\n"), warned = 1;
-        return g_have_geom ? &g_geom.pub : NULL;
     }
-    if (strcmp(name, cur_name) || id != cur_id)
+    else if (strcmp(name, cur_name) || id != cur_id)
     {
         snprintf(cur_name, sizeof cur_name, "%s", name);
         cur_id = id;
         char file[1400], zone[128];
-        geom_free(&g_geom);
-        g_have_geom = 0;
         if (index_lookup(name, id, file, sizeof file, zone, sizeof zone))
-            g_have_geom = geom_load(&g_geom, file, zone);
+            region_build(zone, file, *name ? -1 : id);
         else
+        {
             rt_log("[navdraw] zone %s%s%d not in %s/index.tsv\n", name, *name ? "" : "id ", *name ? 0 : id, draw_dir());
-        g_geom.pub.gen = ++gen;
+            for (int i = 0; i < g_nslots; ++i)
+                slot_drop(&g_slots[i]);
+            g_nslots = 0;
+        }
     }
-    if (!g_have_geom)
-        return NULL;
-    g_geom.pub.tris_shown = g_show_pruned ? g_geom.pub.ntris : g_geom.tris_visible;
-    g_geom.pub.lines_shown = g_show_pruned ? g_geom.pub.nlines : g_geom.lines_visible;
-    return &g_geom.pub;
+    drain();
+
+    float m[16], cam[3];
+    int have_cam = navdraw_get_camera(m) && camera_pos(m, cam);
+    /* what to load: the current zone, then the others nearest first while within the radius and
+     * the budget; what to drop: the others once well outside it (hysteresis), or hidden */
+    uint64_t used = 0;
+    for (int i = 0; i < g_nslots; ++i)
+        if (g_slots[i].state == S_READY)
+            used += geom_bytes(&g_slots[i].geom);
+        else if (g_slots[i].state == S_LOADING)
+            used += g_slots[i].estimate;
+    for (int i = 0; i < g_nslots; ++i)
+    {
+        Slot* s = &g_slots[i];
+        if (s->current || s->state == S_NONE || s->state == S_FAILED)
+            continue;
+        if (!g_show_neighbours || (have_cam && s->have_bounds && box_dist(s, cam) > radius * 1.25f + 100.0f))
+        {
+            used -= s->state == S_READY ? geom_bytes(&s->geom) : s->estimate;
+            slot_drop(s);
+        }
+    }
+    if (g_nslots && g_slots[0].state == S_NONE)
+    {
+        request(&g_slots[0]);
+        used += g_slots[0].estimate;
+    }
+    for (;;)
+    {
+        Slot* best = NULL;
+        float best_d = 0;
+        for (int i = 1; g_show_neighbours && have_cam && i < g_nslots; ++i)
+        {
+            Slot* s = &g_slots[i];
+            if (s->state != S_NONE || !s->have_bounds)
+                continue;
+            float d = box_dist(s, cam);
+            if (d <= radius && used + s->estimate <= (uint64_t)budget && (!best || d < best_d))
+                best = s, best_d = d;
+        }
+        if (!best)
+            break;
+        request(best);
+        used += best->estimate;
+    }
+    drain(); /* loads done on this thread (XIV_NAVDRAW_SYNC) */
+
+    g_set.n = 0;
+    for (int pass = 0; pass < 2; ++pass)
+        for (int i = 0; i < g_nslots; ++i)
+        {
+            Slot* s = &g_slots[i];
+            if (s->state != S_READY || s->current != pass)
+                continue;
+            Geom* g = &s->geom;
+            g->pub.dim = !s->current;
+            g->pub.tris_shown = g_show_pruned ? g->pub.ntris : g->tris_visible;
+            g->pub.lines_shown = g_show_pruned ? g->pub.nlines : g->lines_visible;
+            g_set.g[g_set.n++] = &g->pub;
+        }
+    return g_set.n ? &g_set : NULL;
+}
+
+void navdraw_handoff(const NavDrawGeom* pub, int tris, int lines)
+{
+    Geom* g = (Geom*)pub;
+    if (tris)
+        g->tris = NULL, g->pub.tris = NULL;
+    if (lines)
+        g->lines = NULL, g->pub.lines = NULL;
+    /* the sizes stay (geom_free skips the NULL pointers): the budget counts the GPU's copy until
+     * the zone is dropped */
+}
+
+void navdraw_stats(uint64_t* bytes, int* loaded, int* loading)
+{
+    *bytes = 0, *loaded = 0, *loading = 0;
+    for (int i = 0; i < g_nslots; ++i)
+        if (g_slots[i].state == S_READY)
+            *bytes += geom_bytes(&g_slots[i].geom), ++*loaded;
+        else if (g_slots[i].state == S_LOADING)
+            ++*loading;
 }
 
 int navdraw_key(int sc, int down, int shift)
 {
-    if (g_disabled || sc != SDL_SCANCODE_F10)
+    static int f11_taken;
+    if (g_disabled)
+        return 0;
+    if (sc == SDL_SCANCODE_F11)
+    {
+        /* Shift+F11 only: plain F11 stays the game's */
+        if (down && shift)
+        {
+            g_show_neighbours = !g_show_neighbours;
+            rt_log("[navdraw] other zones of the region %s\n", g_show_neighbours ? "shown" : "hidden");
+            f11_taken = 1;
+            return 1;
+        }
+        if (!down && f11_taken)
+        {
+            f11_taken = 0;
+            return 1;
+        }
+        return 0;
+    }
+    if (sc != SDL_SCANCODE_F10)
         return 0;
     if (down)
     {
@@ -550,4 +1073,6 @@ __attribute__((constructor)) static void navdraw_init(void)
     navdraw_on = e && strcmp(e, "0") != 0;
     const char* p = getenv("XIV_NAVDRAW_PRUNED");
     g_show_pruned = p && strcmp(p, "0");
+    const char* nb = getenv("XIV_NAVDRAW_NEIGHBOURS");
+    g_show_neighbours = !(nb && !strcmp(nb, "0"));
 }

@@ -4,7 +4,8 @@
  *
  * g9_overlay runs once a frame, when the game presents, before the back buffer is shot or shown: a
  * pass over the back buffer draws the zone's navmesh as translucent faces, then its edges and
- * off-mesh links as screen-space quads. No depth buffer is attached: each fragment reads the
+ * off-mesh links as screen-space quads, for each zone navdraw_frame gives (the region's other zones
+ * first, faded: less alpha, less colour). No depth buffer is attached: each fragment reads the
  * scene's depth (fx_note_draw's, this frame's) and is dropped when the scene is nearer. Both
  * depths are compared as view distances (the projection's z = A w + B, from its rows), so the
  * bias is in metres at any distance. Nothing runs, and nothing is noted per draw, while the overlay
@@ -15,9 +16,9 @@
 static const char ND_MSL[] =
     "#include <metal_stdlib>\nusing namespace metal;\n"
     "struct NV { packed_float3 p; uint c; };\n"
-    "struct NU { float4 r[4]; float4 target; float4 depth; float4 zlin; float4 opt; };\n"
+    "struct NU { float4 r[4]; float4 target; float4 depth; float4 zlin; float4 opt; float4 style; };\n"
     /* target: w, h, 1/w, 1/h; depth: tex w, h, has depth; zlin: A, B, linear, bias m;
-     * opt: lift (faces), lift (lines), half line width px, relative bias */
+     * opt: lift (faces), lift (lines), half line width px, relative bias; style: alpha scale, desaturation */
     "struct NO { float4 p [[position]]; float4 c; float w; };\n"
     "static float4 nd_clip(constant NU& u, float3 p) { float4 v = float4(p, 1.0);\n"
     "  return float4(dot(u.r[0], v), dot(u.r[1], v), dot(u.r[2], v), dot(u.r[3], v)); }\n"
@@ -48,7 +49,8 @@ static const char ND_MSL[] =
     "      if (i.w > ws + u.zlin.w + ws * u.opt.w) discard_fragment();\n"
     "    } else if (abs(i.p.z - sd) > u.zlin.w * 1e-3 && (u.zlin.x > 0.0 ? i.p.z < sd : i.p.z > sd)) discard_fragment();\n"
     "  }\n"
-    "  return i.c; }\n";
+    "  float4 c = i.c; float l = dot(c.rgb, float3(0.299, 0.587, 0.114));\n"
+    "  c.rgb = mix(c.rgb, float3(l), u.style.y); c.a *= u.style.x; return c; }\n";
 
 static struct
 {
@@ -56,8 +58,12 @@ static struct
     id<MTLLibrary> lib;
     id<MTLRenderPipelineState> tri, line;
     MTLPixelFormat fmt;
-    id<MTLBuffer> tris, lines;
-    uint32_t gen;
+    struct
+    {
+        uint32_t id;
+        int used;
+        id<MTLBuffer> tris, lines;
+    } buf[NAVDRAW_MAX];
     id<MTLTexture> nodepth;
     int warned_cam, warned_depth;
 } g_nd;
@@ -148,8 +154,65 @@ static int nd_pipes(MTLPixelFormat fmt)
 typedef struct NdU
 {
     float r[16];
-    float target[4], depth[4], zlin[4], opt[4];
+    float target[4], depth[4], zlin[4], opt[4], style[4];
 } NdU;
+
+/* A GPU buffer over a zone's vertex memory: wrapped without a copy (*wrapped = 1: the buffer then
+ * owns the memory and frees it once the GPU is done with it), or copied when that fails. */
+static id<MTLBuffer> nd_buffer(const NavDrawVert* v, uint32_t n, size_t bytes, int* wrapped)
+{
+    *wrapped = 0;
+    if (!v || !n)
+        return nil;
+    void* p = (void*)v;
+    id<MTLBuffer> b = [g_dev newBufferWithBytesNoCopy:p
+                                               length:bytes
+                                              options:MTLResourceStorageModeShared
+                                          deallocator:^(void* q, NSUInteger len) {
+                                              navdraw_vfree(q, len);
+                                          }];
+    if (b)
+    {
+        *wrapped = 1;
+        return b;
+    }
+    return [g_dev newBufferWithBytes:v length:n * sizeof(NavDrawVert) options:MTLResourceStorageModeShared];
+}
+
+/* the GPU copies of this frame's zones: made for new ones, released for the ones gone */
+static void nd_sync(const NavDrawSet* set)
+{
+    for (int k = 0; k < NAVDRAW_MAX; ++k)
+        g_nd.buf[k].used = 0;
+    for (uint32_t i = 0; i < set->n; ++i)
+    {
+        const NavDrawGeom* geo = set->g[i];
+        int k = 0;
+        while (k < NAVDRAW_MAX && !(g_nd.buf[k].id == geo->id && (g_nd.buf[k].tris || g_nd.buf[k].lines)))
+            ++k;
+        if (k == NAVDRAW_MAX)
+        {
+            for (k = 0; k < NAVDRAW_MAX && (g_nd.buf[k].tris || g_nd.buf[k].lines || g_nd.buf[k].used); ++k)
+                ;
+            if (k == NAVDRAW_MAX)
+                continue;
+            int wt = 0, wl = 0;
+            g_nd.buf[k].id = geo->id;
+            g_nd.buf[k].tris = nd_buffer(geo->tris, geo->ntris, geo->tris_bytes, &wt);
+            g_nd.buf[k].lines = nd_buffer(geo->lines, geo->nlines, geo->lines_bytes, &wl);
+            navdraw_handoff(geo, wt, wl);
+        }
+        g_nd.buf[k].used = 1;
+    }
+    for (int k = 0; k < NAVDRAW_MAX; ++k)
+        if (!g_nd.buf[k].used && (g_nd.buf[k].tris || g_nd.buf[k].lines))
+        {
+            [g_nd.buf[k].tris release];
+            [g_nd.buf[k].lines release];
+            g_nd.buf[k].tris = g_nd.buf[k].lines = nil;
+            g_nd.buf[k].id = 0;
+        }
+}
 
 void g9_overlay(G9Tex* bb)
 {
@@ -157,8 +220,8 @@ void g9_overlay(G9Tex* bb)
         return;
     @autoreleasepool
     {
-        const NavDrawGeom* geo = navdraw_frame();
-        if (!geo || !geo->tris_shown)
+        const NavDrawSet* set = navdraw_frame();
+        if (!set)
             return;
         NdU u;
         memset(&u, 0, sizeof u);
@@ -170,18 +233,7 @@ void g9_overlay(G9Tex* bb)
         }
         if (!nd_pipes(bb->tex.pixelFormat))
             return;
-        if (geo->gen != g_nd.gen)
-        {
-            [g_nd.tris release];
-            [g_nd.lines release];
-            g_nd.tris = geo->ntris ? [g_dev newBufferWithBytes:geo->tris length:geo->ntris * sizeof(NavDrawVert)
-                                                       options:MTLResourceStorageModeShared]
-                                   : nil;
-            g_nd.lines = geo->nlines ? [g_dev newBufferWithBytes:geo->lines length:geo->nlines * sizeof(NavDrawVert)
-                                                         options:MTLResourceStorageModeShared]
-                                     : nil;
-            g_nd.gen = geo->gen;
-        }
+        nd_sync(set);
         if (g_pending_clear)
             begin_pass();
         end_pass();
@@ -228,16 +280,35 @@ void g9_overlay(G9Tex* bb)
         [e setViewport:(MTLViewport){ 0, 0, tw, th, 0, 1 }];
         [e setCullMode:MTLCullModeNone];
         [e setFragmentTexture:dt atIndex:0];
-        [e setFragmentBytes:&u length:sizeof u atIndex:0];
-        [e setVertexBytes:&u length:sizeof u atIndex:1];
-        [e setRenderPipelineState:g_nd.tri];
-        [e setVertexBuffer:g_nd.tris offset:0 atIndex:0];
-        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geo->tris_shown];
-        if (g_nd.lines && geo->lines_shown >= 2)
+        static float dim_a = -1, dim_s;
+        if (dim_a < 0)
         {
-            [e setRenderPipelineState:g_nd.line];
-            [e setVertexBuffer:g_nd.lines offset:0 atIndex:0];
-            [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:geo->lines_shown / 2];
+            dim_a = getenv("XIV_NAVDRAW_DIM") ? strtof(getenv("XIV_NAVDRAW_DIM"), NULL) : 0.45f;
+            dim_s = 0.7f;
+        }
+        for (uint32_t i = 0; i < set->n; ++i)
+        {
+            const NavDrawGeom* geo = set->g[i];
+            int k = 0;
+            while (k < NAVDRAW_MAX && !(g_nd.buf[k].used && g_nd.buf[k].id == geo->id))
+                ++k;
+            if (k == NAVDRAW_MAX)
+                continue;
+            u.style[0] = geo->dim ? dim_a : 1.0f, u.style[1] = geo->dim ? dim_s : 0.0f;
+            [e setFragmentBytes:&u length:sizeof u atIndex:0];
+            [e setVertexBytes:&u length:sizeof u atIndex:1];
+            if (g_nd.buf[k].tris && geo->tris_shown)
+            {
+                [e setRenderPipelineState:g_nd.tri];
+                [e setVertexBuffer:g_nd.buf[k].tris offset:0 atIndex:0];
+                [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geo->tris_shown];
+            }
+            if (g_nd.buf[k].lines && geo->lines_shown >= 2)
+            {
+                [e setRenderPipelineState:g_nd.line];
+                [e setVertexBuffer:g_nd.buf[k].lines offset:0 atIndex:0];
+                [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:geo->lines_shown / 2];
+            }
         }
         [e endEncoding];
         g_targets_changed = 1;
