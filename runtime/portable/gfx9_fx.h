@@ -23,6 +23,8 @@
 
 #include <sys/stat.h>
 
+#include "navdraw.h" /* navdraw_on: the overlay wants the view-projection vote and the scene depth too */
+
 static void up_apply(G9Tex* t); /* gfx9_upscale.h */
 static int up_mode(void);
 
@@ -437,7 +439,7 @@ static int invert4(const float* m, float* out)
 static void fx_note_draw(const G9Draw* d)
 {
     G9Tex* final = g_xfx.ui ? g_xfx.ui : g_xfx.bb;
-    if ((g_xfs.fx == 0.0f && up_mode() != 2) || !final || !g_rt[0] || !g_ds || !d->rs.zenable || g_rt[0]->w != final->w ||
+    if ((g_xfs.fx == 0.0f && up_mode() != 2 && !navdraw_on) || !final || !g_rt[0] || !g_ds || !d->rs.zenable || g_rt[0]->w != final->w ||
         g_rt[0]->h != final->h)
         return;
     g_xfx.ds = g_ds;

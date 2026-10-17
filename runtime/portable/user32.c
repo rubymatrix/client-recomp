@@ -19,6 +19,7 @@
 #include "input.h"
 #include "k32.h"
 #include "kobj.h"
+#include "navdraw.h"
 #include "pe.h"
 #include "plat.h"
 #include "thunk.h"
@@ -589,6 +590,9 @@ static void pump(void)
             g_mouse_held = SDL_GetMouseState(NULL, NULL) != 0;
             continue;
         }
+        if ((e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) &&
+            navdraw_key(e.key.scancode, e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat, (e.key.mod & SDL_KMOD_SHIFT) != 0))
+            continue; /* the navmesh overlay's keys (navdraw.h) */
         input_sdl_event(&e); /* DirectInput's view of the same events */
         Wnd* w = NULL;
         switch (e.type)

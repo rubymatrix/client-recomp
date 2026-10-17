@@ -1476,6 +1476,7 @@ static uint32_t g_draw_errors;
 
 #include "gfx9_fx.h"
 #include "gfx9_upscale.h"
+#include "gfx9_navdraw.h"
 
 /* --- one-frame draw trace (XIV_GFXTRACE=<dir>; touch <dir>/req to trace the next frame) ---------
  * <dir>/draws.txt: a line per draw (shaders, targets, blend, samplers); <dir>/consts.bin: per draw

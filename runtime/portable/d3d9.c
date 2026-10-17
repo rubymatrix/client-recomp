@@ -884,6 +884,7 @@ static void present(void)
     uint32_t f, l;
     Obj* bb = obj(g_dev.backbuffer);
     G9Tex* t = bb ? surface_gpu(bb, &f, &l) : NULL;
+    g9_overlay(t);
     if (bb)
         debug_shot(t, bb->width, bb->height);
     {

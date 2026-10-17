@@ -150,6 +150,8 @@ typedef struct G9Draw
 void g9_draw(const G9Draw* d);
 /* The frame is done: the back buffer goes to the window. */
 void g9_present(G9Tex* backbuffer);
+/* Debug overlays over the finished frame (the navmesh: navdraw.h), before it is shot or presented. */
+void g9_overlay(G9Tex* backbuffer);
 /* the frame rate presents are paced to (gfx9_metal.m pace_set): the host passes it to the game's limiter */
 extern void (*g9_pace_hook)(uint32_t fps);
 uint64_t g9_pace_refresh_ns(void); /* the display's refresh while presents are paced, else 0 */
