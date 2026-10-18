@@ -40,6 +40,8 @@ WRAPS += ',window_arrange=0x925490'  # Sqwt Window arrange: the talk window's st
 WRAPS += ',crt_memcpy=0x9d4600,crt_memmove=0x9d5110,crt_memset=0x9d2110,const_cache_a=0x423b90,const_cache_b=0x423a40,mat4_vec4=0x42ec50'
 # the dev ticket login: NetworkModule's ctor and Update (runtime/portable/xiv_direct_login.c, XIV_DIRECT_LOGIN)
 WRAPS += ',net_ctor=0x4e0dc0,net_tick=0x4e30a0,net_session_login=0x4e1eb0'
+# remote actors ground snap: ray start 1 above, and the snap log (runtime/portable/xiv_groundsnap.c, XIV_SNAPLOG)
+WRAPS += ',snap_ground=0x660f70,actor_setpos=0x7ce080'
 # the client's Lua C++ bindings, watched by the probe (runtime/portable/xiv_probe.c, XIV_PROBE)
 WRAPS += ''.join(',lb_%s=0x%s' % (a, a) for a in re.findall(r'^LB\((\w+),', open(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'runtime/portable/xiv_probe_binds.h')).read(), re.M))
@@ -54,7 +56,7 @@ PORTABLE = ['runtime/runtime.c', 'runtime/portable/plat_posix.c', 'runtime/porta
             'runtime/portable/reg.c', 'runtime/portable/ole.c',
             'runtime/portable/k32_misc.c', 'runtime/portable/k32_xiv.c',
             'runtime/portable/xiv_misc.c', 'runtime/portable/fiber.c', 'runtime/portable/xiv_ui.c', 'runtime/portable/xiv_probe.c', 'runtime/portable/sampler_posix.c',
-            'runtime/portable/xiv_native.c', 'runtime/portable/xiv_direct_login.c']
+            'runtime/portable/xiv_native.c', 'runtime/portable/xiv_direct_login.c', 'runtime/portable/xiv_groundsnap.c']
 
 
 # Win32 shims on SDL3 (windowing, input, timers, sockets, audio) shared with FFXI.

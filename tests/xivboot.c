@@ -117,6 +117,7 @@ void xiv_misc_init(void);
 void xiv_ui_init(void);
 void xiv_native_init(void); /* xiv_native.c */
 void xiv_direct_login_init(void); /* xiv_direct_login.c */
+void xiv_groundsnap_init(void);   /* xiv_groundsnap.c */
 void xiv_probe_init(void);
 void sampler_start(void);
 void user32_main_tick(void);
@@ -205,6 +206,7 @@ int main(int argc, char** argv)
     xiv_ui_init();
     xiv_native_init();
     xiv_direct_login_init();
+    xiv_groundsnap_init();
     xiv_probe_init();
     ole_init();
     user32_init();
