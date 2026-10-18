@@ -4,6 +4,8 @@
  *   F10              toggle the overlay (XIV_NAVDRAW=1 starts it on, XIV_NAVDRAW=0 disables it and F10)
  *   Shift+F10        show / hide pruned polys (hidden by default)
  *   Shift+F11        show / hide the region's other zones (XIV_NAVDRAW_NEIGHBOURS=0 starts them hidden)
+ *   Shift+F9         zone geometry (terrain, objects) in wireframe, characters solid
+ *                    (XIV_WIREFRAME=1 starts it on; works with XIV_NAVDRAW=0 too)
  *   XIV_NAVDRAW_DIR  folder with index.tsv and the .navdraw files (default: the workspace's navmeshes/draw)
  *   XIV_NAVDRAW_ZONE zone name (fst0Field01) or zone id (150): overrides the client's own zone (its
  *                    map's place id); before the client has a map, the Meteor admin API's
@@ -38,6 +40,8 @@ int navdraw_get_zone(char* name, size_t n, int* zone_id);
 
 /* 1 while the overlay is on (cheap: a load). */
 extern volatile int navdraw_on;
+/* 1 while zone geometry draws in wireframe (Shift+F9; the D3D9 back end picks the draws). */
+extern volatile int navdraw_wire_bg;
 /* A key from the window (user32.c, before the game sees it). Returns 1 when it was the overlay's. */
 int navdraw_key(int sdl_scancode, int down, int shift);
 

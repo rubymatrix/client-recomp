@@ -394,6 +394,20 @@ static void read_script(int appended)
 
 static void push_key(uint32_t win, int sc, int down)
 {
+    /* the modifiers the script holds, as a real key event carries them (Shift+F10 and the like) */
+    static SDL_Keymod held;
+    SDL_Keymod m = 0;
+    switch (sc)
+    {
+    case SDL_SCANCODE_LSHIFT: m = SDL_KMOD_LSHIFT; break;
+    case SDL_SCANCODE_RSHIFT: m = SDL_KMOD_RSHIFT; break;
+    case SDL_SCANCODE_LCTRL: m = SDL_KMOD_LCTRL; break;
+    case SDL_SCANCODE_RCTRL: m = SDL_KMOD_RCTRL; break;
+    case SDL_SCANCODE_LALT: m = SDL_KMOD_LALT; break;
+    case SDL_SCANCODE_RALT: m = SDL_KMOD_RALT; break;
+    default: break;
+    }
+    held = down ? held | m : held & ~m;
     SDL_Event e;
     memset(&e, 0, sizeof e);
     e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
@@ -401,6 +415,7 @@ static void push_key(uint32_t win, int sc, int down)
     e.key.windowID = win;
     e.key.scancode = (SDL_Scancode)sc;
     e.key.key = SDL_GetKeyFromScancode((SDL_Scancode)sc, SDL_KMOD_NONE, false);
+    e.key.mod = held;
     e.key.down = down != 0;
     SDL_PushEvent(&e);
 }

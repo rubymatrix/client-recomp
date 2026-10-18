@@ -24,6 +24,7 @@ void rt_log(const char* fmt, ...);
 int (*navdraw_camera_hook)(float m[16]);
 int (*navdraw_zone_hook)(char* name, size_t n, int* zone_id);
 volatile int navdraw_on;
+volatile int navdraw_wire_bg;
 
 static int g_disabled; /* XIV_NAVDRAW=0 */
 static int g_show_pruned;
@@ -1028,7 +1029,24 @@ void navdraw_stats(uint64_t* bytes, int* loaded, int* loading)
 
 int navdraw_key(int sc, int down, int shift)
 {
-    static int f11_taken;
+    static int f11_taken, f9_taken;
+    if (sc == SDL_SCANCODE_F9)
+    {
+        /* Shift+F9 only, as Shift+F11 */
+        if (down && shift)
+        {
+            navdraw_wire_bg = !navdraw_wire_bg;
+            rt_log("[navdraw] zone wireframe %s\n", navdraw_wire_bg ? "on" : "off");
+            f9_taken = 1;
+            return 1;
+        }
+        if (!down && f9_taken)
+        {
+            f9_taken = 0;
+            return 1;
+        }
+        return 0;
+    }
     if (g_disabled)
         return 0;
     if (sc == SDL_SCANCODE_F11)
@@ -1075,4 +1093,6 @@ __attribute__((constructor)) static void navdraw_init(void)
     g_show_pruned = p && strcmp(p, "0");
     const char* nb = getenv("XIV_NAVDRAW_NEIGHBOURS");
     g_show_neighbours = !(nb && !strcmp(nb, "0"));
+    const char* w = getenv("XIV_WIREFRAME");
+    navdraw_wire_bg = w && strcmp(w, "0") != 0;
 }

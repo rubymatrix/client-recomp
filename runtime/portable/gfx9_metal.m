@@ -1667,6 +1667,25 @@ static void trace_draw(const G9Draw* d, const SmOpts* vo, const SmOpts* po, cons
     g_trace_draw++;
 }
 
+/* A model of the zone (terrain, objects) drawn into the scene: the game's models carry SHORT4
+ * positions (effects, UI and post passes other formats), and characters are the skinned ones,
+ * joint indices in TEXCOORD7 as UBYTE4. */
+static int is_zone_geometry(const G9Draw* d)
+{
+    if (d->prim < 4 || !d->rs.zenable || !g_ds || !g_rt[0])
+        return 0;
+    int model = 0;
+    for (uint32_t j = 0; j < d->nel; ++j)
+    {
+        const G9Elem* e = &d->el[j];
+        if (e->usage == SM_POSITION && e->index == 0)
+            model = e->type == 7; /* D3DDECLTYPE_SHORT4 */
+        else if (e->usage == SM_TEXCOORD && e->index == 7 && e->type == 5 && !(d->stream[e->stream].freq & 0x80000000u))
+            return 0; /* D3DDECLTYPE_UBYTE4 joints */
+    }
+    return model;
+}
+
 void g9_draw(const G9Draw* d)
 {
     if (!d->vs || !d->ps || !d->count)
@@ -1885,7 +1904,8 @@ void g9_draw(const G9Draw* d)
         /* D3DCULL: NONE 1, CW 2 (cull clockwise), CCW 3; D3D9's triangles are clockwise when front */
         [enc setFrontFacingWinding:MTLWindingClockwise];
         [enc setCullMode:d->rs.cull == 2 ? MTLCullModeFront : d->rs.cull == 3 ? MTLCullModeBack : MTLCullModeNone];
-        [enc setTriangleFillMode:d->rs.fill == 2 ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+        [enc setTriangleFillMode:d->rs.fill == 2 || (navdraw_wire_bg && is_zone_geometry(d)) ? MTLTriangleFillModeLines
+                                                                                             : MTLTriangleFillModeFill];
         [enc setDepthBias:d->rs.depth_bias * 16777215.0f slopeScale:d->rs.slope_bias clamp:0];
         uint32_t bf = d->rs.blend_factor;
         [enc setBlendColorRed:((bf >> 16) & 255) / 255.0f green:((bf >> 8) & 255) / 255.0f blue:(bf & 255) / 255.0f alpha:(bf >> 24) / 255.0f];
