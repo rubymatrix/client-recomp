@@ -318,19 +318,31 @@ class FunctionTranslator:
                         break
                 if not ok:
                     continue
+                # restored: on every path here the register was popped (or ebp left) with no write
+                # or call since; every exit must be reached restored
+                n = len(out)
+                preds = [[] for _ in range(n)]
+                for k, o in enumerate(out):
+                    for t in o[4]:
+                        preds[t].append(k)
+                rin, rout = [True] * n, [True] * n
+                rin[0] = False
+                changed = True
+                while changed:
+                    changed = False
+                    for k in range(n):
+                        v = (k != 0) and all(rout[p] for p in preds[k])
+                        i = insns[k]
+                        if (i.mnemonic == 'pop' and i.op_str == name) or (name == 'ebp' and i.mnemonic == 'leave'):
+                            o = True
+                        elif out[k][1] & bit or out[k][2] in (1, 2):
+                            o = False
+                        else:
+                            o = v
+                        if v != rin[k] or o != rout[k]:
+                            rin[k], rout[k], changed = v, o, True
                 for k, (r, w, kind, tgt, succ) in enumerate(out):
-                    if kind not in (3, 4, 5):
-                        continue
-                    j, found = k - 1, False
-                    while j >= 0 and insns[j + 1].address not in targets:
-                        ij = insns[j]
-                        if (ij.mnemonic == 'pop' and ij.op_str == name) or (name == 'ebp' and ij.mnemonic == 'leave'):
-                            found = True
-                            break
-                        if out[j][1] & bit or out[j][2] or out[j][4] != [j + 1]:
-                            break
-                        j -= 1
-                    if not found:
+                    if kind in (3, 4, 5) and not rin[k]:
                         ok = False
                         break
                 if ok:

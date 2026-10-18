@@ -602,11 +602,32 @@ def register_liveness(reginfo):
         if v != live_in[e]:
             live_in[e] = v
             work |= callers[e]
+    # What a return stores: mod, and a register the function saves and restores whose slot in g a
+    # call inside it may have overwritten (a call stores its callee's live-in registers from this
+    # function's locals, the callee's return stores its own; full stores write everything), since
+    # its callers keep the value they had and their own returns rely on g holding it.
+    ret = dict(mod)
+    work = set(reginfo)
+    while work:
+        e = work.pop()
+        ri = reginfo[e]
+        if ri['unsafe'] or not ri['preserved']:
+            continue
+        dirty = 0
+        for r, w, kind, tgt, succ in ri['insns']:
+            if kind == 1:
+                dirty |= live_in.get(tgt, REG_ALL) | ret.get(tgt, REG_ALL)
+            elif kind:
+                dirty |= REG_ALL
+        v = mod[e] | (ri['preserved'] & dirty)
+        if v != ret[e]:
+            ret[e] = v
+            work |= callers[e]
     n = len(reginfo)
     print('registers across calls: %d functions, %.2f registers changed and %.2f read on entry on average'
           % (n, sum(bin(m).count('1') for m in mod.values()) / max(n, 1),
              sum(bin(v).count('1') for v in live_in.values()) / max(n, 1)), file=sys.stderr)
-    return mod, live_in
+    return mod, live_in, ret
 
 
 
@@ -787,7 +808,7 @@ def main():
             t = int(mm.group(1), 16)
             return 'REGS_STORE;' if t in flags_in else 'REGS_STORE_CUT(0x%08x);' % t
     # RECOMP_REGS=1: not yet run in game, so off by default
-    regs_mod, regs_in = register_liveness(reginfo) if os.environ.get('RECOMP_REGS') and not bisect else ({}, {})
+    regs_mod, regs_in, regs_ret = register_liveness(reginfo) if os.environ.get('RECOMP_REGS') and not bisect else ({}, {}, {})
     call_re = re.compile(r'REGS_STORE_TO_([0-9a-f]{8});(.*?)REGS_LOAD;')
 
     def call_regs(mm):
@@ -797,7 +818,7 @@ def main():
         return regs_store(regs_in[t], t in flags_in) + mm.group(2) + regs_load(regs_mod[t])
     for e in done:
         if e in regs_mod:
-            ret = regs_store(regs_mod[e], e in flags_out)
+            ret = regs_store(regs_ret[e], e in flags_out)
         else:
             ret = 'REGS_STORE;' if e in flags_out else ('REGS_STORE_CUT(0x%08x);' % e if bisect else 'REGS_STORE_NOFLAGS;')
         done[e] = [to_re.sub(to_store, call_re.sub(call_regs, ln)).replace('REGS_STORE_RET;', ret)
