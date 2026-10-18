@@ -81,6 +81,11 @@ def newest_header():
 def compile_stale(sources, objdir, extra=(), gen_flags=None):
     os.makedirs(os.path.join(ROOT, objdir), exist_ok=True)
     headers = newest_header()
+    # objects built with other flags (a moved guest base, PGO) are stale whatever their age
+    stamp = os.path.join(ROOT, objdir, '.flags')
+    sig = repr((CFLAGS, list(extra), gen_flags or GEN_FLAGS))
+    if not os.path.exists(stamp) or open(stamp).read() != sig:
+        headers = float('inf')
     objs, jobs = [], []
     for s in sources:
         obj = os.path.join(objdir, os.path.splitext(os.path.basename(s))[0] + '.o')
@@ -101,6 +106,8 @@ def compile_stale(sources, objdir, extra=(), gen_flags=None):
                     failed.append(cmd[-3])
         if failed:
             raise SystemExit('compile failed: ' + ', '.join(failed))
+    with open(stamp, 'w') as f:
+        f.write(sig)
     return objs
 
 
