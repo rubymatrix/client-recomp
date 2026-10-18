@@ -161,10 +161,39 @@ static void w_pad_repeat(Guest* g)
     rt_return(g, out, 8);
 }
 
+/* Sqwt Window arrange (FUN_00925490, thiscall (rect)). On a window's first arrange it centres it
+ * with its Margin and keeps the offset as Left. The NPC talk window (NpcSayWidget.form: Center/Bottom,
+ * Margin 238,0,0,64) therefore sits 119 units right of centre, as in retail. For that first arrange
+ * its right margin is made equal to its left, so the box lands centred; the margin is put back after,
+ * and later arranges (Left + left margin) keep it there. XIV_RETAIL_TALK=1 keeps retail's place. */
+static void w_window_arrange(Guest* g)
+{
+    static int retail = -1;
+    if (retail < 0)
+        retail = getenv("XIV_RETAIL_TALK") != NULL;
+    uint32_t w = g->ecx;
+    if (getenv("XIV_ARRANGELOG") && (rd8(w + 0x444) & 4))
+        rt_log("[ui] first arrange %08x vt %08x margin %g,%g,%g,%g align %u,%u startup %u,%u left %g\n", w, rd32(w),
+               rdf32(w + 0x198), rdf32(w + 0x19c), rdf32(w + 0x1a0), rdf32(w + 0x1a4), rd8(w + 0x24c), rd8(w + 0x24e),
+               rd8(w + 0x3c9), rd8(w + 0x3cb), rdf32(w + 0x37c));
+    if (retail || !(rd8(w + 0x444) & 4) || rdf32(w + 0x198) != 238.0f || rdf32(w + 0x19c) != 0.0f ||
+        rdf32(w + 0x1a0) != 0.0f || rdf32(w + 0x1a4) != 64.0f)
+    {
+        rt_orig_window_arrange(g);
+        return;
+    }
+    wr32(w + 0x1a0, rd32(w + 0x198));
+    rt_orig_window_arrange(g);
+    wr32(w + 0x1a0, 0);
+    if (getenv("XIV_ARRANGELOG"))
+        rt_log("[ui] talk window %08x centred: left %g top %g\n", w, rdf32(w + 0x37c), rdf32(w + 0x384));
+}
+
 void xiv_ui_init(void)
 {
     rt_wrap_key_repeat = w_key_repeat;
     rt_wrap_pad_repeat = w_pad_repeat;
+    rt_wrap_window_arrange = w_window_arrange;
     if (getenv("XIV_ANIMLOG"))
     {
 #define ANIM(n, a) rt_wrap_ui_##n = w_##n;
