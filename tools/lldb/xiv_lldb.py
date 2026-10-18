@@ -31,6 +31,8 @@ IMAGE_BASE = 0x00400000
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GEN = os.path.join(ROOT, 'generated', 'ffxivgame')
 DECOMP_SYMBOLS = os.path.join(ROOT, '..', 'decomp', 'config', 'ffxivgame.symbols.json')
+# Names given by docs/ffxivDecomp/legacy sidecars for functions Ghidra still calls FUN_ (build_name_overrides.py).
+NAME_OVERRIDES = os.path.join(ROOT, '..', 'decomp', 'config', 'ffxivgame.name_overrides.json')
 COMMENT = re.compile(r'/\* ([0-9a-f]{8}): (.*?) \*/')
 REGS = ('eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi')
 
@@ -84,10 +86,16 @@ def _decomp_syms():
     global _decomp
     if _decomp is None:
         _decomp = []
+        names = {}
+        try:
+            with open(NAME_OVERRIDES) as f:
+                names = {e['rva']: e['name'] for e in json.load(f)}
+        except (OSError, ValueError, KeyError):
+            pass
         try:
             with open(DECOMP_SYMBOLS) as f:
                 for e in json.load(f):
-                    _decomp.append((IMAGE_BASE + e['rva'], e['name'], e.get('size', 0)))
+                    _decomp.append((IMAGE_BASE + e['rva'], names.get(e['rva'], e['name']), e.get('size', 0)))
             _decomp.sort()
         except (OSError, ValueError, KeyError):
             pass
