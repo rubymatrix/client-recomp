@@ -7,7 +7,7 @@ RECOMP="$WS/recomp"
 "$WS/xivctl" stop >/dev/null 2>&1 || true
 [[ -f "$WS/meteor-server/.public.env" ]] && source "$WS/meteor-server/.public.env"
 WEB_LOCAL="${METEOR_WEB_HOST:-127.0.0.1}"; [[ "$WEB_LOCAL" == 0.0.0.0 ]] && WEB_LOCAL=127.0.0.1
-ACCOUNT="$WS/meteor-server/.client-account"
+ACCOUNT="${XIV_ACCOUNT:-$WS/meteor-server/.client-account}"   # XIV_ACCOUNT: another account file, e.g. .msq-account
 USER_NAME="$(sed -n 's/^user=//p' "$ACCOUNT")"
 export XIV_PASSWORD="$(sed -n 's/^password=//p' "$ACCOUNT")"
 unset XIV_DIRECT_LOGIN
