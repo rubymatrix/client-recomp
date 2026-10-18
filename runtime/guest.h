@@ -93,7 +93,11 @@ typedef void (*GuestFn)(Guest*);
  * addresses before lookup. RD is 0 when the image sits at its preferred base. */
 extern uint32_t rt_reloc_delta;
 extern uint32_t rt_image_lo, rt_image_hi; /* runtime range of the image */
+#ifdef RT_NO_RELOC /* an image without a relocation table can only sit at its base */
+#define RD 0u
+#else
 #define RD rt_reloc_delta
+#endif
 
 #define REGS_DECL                                                                                \
     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;                                             \
