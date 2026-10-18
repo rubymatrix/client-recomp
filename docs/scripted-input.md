@@ -94,7 +94,7 @@ of two or more digits / hex (`0x0D`, `13`). Every action is logged as `[input] <
 ## Running it
 
 ```bash
-cd ~/Projects/FFXIV1_0
+cd ~/Projects/ffxiv-pc
 ./xivctl launch --no-build --input recomp/tools/input/login_walk.txt   # copies to recomp/build/run/input.txt
 ./xivctl wait 180                                                        # server-side: zoned in
 ./xivctl input '+0 stick l 0 1 3000' '+3500 shot after'                  # queue more, any time

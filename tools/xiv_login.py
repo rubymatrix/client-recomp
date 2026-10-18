@@ -39,8 +39,8 @@ except ImportError:
         os.execv(venv, [venv] + sys.argv)
     raise SystemExit('pycryptodome is missing: uv pip install --python .venv/bin/python pycryptodome')
 
-DEFAULT_GAME = os.path.expanduser(
-    '~/Projects/FFXIV1_0/installer/target/prefix/drive_c/Program Files (x86)/SquareEnix/FINAL FANTASY XIV')
+# the workspace's retail install, beside this checkout
+DEFAULT_GAME = os.path.join(os.path.dirname(ROOT), 'retail', 'FINAL FANTASY XIV')
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

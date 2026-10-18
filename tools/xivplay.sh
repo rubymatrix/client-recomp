@@ -2,7 +2,7 @@
 # Rebuild the boot test (translating again with --translate) and sign in with the local test
 # account (build/test-account.txt, made by tools/xiv_login.py --signup) to run the game.
 cd "$(dirname "$0")/.." || exit 1
-EXE="$HOME/Projects/FFXIV1_0/decomp/orig/ffxivgame.exe"
+EXE="${XIV_EXE:-$PWD/../retail/FINAL FANTASY XIV/ffxivgame.exe}"
 [ "$1" = "--translate" ] && { .venv/bin/python tools/build_xiv.py translate --exe "$EXE" 2>&1 | grep -E "translated|Error"; shift; }
 .venv/bin/python tools/build_xiv.py xivboot --exe "$EXE" 2>&1 | grep -E "error|Undefined" | head -20
 U=$(sed -n 's/^user=//p' build/test-account.txt)

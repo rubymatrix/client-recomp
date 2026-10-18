@@ -10,7 +10,7 @@
 #
 # XIV_* env vars (XIV_SERIAL=1 is handy: guest threads take turns) pass through to the game.
 # MCP port: XIV_LLDB_MCP_PORT (default 59999). Build the debug binary first with
-#   .venv/bin/python tools/build_xiv.py xivboot --exe ~/Projects/FFXIV1_0/decomp/orig/ffxivgame.exe --debug
+#   .venv/bin/python tools/build_xiv.py xivboot --exe "../retail/FINAL FANTASY XIV/ffxivgame.exe" --debug
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$(pwd)
 BIN=build/xivboot-dbg
@@ -27,7 +27,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 PORT=${XIV_LLDB_MCP_PORT:-59999}
-GAME=${XIV_GAME:-"$HOME/Projects/FFXIV1_0/installer/target/prefix/drive_c/Program Files (x86)/SquareEnix/FINAL FANTASY XIV"}
+GAME=${XIV_GAME:-"$ROOT/../retail/FINAL FANTASY XIV"}
 LLDB=$(xcrun -f lldb 2>/dev/null || echo lldb)
 
 set -- -o "command script import $ROOT/tools/lldb/xiv_lldb.py" \
