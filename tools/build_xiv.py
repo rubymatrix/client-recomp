@@ -56,7 +56,8 @@ PORTABLE = ['runtime/runtime.c', 'runtime/portable/plat_posix.c', 'runtime/porta
             'runtime/portable/reg.c', 'runtime/portable/ole.c',
             'runtime/portable/k32_misc.c', 'runtime/portable/k32_xiv.c',
             'runtime/portable/xiv_misc.c', 'runtime/portable/fiber.c', 'runtime/portable/xiv_ui.c', 'runtime/portable/xiv_probe.c', 'runtime/portable/sampler_posix.c',
-            'runtime/portable/xiv_native.c', 'runtime/portable/xiv_direct_login.c', 'runtime/portable/xiv_groundsnap.c']
+            'runtime/portable/xiv_native.c', 'runtime/portable/xiv_direct_login.c', 'runtime/portable/xiv_groundsnap.c',
+            'runtime/portable/xiv_discord.c']
 
 
 # Win32 shims on SDL3 (windowing, input, timers, sockets, audio) shared with FFXI.

@@ -1056,6 +1056,8 @@ static struct
 } g_stream[64][2];
 
 void xiv_probe_net(int out, uint16_t op, uint32_t src, const uint8_t* p, uint32_t n); /* xiv_probe.c */
+void xiv_discord_net(int out, uint16_t op, uint32_t src, const uint8_t* p, uint32_t n); /* xiv_discord.c */
+int xiv_discord_on(void);
 
 static void net_msg(int out, const uint8_t* sub, uint32_t size)
 {
@@ -1068,6 +1070,7 @@ static void net_msg(int out, const uint8_t* sub, uint32_t size)
     memcpy(m->pay, sub + 0x20, m->plen < sizeof m->pay ? m->plen : sizeof m->pay);
     m->seq = ++g_net_seq;
     xiv_probe_net(out, m->op, m->src, sub + 0x20, size - 0x20);
+    xiv_discord_net(out, m->op, m->src, sub + 0x20, size - 0x20);
     if (g_net_trace && m->op != 0x00CA && m->op != 0x00CF && m->op != 0x0001 && m->op != 0x0002)
     {
         char hex[3 * 24 + 1] = "";
@@ -1079,7 +1082,8 @@ static void net_msg(int out, const uint8_t* sub, uint32_t size)
 
 void autoinput_net(int stream, int out, const uint8_t* p, uint32_t n)
 {
-    if (stream < 0 || stream >= 64 || !getenv("XIV_INPUT_SCRIPT"))
+    /* also for the Discord presence, which reads the player's name, class and level here */
+    if (stream < 0 || stream >= 64 || !(getenv("XIV_INPUT_SCRIPT") || xiv_discord_on()))
         return;
     while (__atomic_exchange_n(&g_net_lock, 1, __ATOMIC_ACQUIRE))
         ;
