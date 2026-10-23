@@ -30,17 +30,26 @@ This produces `build/xivboot`.
 
 ## Install from the retail disc
 
-Mount the FINAL FANTASY XIV disc (or its image), then:
+Mount the FINAL FANTASY XIV disc (or its image) and double-click `install.command`, or:
 
 ```sh
-.venv/bin/python tools/xiv_install.py
+curl -fsSL https://raw.githubusercontent.com/rubymatrix/client-recomp/main/install.command | bash -s -- \
+    --server <host> --patch-cert <patch_cert.der> --account-url http://<host>:8090
 ```
 
-It unpacks the disc's InstallShield cabinets natively (none of the disc's code runs) into
-`~/Library/Application Support/FFXIV1_0/FINAL FANTASY XIV`, translates and compiles the disc's
-`ffxivboot.exe` and `ffxivupdater.exe`, and makes `build/FINAL FANTASY XIV.app`, which starts the
-native ffxivboot. Patches replace those programs and bring `ffxivlogin.exe` and `ffxivgame.exe`;
-each is rebuilt when it is next started (`tools/xiv_run.py`).
+It gets Apple's command line tools if they are missing, puts these sources in
+`~/Library/Application Support/FFXIV1_0/source`, unpacks the disc's InstallShield cabinets natively
+(none of the disc's code runs) into `~/Library/Application Support/FFXIV1_0/FINAL FANTASY XIV`,
+translates and compiles the disc's `ffxivboot.exe` and `ffxivupdater.exe`, and puts
+`FINAL FANTASY XIV.app` in `/Applications`. The app starts the native ffxivboot: it checks the
+version with the server, downloads the patches and has the native updater apply them up to 1.23b;
+then ffxivlogin signs in and the game starts. Each program is translated again when a patch
+replaces it (`tools/xiv_run.py`); the game is built while you sign in. The server runs
+[meteor-web](https://github.com/rubymatrix/Project-Meteor-Web) for the version check, patches and
+login page; `--patch-cert` is its PatchTool certificate.
+
+`tools/xiv_e2e.sh` tests all of it end to end, from the disc to the lobby's character list, in
+folders of its own (a fresh clone, install, Documents and app folder).
 
 ## Play
 

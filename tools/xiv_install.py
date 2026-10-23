@@ -9,8 +9,8 @@
    folder: ~/Library/Application Support/FFXIV1_0/FINAL FANTASY XIV. A second run resumes.
 3. Translates and compiles the launcher programs it finds there (ffxivboot, ffxivupdater; the
    patches bring ffxivlogin and ffxivgame), each with the address map for its build.
-4. Makes "FINAL FANTASY XIV.app" (build/), which starts the native ffxivboot through
-   tools/xiv_run.py: from there boot checks the version with the server, the updater patches the
+4. Puts "FINAL FANTASY XIV.app" in /Applications (~/Applications if that is not writable; or
+   --app-dir), a launcher that starts the native ffxivboot through tools/xiv_run.py: from there boot checks the version with the server, the updater patches the
    install up to 1.23b, login signs in and the game starts, each rebuilt here when a patch
    replaces it.
 
@@ -19,7 +19,11 @@ signing certificate (meteor-web PatchTool's patch_cert.der), which ffxivboot che
 against; --account-url the server's login page (meteor-web: http://<host>:8090). The app's launcher
 keeps them.
 
-Clang comes from Xcode's command line tools. The install is the player's own disc; nothing from it
+--test-env KEY=VALUE (repeatable) adds an environment setting to the launcher: tools/xiv_e2e.sh
+runs an install in folders of its own (XIV_DOCUMENTS) and signs in by script (XIV_WEB_SCRIPT).
+
+It makes .venv with the recompiler's Python packages on its first run. Clang comes from Xcode's
+command line tools; install.command gets them first when missing. The install is the player's own disc; nothing from it
 is copied into this checkout.
 """
 import argparse
@@ -38,7 +42,27 @@ import thirdparty  # noqa: E402
 
 DEFAULT_INSTALL = os.path.expanduser('~/Library/Application Support/FFXIV1_0/FINAL FANTASY XIV')
 UNPACK = os.path.join(ROOT, 'build', 'bin', 'xiv_unpack')
-APP = os.path.join(ROOT, 'build', 'FINAL FANTASY XIV.app')
+VENV = os.path.join(ROOT, '.venv')
+PACKAGES = ['capstone>=5,<6', 'pefile>=2023', 'pycryptodome>=3.20']
+
+
+def in_venv():
+    """Run inside .venv (made on the first run): the recompiler needs capstone and pefile, the
+    launch arguments pycryptodome"""
+    py = os.path.join(VENV, 'bin', 'python3')
+    if os.path.realpath(sys.prefix) == os.path.realpath(VENV):
+        return
+    ok = os.path.exists(py) and subprocess.run([py, '-c', 'import capstone, pefile, Crypto'], capture_output=True).returncode == 0
+    if not ok:
+        print('Setting up Python packages in %s' % VENV, flush=True)
+        if not os.path.exists(py):
+            subprocess.check_call(['/usr/bin/python3' if os.path.exists('/usr/bin/python3') else sys.executable, '-m', 'venv', VENV])
+        subprocess.check_call([py, '-m', 'pip', 'install', '--disable-pip-version-check', '-q'] + PACKAGES)
+    os.execv(py, [py] + sys.argv)
+
+
+def default_app_dir():
+    return '/Applications' if os.access('/Applications', os.W_OK) else os.path.expanduser('~/Applications')
 PROGRAMS = ('ffxivboot', 'ffxivupdater', 'ffxivlogin')
 
 
@@ -79,7 +103,7 @@ def unpack(disc, install):
 
 APP_PLIST = {
     'CFBundleExecutable': 'FINAL FANTASY XIV',
-    'CFBundleIdentifier': 'local.ffxiv10.recomp',
+    'CFBundleIdentifier': 'local.ffxiv10.launcher',  # the game's own bundle is local.ffxiv10.recomp
     'CFBundleName': 'FINAL FANTASY XIV',
     'CFBundlePackageType': 'APPL',
     'CFBundleInfoDictionaryVersion': '6.0',
@@ -91,9 +115,10 @@ APP_PLIST = {
 }
 
 
-def make_app(install, server, cert, account_url):
-    """The app starts ffxivboot (xiv_run.py); the game keeps its own executable inside it (xivboot,
-    linked in by build_xiv.py when it is built), so macOS sees a game when it runs."""
+def make_app(app_dir, install, server, cert, account_url, test_env):
+    """The app is a launcher: it starts ffxivboot (xiv_run.py) with the server's settings. The game
+    runs from its own bundle in build/ (build_xiv.py), so macOS sees a game when it runs."""
+    APP = os.path.join(app_dir, 'FINAL FANTASY XIV.app')
     macos = os.path.join(APP, 'Contents', 'MacOS')
     os.makedirs(macos, exist_ok=True)
     plist = dict(APP_PLIST)
@@ -105,6 +130,9 @@ def make_app(install, server, cert, account_url):
         env += 'export XIV_PATCH_CERT="%s"\n' % os.path.abspath(cert)
     if account_url:
         env += 'export XIV_ACCOUNT_URL="%s"\n' % account_url
+    for kv in test_env:
+        k, v = kv.split('=', 1)
+        env += 'export %s="%s"\n' % (k, v)
     with open(launcher, 'w') as f:
         f.write('#!/bin/sh\n# FINAL FANTASY XIV: the native ffxivboot of this install (tools/xiv_install.py)\n' + env +
                 'exec "%s" "%s" ffxivboot "%s" >> "%s" 2>&1\n' % (
@@ -123,8 +151,14 @@ def main():
     ap.add_argument('--server', default='127.0.0.1', help="the server's host (Square Enix's names go there)")
     ap.add_argument('--patch-cert', help="the server's patch signing certificate (patch_cert.der)")
     ap.add_argument('--account-url', help="the server's login page, e.g. http://127.0.0.1:8090")
+    ap.add_argument('--app-dir', help='where the app goes (default /Applications, or ~/Applications)')
+    ap.add_argument('--test-env', action='append', default=[], metavar='KEY=VALUE', help=argparse.SUPPRESS)
     a = ap.parse_args()
-    install = os.path.abspath(os.path.expanduser(a.install_dir))
+    in_venv()
+    caller = os.environ.get('XIV_CALLER_DIR', os.getcwd())  # install.command runs this from the sources
+    here = lambda p: p and os.path.join(caller, os.path.expanduser(p))
+    a.install_dir, a.patch_cert, a.disc = here(a.install_dir), here(a.patch_cert), here(a.disc)
+    install = os.path.abspath(a.install_dir)
 
     if not a.no_unpack:
         disc = a.disc or find_disc()
@@ -149,7 +183,8 @@ def main():
     if os.path.exists(game):
         print('ffxivgame: built when it is first started (after patching to 1.23b)')
 
-    app = make_app(install, a.server, a.patch_cert, a.account_url)
+    app = make_app(os.path.expanduser(a.app_dir or default_app_dir()), install, a.server, a.patch_cert, a.account_url,
+                   a.test_env)
     print('Ready: %s' % app)
     if a.open:
         subprocess.call(['open', app])

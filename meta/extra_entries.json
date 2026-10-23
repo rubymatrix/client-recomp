@@ -1,0 +1,15 @@
+{
+ "_comment": "Functions the Ghidra export and recomp.py's discovery miss, by the exe's SHA-256: reached only through pointers made at run time (an exit-time callback the CRT registers). Each is translated from its address to its first ret (recomp.py --entries).",
+ "6a18533d4c3b296ccdedd84c81a3eb99ae5ddb47c3416de60e3414983783efef": {
+  "name": "ffxivboot 2010.09.18.0000",
+  "entries": [
+   "0x45e990"
+  ]
+ },
+ "9341f2b4567440b310a4d494f5cc5599ca334ba51c8042247317ff466492f2e9": {
+  "name": "ffxivgame 2012.09.19.0001",
+  "entries": [
+   "0x465550"
+  ]
+ }
+}

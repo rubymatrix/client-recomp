@@ -670,6 +670,9 @@ def main():
     ap.add_argument('--image', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--functions', default='')
+    ap.add_argument('--entries', default='',
+                    help='0xADDR,...: functions the metadata and discovery miss (reached only through '
+                         'pointers made at run time); each runs from its address to its first ret')
     ap.add_argument('--all', action='store_true')
     ap.add_argument('--stats', action='store_true')
     ap.add_argument('--chunk', type=int, default=400)
@@ -695,6 +698,14 @@ def main():
                 if not addr.startswith('_'):
                     meta['apply'][int(addr, 16)] = bytes.fromhex(hexbytes)
     prog = Program(meta, args.image)
+    for e in filter(None, args.entries.split(',')):
+        a = int(e, 16)
+        if a not in prog.functions:
+            end = prog.code_until_ret(a)
+            if not end:
+                raise SystemExit('--entries: %#x does not decode as code up to a ret' % a)
+            prog.functions[a] = [[a, end]]
+            prog.entries.add(a)
     prog.prefix = args.module + '_' if args.module else 'f_'
     for h in filter(None, args.hooks.split(',')):
         name, addr = h.split('=')

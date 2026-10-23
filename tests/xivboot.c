@@ -196,6 +196,8 @@ int main(int argc, char** argv)
         snprintf(docs, sizeof docs, "%s/Library/Application Support/FFXIV1_0", home ? home : ".");
         plat_mkdir(docs);
         strncat(docs, "/Documents", sizeof docs - strlen(docs) - 1);
+        if (getenv("XIV_DOCUMENTS")) /* a folder of its own (tools/xiv_e2e.sh runs in one) */
+            snprintf(docs, sizeof docs, "%s", getenv("XIV_DOCUMENTS"));
         plat_mkdir(docs);
         xiv_set_documents(docs);
         write_default_config(docs);

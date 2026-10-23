@@ -18,6 +18,7 @@ import argparse
 import concurrent.futures
 import glob
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -164,9 +165,16 @@ def meta(exe, ghidra):
          '-scriptPath', 'discovery', '-postScript', 'ExportFFXIV.java', os.path.join(ROOT, META), sha256(exe), '1.23b'])
 
 
+def extra_entries(exe):
+    """meta/extra_entries.json's functions for this build of an exe (recomp.py --entries)"""
+    with open(os.path.join(ROOT, 'meta', 'extra_entries.json')) as f:
+        known = json.load(f).get(sha256(exe))
+    return ['--entries', ','.join(known['entries'])] if known else []
+
+
 def translate(exe):
     run([sys.executable, 'recomp/recomp.py', '--meta', META, '--apply', APPLY, '--image', exe, '--retail', exe, '--out',
-         GEN, '--all', '--wraps', WRAPS])
+         GEN, '--all', '--wraps', WRAPS] + extra_entries(exe))
 
 
 def xivboot(exe, run_it, extra, debug=False, opt='-O1', pgo=None):
@@ -252,7 +260,7 @@ def program(exe, name, run_it, extra):
     gen_dir = 'generated/' + tag
     if not os.path.exists(os.path.join(ROOT, gen_dir, 'table.c')):
         run([sys.executable, 'recomp/recomp.py', '--meta', meta_path, '--image', exe,
-             '--retail', exe, '--out', gen_dir, '--all'])
+             '--retail', exe, '--out', gen_dir, '--all'] + extra_entries(exe))
     gen = sorted(os.path.relpath(p, ROOT) for p in glob.glob(os.path.join(ROOT, gen_dir, '*.c')))
     objs = compile_stale(gen, 'build/%s/gen' % tag, gen_flags=['-O2', '-mcpu=apple-m1', '-w'])
     thirdparty.build('sdl3')
