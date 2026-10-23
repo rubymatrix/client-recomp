@@ -691,7 +691,8 @@ static void pump(void)
             /* Cmd+Q, the Dock's Quit, Ctrl+C, the window's close button: the player leaving. FFXI
              * only leaves from its own menus (its window procedure ignores WM_CLOSE), so the host
              * ends the run here; nothing is lost - the registry is saved as the game changes it. */
-            rt_log("[recomp] quit\n");
+            rt_log("[recomp] quit: %s\n", e.type == SDL_EVENT_QUIT ? "the app was told to quit (Cmd+Q, the Dock, the system)"
+                                                                 : "the window was closed");
             if (user32_quit_hook)
                 user32_quit_hook();
             fflush(NULL);

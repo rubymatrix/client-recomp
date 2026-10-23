@@ -15,7 +15,12 @@
 #include <pthread.h>
 #include <pthread/qos.h>
 #endif
+#include <signal.h>
 #include <stdlib.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <libproc.h>
+#endif
 #include <string.h>
 
 #include "gthread.h"
@@ -155,6 +160,19 @@ static void game_thread(void* arg)
 extern void (*g9_pace_hook)(uint32_t fps); /* gfx9.h */
 uint64_t g9_pace_refresh_ns(void);
 static void xiv_pace_fps(uint32_t fps) { wr32(0x137DF00, fps); }
+
+static void quit_signal(int sig, siginfo_t* info, void* ctx)
+{
+    char path[1024] = "";
+#if defined(__APPLE__)
+    proc_pidpath(info->si_pid, path, sizeof path);
+#endif
+    char line[1200];
+    int n = snprintf(line, sizeof line, "[recomp] quit: signal %d from pid %d (%s)\n", sig, (int)info->si_pid, path);
+    write(2, line, (size_t)n);
+    (void)ctx;
+    _Exit(0);
+}
 
 int main(int argc, char** argv)
 {
@@ -304,6 +322,17 @@ int main(int argc, char** argv)
     /* The game runs on a thread of its own: the main thread is SDL's (macOS lets only it touch
      * windows), pumping events and running the window calls the game's threads hand it
      * (runtime/portable/sdl_main.h). */
+    /* Ctrl+C and kill end the run as SDL's own handlers would, saying which signal and who sent it */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = quit_signal;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGHUP, &sa, NULL);
+    }
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD))
         printf("SDL_Init: %s\n", SDL_GetError());
     static volatile int done;

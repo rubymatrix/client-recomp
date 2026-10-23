@@ -1788,6 +1788,17 @@ void ui_register_class(const char* name, uint32_t proc)
     }
 }
 
+/* The program about to be started (the game, from ffxivlogin) may take the focus: since macOS 14
+ * an app only comes to the front when the active one yields to it. */
+void ui_yield_activation(const char* bundle_id)
+{
+    NSString* b = [NSString stringWithUTF8String:bundle_id];
+    on_main(^{
+        if (@available(macOS 14.0, *))
+            [NSApp yieldActivationToApplicationWithBundleIdentifier:b];
+    });
+}
+
 void* ui_view(uint32_t hwnd)
 {
     UiWnd* w = ui(hwnd);

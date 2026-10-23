@@ -46,6 +46,7 @@ void k32_launch_init(void); /* k32_launch.c */
 void ui_appkit_init(void);  /* ui_appkit.m: after user32_init, whose shims it hands other windows to */
 void webbrowser_init(void); /* webbrowser.m: after ole_init and ui_appkit_init */
 void ui_suppress_controls(const uint32_t* ids, int n);
+void ui_yield_activation(const char* bundle_id);
 void webbrowser_setup(void);
 void winhttp_init(void);    /* winhttp.c: over xiv_misc.c's stubs */
 void dinput_init(void);
@@ -156,6 +157,8 @@ static int launch(const char* file, const char* params, const char* dir)
         printf("launch: no native build of %s (%s)\n", base, bin);
         return 0;
     }
+    if (!strcmp(name, "ffxivgame"))
+        ui_yield_activation("local.ffxiv10.recomp"); /* the app's bundle (tools/build_xiv.py) */
     /* a session of its own: the started program outlives this one (ffxivlogin exits as the game starts) */
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);

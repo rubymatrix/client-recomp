@@ -73,6 +73,40 @@ def run(cmd):
     subprocess.check_call(cmd, cwd=ROOT)
 
 
+def run_lto(cmd, cache, modules):
+    """The ThinLTO link with a progress bar: each module the link compiles writes its cache file in
+    `cache`, so the files written since the link started count the modules done (of `modules`, the
+    bitcode objects; ones reused from the cache are quick and not counted). A terminal gets a bar;
+    a log a line per tenth."""
+    import time
+    line = ' '.join(shlex.quote(c) for c in cmd)
+    print('>', line if len(line) < 200 else line[:200] + ' ...', flush=True)
+    os.makedirs(os.path.join(ROOT, cache), exist_ok=True)
+    start = time.time() - 1
+    p = subprocess.Popen(cmd, cwd=ROOT)
+    tty, shown = sys.stdout.isatty(), -1
+    while p.poll() is None:
+        time.sleep(0.5)
+        try:
+            done = sum(1 for e in os.scandir(os.path.join(ROOT, cache)) if e.stat().st_mtime >= start)
+        except OSError:
+            done = 0
+        frac = min(done / modules, 1.0) if modules else 0
+        elapsed = time.time() - start
+        if tty:
+            sys.stdout.write('\r  linking [%-40s] %3d%%  %d / %d modules  %ds ' % (
+                '#' * int(frac * 40), 100 * frac, min(done, modules), modules, elapsed))
+            sys.stdout.flush()
+        elif int(frac * 10) > shown:
+            shown = int(frac * 10)
+            print('  linking %d%% (%d / %d modules, %ds)' % (100 * frac, min(done, modules), modules, elapsed), flush=True)
+    if tty:
+        print()
+    if p.returncode:
+        raise subprocess.CalledProcessError(p.returncode, cmd)
+    print('  linked in %ds (modules not counted were reused from the cache)' % (time.time() - start), flush=True)
+
+
 def newest_header():
     newest = 0
     for d in ('runtime', 'runtime/portable'):
@@ -175,9 +209,9 @@ def xivboot(exe, run_it, extra, debug=False, opt='-O1', pgo=None):
     # XIV_INLINE=<threshold>: LTO inlining experiments (import limit and inline threshold)
     inl = os.environ.get('XIV_INLINE')
     inl_flags = ['-Wl,-mllvm,-import-instr-limit=%d' % (int(inl) * 2), '-Wl,-mllvm,-inline-threshold=%s' % inl] if inl else []
-    run(['clang', '-o', 'build/xivboot', '-flto=thin', '-O3', '-mcpu=apple-m1', '-Wl,-U,___llvm_profile_write_file'] + pgo_flags + inl_flags + [
-         '-Wl,-cache_path_lto,build/xiv/lto-cache', '-Wl,-mllvm,-threads=%d' % (os.cpu_count() or 4)]
-        + objs + thirdparty.libs('sdl3') + GFX_LIBS + ['-lm', '-lpthread'])
+    run_lto(['clang', '-o', 'build/xivboot', '-flto=thin', '-O3', '-mcpu=apple-m1', '-Wl,-U,___llvm_profile_write_file'] + pgo_flags + inl_flags + [
+             '-Wl,-cache_path_lto,build/xiv/lto-cache', '-Wl,-mllvm,-threads=%d' % (os.cpu_count() or 4)]
+            + objs + thirdparty.libs('sdl3') + GFX_LIBS + ['-lm', '-lpthread'], 'build/xiv/lto-cache', len(gen))
     xiv_bundle()
     with open(os.path.join(ROOT, 'build', 'xivboot.sha256'), 'w') as f:  # which ffxivgame.exe (xiv_run.py)
         f.write(sha256(exe) + '\n')
