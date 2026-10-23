@@ -45,6 +45,7 @@ void ws2_init(void);
 void k32_launch_init(void); /* k32_launch.c */
 void ui_appkit_init(void);  /* ui_appkit.m: after user32_init, whose shims it hands other windows to */
 void webbrowser_init(void); /* webbrowser.m: after ole_init and ui_appkit_init */
+void ui_suppress_controls(const uint32_t* ids, int n);
 void webbrowser_setup(void);
 void dinput_init(void);
 void dsound_init(void);
@@ -216,6 +217,13 @@ int main(int argc, char** argv)
     ws2_init();
     k32_launch_init();
     ui_appkit_init();
+    if (!strcasecmp(base, "ffxivlogin.exe"))
+    {
+        /* the login window without its Cancel and Update Page buttons: the page is the whole UI,
+         * and the window's close button cancels */
+        static const uint32_t ids[] = { 2 /* IDCANCEL */, 1001 /* Update Page */ };
+        ui_suppress_controls(ids, 2);
+    }
     webbrowser_init();
     vfs_init(GAME_DIR_GUEST);
     reg_init(NULL, 0, NULL);
