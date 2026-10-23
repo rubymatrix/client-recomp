@@ -28,6 +28,20 @@ python3 -m venv .venv && .venv/bin/pip install pycryptodome
 
 This produces `build/xivboot`.
 
+## Install from the retail disc
+
+Mount the FINAL FANTASY XIV disc (or its image), then:
+
+```sh
+.venv/bin/python tools/xiv_install.py
+```
+
+It unpacks the disc's InstallShield cabinets natively (none of the disc's code runs) into
+`~/Library/Application Support/FFXIV1_0/FINAL FANTASY XIV`, translates and compiles the disc's
+`ffxivboot.exe` and `ffxivupdater.exe`, and makes `build/FINAL FANTASY XIV.app`, which starts the
+native ffxivboot. Patches replace those programs and bring `ffxivlogin.exe` and `ffxivgame.exe`;
+each is rebuilt when it is next started (`tools/xiv_run.py`).
+
 ## Play
 
 ```sh
