@@ -344,6 +344,14 @@ static NSString* const AUTH_JS =
 
 - (void)webView:(WKWebView*)wv didFinishNavigation:(WKNavigation*)nav
 {
+    /* XIV_WEB_SCRIPT=<file.js>: run in every page once it loads (unattended tests sign in so) */
+    const char* script = getenv("XIV_WEB_SCRIPT");
+    NSString* js = script ? [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:script]
+                                                      encoding:NSUTF8StringEncoding
+                                                         error:nil]
+                          : nil;
+    if (js)
+        [wv evaluateJavaScript:js completionHandler:nil];
     NSString* url = [[[wv URL] absoluteString] copy];
     [wv evaluateJavaScript:AUTH_JS
          completionHandler:^(id result, NSError* err) {

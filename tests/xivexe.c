@@ -130,8 +130,13 @@ static int launch(const char* file, const char* params, const char* dir)
         printf("launch: no native build of %s (%s)\n", base, bin);
         return 0;
     }
+    /* a session of its own: the started program outlives this one (ffxivlogin exits as the game starts) */
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
     pid_t pid;
-    int rc = posix_spawn(&pid, bin, NULL, NULL, argv, env);
+    int rc = posix_spawn(&pid, bin, NULL, &attr, argv, env);
+    posix_spawnattr_destroy(&attr);
     printf("launch: %s -> %s: %s\n", base, bin, rc ? strerror(rc) : "started");
     (void)dir;
     return rc == 0;
