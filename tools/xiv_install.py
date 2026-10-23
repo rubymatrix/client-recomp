@@ -1,5 +1,6 @@
 """Install FINAL FANTASY XIV on this Mac from the retail disc, start to finish.
   python3 tools/xiv_install.py [--disc <mounted disc>] [--install-dir <folder>] [--no-unpack] [--open]
+                               [--server <host>] [--patch-cert <cert.der>] [--account-url <url>]
 
 1. Finds the disc (a mounted volume with ffxivsetup.exe and data/data1.hdr) or takes --disc.
 2. Unpacks it with tools/xiv_unpack.c (InstallShield cabinets, read natively with the vendored
@@ -12,6 +13,11 @@
    tools/xiv_run.py: from there boot checks the version with the server, the updater patches the
    install up to 1.23b, login signs in and the game starts, each rebuilt here when a patch
    replaces it.
+
+--server is the host Square Enix's names go to (default 127.0.0.1); --patch-cert the server's patch
+signing certificate (meteor-web PatchTool's patch_cert.der), which ffxivboot checks patch torrents
+against; --account-url the server's login page (meteor-web: http://<host>:8090). The app's launcher
+keeps them.
 
 Clang comes from Xcode's command line tools. The install is the player's own disc; nothing from it
 is copied into this checkout.
@@ -85,7 +91,7 @@ APP_PLIST = {
 }
 
 
-def make_app(install):
+def make_app(install, server, cert, account_url):
     """The app starts ffxivboot (xiv_run.py); the game keeps its own executable inside it (xivboot,
     linked in by build_xiv.py when it is built), so macOS sees a game when it runs."""
     macos = os.path.join(APP, 'Contents', 'MacOS')
@@ -94,8 +100,13 @@ def make_app(install):
     with open(os.path.join(APP, 'Contents', 'Info.plist'), 'wb') as f:
         plistlib.dump(plist, f)
     launcher = os.path.join(macos, 'FINAL FANTASY XIV')
+    env = 'export XIV_SERVER_HOST="%s"\n' % server
+    if cert:
+        env += 'export XIV_PATCH_CERT="%s"\n' % os.path.abspath(cert)
+    if account_url:
+        env += 'export XIV_ACCOUNT_URL="%s"\n' % account_url
     with open(launcher, 'w') as f:
-        f.write('#!/bin/sh\n# FINAL FANTASY XIV: the native ffxivboot of this install (tools/xiv_install.py)\n'
+        f.write('#!/bin/sh\n# FINAL FANTASY XIV: the native ffxivboot of this install (tools/xiv_install.py)\n' + env +
                 'exec "%s" "%s" ffxivboot "%s" >> "%s" 2>&1\n' % (
                     os.path.join(ROOT, '.venv', 'bin', 'python'), os.path.join(HERE, 'xiv_run.py'),
                     os.path.join(install, 'ffxivboot.exe'), os.path.join(ROOT, 'build', 'run.log')))
@@ -109,6 +120,9 @@ def main():
     ap.add_argument('--install-dir', default=DEFAULT_INSTALL)
     ap.add_argument('--no-unpack', action='store_true', help='the install folder is already unpacked')
     ap.add_argument('--open', action='store_true', help='start the app when done')
+    ap.add_argument('--server', default='127.0.0.1', help="the server's host (Square Enix's names go there)")
+    ap.add_argument('--patch-cert', help="the server's patch signing certificate (patch_cert.der)")
+    ap.add_argument('--account-url', help="the server's login page, e.g. http://127.0.0.1:8090")
     a = ap.parse_args()
     install = os.path.abspath(os.path.expanduser(a.install_dir))
 
@@ -135,7 +149,7 @@ def main():
     if os.path.exists(game):
         print('ffxivgame: built when it is first started (after patching to 1.23b)')
 
-    app = make_app(install)
+    app = make_app(install, a.server, a.patch_cert, a.account_url)
     print('Ready: %s' % app)
     if a.open:
         subprocess.call(['open', app])
