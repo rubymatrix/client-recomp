@@ -47,6 +47,8 @@ static const char* const KNOWN_DLLS[] = {
     "dpnhpast.dll",
     /* the game folder's XInput wrapper; its exports are dinput.c's XInput shims */
     "xinputdll.dll",
+    /* the launcher programs' system DLLs, loaded by name (MFC reaches InitCommonControlsEx so) */
+    "comctl32.dll", "shlwapi.dll", "urlmon.dll", "comdlg32.dll",
     NULL,
 };
 
@@ -432,27 +434,50 @@ static void sh_GetCPInfo(Guest* g)
     RET(1, 2);
 }
 
+/* MultiByteToWideChar(cp, flags, src, n, dst, cap): CP_UTF8 (65001) decodes UTF-8; every other code
+ * page is the bytes as code points. A buffer too small is filled as far as it goes and the call
+ * fails with ERROR_INSUFFICIENT_BUFFER, as on Windows (ATL's conversions rely on the fill). */
 static void sh_MultiByteToWideChar(Guest* g)
 {
-    uint32_t src = ARG(2), dst = ARG(4);
+    uint32_t cp = ARG(0), src = ARG(2), dst = ARG(4);
     int32_t n = (int32_t)ARG(3), cap = (int32_t)ARG(5);
     if (n < 0)
         n = (int32_t)strlen((const char*)GUEST_PTR(src)) + 1;
-    if (!cap)
-        RET(n, 6);
-    if (cap < n)
+    int32_t out = 0;
+    for (int32_t i = 0; i < n;)
     {
-        gt_set_error(ERROR_INSUFFICIENT_BUFFER);
-        RET(0, 6);
+        uint32_t c = rd8(src + (uint32_t)i++);
+        if (cp == 65001 && c >= 0xC0)
+        {
+            int more = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : 1;
+            c &= 0x3F >> more;
+            for (; more && i < n && (rd8(src + (uint32_t)i) & 0xC0) == 0x80; --more)
+                c = (c << 6) | (rd8(src + (uint32_t)i++) & 0x3F);
+        }
+        int units = c > 0xFFFF ? 2 : 1;
+        if (cap && out + units > cap)
+        {
+            gt_set_error(ERROR_INSUFFICIENT_BUFFER);
+            RET(0, 6);
+        }
+        if (cap && units == 2)
+        {
+            c -= 0x10000;
+            wr16(dst + 2u * (uint32_t)out, (uint16_t)(0xD800 | (c >> 10)));
+            wr16(dst + 2u * (uint32_t)out + 2, (uint16_t)(0xDC00 | (c & 0x3FF)));
+        }
+        else if (cap)
+            wr16(dst + 2u * (uint32_t)out, (uint16_t)c);
+        out += units;
     }
-    for (int32_t i = 0; i < n; ++i)
-        wr16(dst + 2u * (uint32_t)i, rd8(src + (uint32_t)i));
-    RET(n, 6);
+    RET(out, 6);
 }
 
+/* WideCharToMultiByte(cp, flags, src, n, dst, cap, default, used): CP_UTF8 encodes UTF-8; other
+ * code pages keep characters up to 0xFF and write '?' for the rest */
 static void sh_WideCharToMultiByte(Guest* g)
 {
-    uint32_t src = ARG(2), dst = ARG(4), used = ARG(7);
+    uint32_t cp = ARG(0), src = ARG(2), dst = ARG(4), used = ARG(7);
     int32_t n = (int32_t)ARG(3), cap = (int32_t)ARG(5);
     if (n < 0)
     {
@@ -463,21 +488,39 @@ static void sh_WideCharToMultiByte(Guest* g)
     }
     if (used)
         wr32(used, 0);
-    if (!cap)
-        RET(n, 8);
-    if (cap < n)
+    int32_t out = 0;
+    for (int32_t i = 0; i < n;)
     {
-        gt_set_error(ERROR_INSUFFICIENT_BUFFER);
-        RET(0, 8);
+        uint32_t c = rd16(src + 2u * (uint32_t)i++);
+        if (c >= 0xD800 && c < 0xDC00 && i < n && (rd16(src + 2u * (uint32_t)i) & 0xFC00) == 0xDC00)
+            c = 0x10000 + ((c - 0xD800) << 10) + (rd16(src + 2u * (uint32_t)i++) - 0xDC00);
+        uint8_t b[4];
+        int k = 0;
+        if (cp != 65001)
+        {
+            if (c > 0xFF && used)
+                wr32(used, 1);
+            b[k++] = c > 0xFF ? '?' : (uint8_t)c;
+        }
+        else if (c < 0x80)
+            b[k++] = (uint8_t)c;
+        else if (c < 0x800)
+            b[k++] = (uint8_t)(0xC0 | (c >> 6)), b[k++] = (uint8_t)(0x80 | (c & 0x3F));
+        else if (c < 0x10000)
+            b[k++] = (uint8_t)(0xE0 | (c >> 12)), b[k++] = (uint8_t)(0x80 | ((c >> 6) & 0x3F)), b[k++] = (uint8_t)(0x80 | (c & 0x3F));
+        else
+            b[k++] = (uint8_t)(0xF0 | (c >> 18)), b[k++] = (uint8_t)(0x80 | ((c >> 12) & 0x3F)),
+            b[k++] = (uint8_t)(0x80 | ((c >> 6) & 0x3F)), b[k++] = (uint8_t)(0x80 | (c & 0x3F));
+        if (cap && out + k > cap)
+        {
+            gt_set_error(ERROR_INSUFFICIENT_BUFFER);
+            RET(0, 8);
+        }
+        for (int j = 0; cap && j < k; ++j)
+            wr8(dst + (uint32_t)(out + j), b[j]);
+        out += k;
     }
-    for (int32_t i = 0; i < n; ++i)
-    {
-        uint16_t w = rd16(src + 2u * (uint32_t)i);
-        if (w > 0xFF && used)
-            wr32(used, 1);
-        wr8(dst + (uint32_t)i, w > 0xFF ? '?' : (uint8_t)w);
-    }
-    RET(n, 8);
+    RET(out, 8);
 }
 
 #define LCMAP_LOWERCASE 0x100u

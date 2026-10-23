@@ -43,6 +43,8 @@
 #define WM_SHOWWINDOW 0x0018
 #define WM_SETFONT 0x0030
 #define WM_GETFONT 0x0031
+#define WM_CREATE 0x0001
+#define WM_NCCREATE 0x0081
 #define WM_NCDESTROY 0x0082
 #define WM_INITDIALOG 0x0110
 #define WM_COMMAND 0x0111
@@ -86,6 +88,9 @@ typedef struct UiWnd
     int x, y, w, h; /* children: in the parent's client area; dialogs: the client area on the screen */
     int visible, enabled;
     uint16_t text[UI_TEXT];
+    char cls[48];      /* the class name GetClassName reports */
+    int bx, by;        /* a dialog's base units (MapDialogRect) */
+    struct { uint32_t atom, value; } props[8]; /* SetProp, by atom */
     int pmin, pmax, ppos, pstep;
     void* view; /* NSWindow* (dialogs) or NSView* (controls), retained */
 } UiWnd;
@@ -353,6 +358,8 @@ static void sync_view(UiWnd* w)
         {
             [NSApp activateIgnoringOtherApps:YES];
             [win makeKeyAndOrderFront:nil];
+            if (getenv("XIV_UI_LOG")) /* for screencapture -l: this window alone */
+                rt_log("[ui] %05x is window number %ld\n", w->hwnd, (long)[win windowNumber]);
         }
         else if (!w->visible && [win isVisible])
             [win orderOut:nil];
@@ -430,6 +437,8 @@ static uint32_t def_window(UiWnd* w, uint32_t msg, uint32_t wp, uint32_t lp)
     }
     case WM_GETTEXTLENGTH:
         return (uint32_t)text_len(w);
+    case WM_NCCREATE:
+        return 1;
     case WM_SETFONT:
         w->font = wp;
         return 0;
@@ -536,13 +545,13 @@ static uint32_t animate_proc(UiWnd* w, uint32_t msg, uint32_t wp, uint32_t lp)
 {
     switch (msg)
     {
-    case 0x0464: /* ACM_OPENW: the AVI is the spinner here */
-    case 0x0464 + 3: /* ACM_OPENA */
+    case 0x0464: /* ACM_OPENA: the AVI is the spinner here */
+    case 0x0467: /* ACM_OPENW */
         return 1;
-    case 0x0465: /* ACM_PLAY */
+    case 0x0465: /* ACM_PLAY(repeat, from | to << 16): -1 repeats loop; anything else shows a frame */
     case 0x0466: /* ACM_STOP */
     {
-        int play = msg == 0x0465;
+        int play = msg == 0x0465 && wp == 0xFFFFFFFFu;
         NSProgressIndicator* pi = (NSProgressIndicator*)w->view;
         on_main(^{
             if (play)
@@ -606,6 +615,46 @@ static void destroy(UiWnd* w)
                 [(NSView*)v removeFromSuperview];
             [(id)v release];
         });
+}
+
+/* --- creation hooks (SetWindowsHookEx WH_CBT): MFC attaches its CWnd objects to new windows from
+ * HCBT_CREATEWND, subclassing them before their first message ------------------------------------ */
+typedef struct { uint32_t id, type, proc, tid; } Hook;
+static Hook g_hooks[16];
+static uint32_t g_next_hook = 0x00070001u;
+
+/* the window exists; hooks see it, then WM_NCCREATE and WM_CREATE with its CREATESTRUCTW */
+static void created(UiWnd* w, uint32_t params)
+{
+    uint32_t h = w->hwnd;
+    uint32_t cls = gheap_alloc(2 * (uint32_t)(strlen(w->cls) + 1), 1);
+    for (size_t i = 0; w->cls[i]; ++i)
+        wr16(cls + 2 * (uint32_t)i, (uint8_t)w->cls[i]);
+    uint32_t cs = gheap_alloc(48 + 8, 1), cbt = cs + 48;
+    wr32(cs, params);
+    wr32(cs + 4, w->hinst);
+    wr32(cs + 8, w->parent ? w->id : 0);
+    wr32(cs + 12, w->parent ? w->parent : w->owner);
+    wr32(cs + 16, (uint32_t)w->h), wr32(cs + 20, (uint32_t)w->w), wr32(cs + 24, (uint32_t)w->y), wr32(cs + 28, (uint32_t)w->x);
+    wr32(cs + 32, w->style | (w->visible ? WS_VISIBLE : 0));
+    wr32(cs + 36, 0);
+    wr32(cs + 40, cls);
+    wr32(cs + 44, w->exstyle);
+    wr32(cbt, cs);
+    wr32(cbt + 4, 0);
+    uint32_t tid = gt_self()->tid;
+    for (int i = 0; i < 16; ++i)
+        if (g_hooks[i].id && g_hooks[i].type == 5 && g_hooks[i].tid == tid) /* WH_CBT */
+        {
+            uint32_t a[3] = { 3 /* HCBT_CREATEWND */, h, cbt };
+            guest_call(g_hooks[i].proc, 3, a);
+        }
+    if ((w = ui(h)))
+        ui_send(w, WM_NCCREATE, 0, cs);
+    if ((w = ui(h)))
+        ui_send(w, WM_CREATE, 0, cs);
+    gheap_free(cs);
+    gheap_free(cls);
 }
 
 static UiKind kind_of(const char* cls)
@@ -686,6 +735,8 @@ static uint32_t create_dialog(uint32_t hinst, uint32_t tpl, uint32_t parent, uin
     if (!d)
         return 0;
     d->kind = UK_DIALOG;
+    strcpy(d->cls, "#32770");
+    d->bx = bx, d->by = by;
     d->style = style & ~WS_VISIBLE;
     d->exstyle = exstyle;
     d->owner = parent;
@@ -699,6 +750,9 @@ static uint32_t create_dialog(uint32_t hinst, uint32_t tpl, uint32_t parent, uin
     set_text(d, title);
     uint32_t dh = d->hwnd;
     { UiWnd c = *d; on_main(^{ UiWnd cc = c; make_view(&cc); g_ui[(dh - UI_BASE) / UI_STRIDE].view = cc.view; }); }
+    created(d, param);
+    if (!(d = ui(dh)))
+        return 0;
 
     uint32_t first = 0;
     for (uint32_t i = 0; i < n; ++i)
@@ -737,6 +791,7 @@ static uint32_t create_dialog(uint32_t hinst, uint32_t tpl, uint32_t parent, uin
         if (!c)
             break;
         c->kind = kind_of(icls);
+        snprintf(c->cls, sizeof c->cls, "%s", icls);
         c->parent = dh;
         c->id = iid;
         c->style = ist;
@@ -756,6 +811,9 @@ static uint32_t create_dialog(uint32_t hinst, uint32_t tpl, uint32_t parent, uin
         uint32_t chw = c->hwnd;
         UiWnd snap = *c;
         on_main(^{ UiWnd cc = snap; make_view(&cc); g_ui[(chw - UI_BASE) / UI_STRIDE].view = cc.view; });
+        created(c, 0);
+        if (!(d = ui(dh)))
+            return 0;
     }
 #undef DX
 #undef DY
@@ -778,7 +836,7 @@ static uint32_t create_dialog(uint32_t hinst, uint32_t tpl, uint32_t parent, uin
 /* --- shims --------------------------------------------------------------------------------------------- */
 /* the shim each override replaces, for windows that are not ours */
 typedef struct { const char* name; Shim fn; } Prev;
-static Prev g_prev[64];
+static Prev g_prev[256];
 static int g_nprev;
 
 /* A call for a window that is not ours goes to the shim below; one of ours that is gone fails as
@@ -1391,6 +1449,12 @@ static void sh_MessageBoxW(Guest* g)
     if (type > 5)
         type = 0;
     __block NSInteger which = 0;
+    if (getenv("XIV_UI_NOMODAL")) /* unattended runs: the first button, without waiting */
+    {
+        [text release];
+        [title release];
+        RET(ids[type][0], 4);
+    }
     gt_unlock();
     on_main(^{
         NSAlert* a = [[NSAlert alloc] init];
@@ -1459,6 +1523,512 @@ static void sh_SystemParametersInfoW(Guest* g)
 
 static void sh_GetDesktopWindow(Guest* g) { RET(0, 0); }
 
+/* one monitor: the main screen */
+static void sh_MonitorFromWindow(Guest* g) { RET(0x00100001u, 2); }
+static void sh_MonitorFromRect(Guest* g) { RET(0x00100001u, 2); }
+static void sh_MonitorFromPoint(Guest* g) { RET(0x00100001u, 3); }
+
+/* GetMonitorInfoW/A(monitor, MONITORINFO*): rcMonitor at 4, rcWork at 20, dwFlags (primary) at 36 */
+static void sh_GetMonitorInfoW(Guest* g)
+{
+    uint32_t p = ARG(1);
+    NSScreen* s = [NSScreen screens][0];
+    NSRect v = [s visibleFrame], f = [s frame];
+    int top = (int)(NSMaxY(f) - NSMaxY(v));
+    write_rect(p + 4, 0, 0, (int)f.size.width, (int)f.size.height);
+    write_rect(p + 20, (int)v.origin.x, top, (int)NSMaxX(v), top + (int)v.size.height);
+    wr32(p + 36, 1);
+    RET(1, 2);
+}
+
+
+/* --- classes and generic windows (MFC registers its own classes and checks the system ones) ------ */
+typedef struct { char name[48]; uint32_t proc, style, extra; } UiClass;
+static UiClass g_classes[32];
+
+static void guest_name(uint32_t p, char* out, size_t cap)
+{
+    if (p < 0x10000u) /* an atom */
+        snprintf(out, cap, "#%u", p);
+    else
+    {
+        size_t k = 0;
+        for (uint16_t c; (c = rd16(p)) && k + 1 < cap; p += 2)
+            out[k++] = c > 0x7F ? '?' : (char)c;
+        out[k] = 0;
+    }
+}
+
+static UiClass* find_class(const char* name)
+{
+    for (int i = 0; i < 32; ++i)
+        if (g_classes[i].name[0] && !strcasecmp(g_classes[i].name, name))
+            return &g_classes[i];
+    return NULL;
+}
+
+static uint32_t register_class(uint32_t namep, uint32_t proc, uint32_t style, uint32_t extra)
+{
+    char name[48];
+    guest_name(namep, name, sizeof name);
+    UiClass* c = find_class(name);
+    for (int i = 0; !c && i < 32; ++i)
+        if (!g_classes[i].name[0])
+            c = &g_classes[i];
+    if (!c)
+        return 0;
+    snprintf(c->name, sizeof c->name, "%s", name);
+    c->proc = proc, c->style = style, c->extra = extra;
+    return 0xC100u + (uint32_t)(c - g_classes);
+}
+
+/* RegisterClassW(WNDCLASSW*) / RegisterClassExW(WNDCLASSEXW*) */
+static void sh_RegisterClassW(Guest* g) { uint32_t w = ARG(0); RET(register_class(rd32(w + 36), rd32(w + 4), rd32(w), rd32(w + 12)), 1); }
+static void sh_RegisterClassExW(Guest* g) { uint32_t w = ARG(0); RET(register_class(rd32(w + 40), rd32(w + 8), rd32(w + 4), rd32(w + 16)), 1); }
+
+static void sh_UnregisterClassW(Guest* g)
+{
+    char name[48];
+    guest_name(ARG(0), name, sizeof name);
+    UiClass* c = find_class(name);
+    if (c)
+        c->name[0] = 0;
+    RET(c != NULL, 2);
+}
+
+/* the window procedure a class name stands for: a registered class, or a system one */
+static uint32_t class_proc(const char* name, UiKind* kind)
+{
+    UiClass* c = find_class(name);
+    *kind = kind_of(name);
+    if (c)
+        return c->proc;
+    if (!strcmp(name, "#32770"))
+        return *kind = UK_DIALOG, proc_for(UK_DIALOG);
+    return *kind != UK_OTHER ? proc_for(*kind) : 0;
+}
+
+/* GetClassInfoW(hinst, name, WNDCLASSW*) / GetClassInfoExW(hinst, name, WNDCLASSEXW*) */
+static int class_info(uint32_t namep, uint32_t* proc, uint32_t* style)
+{
+    char name[48];
+    guest_name(namep, name, sizeof name);
+    UiKind k;
+    *proc = class_proc(name, &k);
+    UiClass* c = find_class(name);
+    *style = c ? c->style : 0;
+    return *proc != 0;
+}
+
+static void sh_GetClassInfoW(Guest* g)
+{
+    uint32_t proc, style, w = ARG(2);
+    if (!class_info(ARG(1), &proc, &style))
+        RET(0, 3);
+    memset(GUEST_PTR(w), 0, 40);
+    wr32(w, style), wr32(w + 4, proc), wr32(w + 16, ARG(0)), wr32(w + 36, ARG(1));
+    RET(1, 3);
+}
+
+static void sh_GetClassInfoExW(Guest* g)
+{
+    uint32_t proc, style, w = ARG(2);
+    if (!class_info(ARG(1), &proc, &style))
+        RET(0, 3);
+    memset(GUEST_PTR(w + 4), 0, 44);
+    wr32(w + 4, style), wr32(w + 8, proc), wr32(w + 20, ARG(0)), wr32(w + 40, ARG(1));
+    RET(1, 3);
+}
+
+static void sh_GetClassLongW(Guest* g) { RET(0, 2); }
+
+static void sh_GetClassNameW(Guest* g)
+{
+    UiWnd* w = ui(ARG(0));
+    uint32_t buf = ARG(1), n = ARG(2);
+    if (!w || !n)
+        RET(0, 3);
+    uint32_t k = 0;
+    for (; w->cls[k] && k + 1 < n; ++k)
+        wr16(buf + 2 * k, (uint8_t)w->cls[k]);
+    wr16(buf + 2 * k, 0);
+    RET(k, 3);
+}
+
+/* CreateWindowExW's work: child windows get a plain view; a top-level one that is not a dialog
+ * gets none (MFC's hidden helpers). Returns the HWND or 0. */
+uint32_t ui_create_window(uint32_t exstyle, const char* cls, uint32_t name, uint32_t style, int32_t x, int32_t y,
+    int32_t cx, int32_t cy, uint32_t parent, uint32_t menu, uint32_t hinst, uint32_t params)
+{
+    UiKind kind;
+    uint32_t proc = class_proc(cls, &kind);
+    if (!proc)
+    {
+        rt_log("[ui] CreateWindowExW: class %s is not registered\n", cls);
+        return 0;
+    }
+    UiWnd* w = ui_new();
+    if (!w)
+        return 0;
+    int child = (style & WS_CHILD) != 0;
+    w->kind = kind == UK_DIALOG ? UK_OTHER : kind; /* a #32770 made by hand has no template */
+    snprintf(w->cls, sizeof w->cls, "%s", cls);
+    w->style = style & ~WS_VISIBLE;
+    w->exstyle = exstyle;
+    w->parent = child ? parent : 0;
+    w->owner = child ? 0 : parent;
+    w->id = child ? menu : 0;
+    w->hinst = hinst;
+    w->tid = gt_self()->tid;
+    w->wndproc = proc;
+    w->visible = (style & WS_VISIBLE) != 0;
+    w->enabled = !(style & WS_DISABLED);
+    w->x = x == (int32_t)0x80000000 ? 0 : x, w->y = y == (int32_t)0x80000000 ? 0 : y;
+    w->w = cx == (int32_t)0x80000000 ? 0 : cx, w->h = cy == (int32_t)0x80000000 ? 0 : cy;
+    if (name >= 0x10000u)
+        set_text(w, name);
+    uint32_t h = w->hwnd;
+    if (child && ui(parent))
+    {
+        UiWnd snap = *w;
+        on_main(^{ UiWnd cc = snap; make_view(&cc); g_ui[(h - UI_BASE) / UI_STRIDE].view = cc.view; });
+    }
+    created(w, params);
+    return ui(h) ? h : 0;
+}
+
+static void sh_CreateWindowExW(Guest* g)
+{
+    char cls[48];
+    guest_name(ARG(1), cls, sizeof cls);
+    RET(ui_create_window(ARG(0), cls, ARG(2), ARG(3), (int32_t)ARG(4), (int32_t)ARG(5), (int32_t)ARG(6),
+            (int32_t)ARG(7), ARG(8), ARG(9), ARG(10), ARG(11)), 12);
+}
+
+/* for other host modules (webbrowser.m): a class served by a host window procedure, a window's
+ * AppKit view (use it on the main thread), the default window procedure */
+void ui_register_class(const char* name, uint32_t proc)
+{
+    UiClass* c = find_class(name);
+    for (int i = 0; !c && i < 32; ++i)
+        if (!g_classes[i].name[0])
+            c = &g_classes[i];
+    if (c)
+    {
+        snprintf(c->name, sizeof c->name, "%s", name);
+        c->proc = proc;
+    }
+}
+
+void* ui_view(uint32_t hwnd)
+{
+    UiWnd* w = ui(hwnd);
+    return w ? w->view : NULL;
+}
+
+uint32_t ui_def_window(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp)
+{
+    UiWnd* w = ui(hwnd);
+    return w ? def_window(w, msg, wp, lp) : 0;
+}
+
+uint32_t ui_window_tid(uint32_t hwnd)
+{
+    UiWnd* w = ui(hwnd);
+    return w ? w->tid : 0;
+}
+
+/* SetWindowsHookExA/W(type, proc, module, tid): WH_CBT runs at window creation; others are kept */
+static void sh_SetWindowsHookExW(Guest* g)
+{
+    for (int i = 0; i < 16; ++i)
+        if (!g_hooks[i].id)
+        {
+            g_hooks[i].id = g_next_hook++;
+            g_hooks[i].type = ARG(0);
+            g_hooks[i].proc = ARG(1);
+            g_hooks[i].tid = ARG(3) ? ARG(3) : gt_self()->tid;
+            RET(g_hooks[i].id, 4);
+        }
+    RET(0, 4);
+}
+
+static void sh_UnhookWindowsHookEx(Guest* g)
+{
+    for (int i = 0; i < 16; ++i)
+        if (g_hooks[i].id == ARG(0))
+        {
+            memset(&g_hooks[i], 0, sizeof g_hooks[i]);
+            RET(1, 1);
+        }
+    RET(0, 1);
+}
+
+static void sh_CallNextHookEx(Guest* g) { RET(0, 4); }
+
+/* CallWindowProcW(proc, hwnd, msg, wp, lp) */
+static void sh_CallWindowProcW(Guest* g)
+{
+    if (!ARG(0))
+        RET(0, 5);
+    uint32_t a[4] = { ARG(1), ARG(2), ARG(3), ARG(4) };
+    RET(guest_call(ARG(0), 4, a), 5);
+}
+
+/* --- window relations ------------------------------------------------------------------------------- */
+static void sh_GetDlgCtrlID(Guest* g) { UiWnd* w = ui(ARG(0)); RET(w ? w->id : 0, 1); }
+
+static void sh_IsChild(Guest* g)
+{
+    UiWnd* w = ui(ARG(1));
+    while (w && w->parent)
+    {
+        if (w->parent == ARG(0))
+            RET(1, 2);
+        w = ui(w->parent);
+    }
+    RET(0, 2);
+}
+
+static void sh_GetTopWindow(Guest* g)
+{
+    UiWnd* best = NULL;
+    for (int i = 0; i < UI_MAX; ++i)
+        if (g_ui[i].used && g_ui[i].parent == ARG(0) && (!best || g_ui[i].order < best->order))
+            best = &g_ui[i];
+    RET(best ? best->hwnd : 0, 1);
+}
+
+static void sh_GetLastActivePopup(Guest* g) { RET(ARG(0), 1); }
+
+/* GetNextDlgTabItem / GetNextDlgGroupItem(dlg, ctl, previous): the next sibling, wrapping */
+static void sh_GetNextDlgTabItem(Guest* g)
+{
+    UiWnd* c = ui(ARG(1));
+    int prev = ARG(2) != 0;
+    UiWnd *best = NULL, *wrap = NULL;
+    for (int i = 0; i < UI_MAX; ++i)
+    {
+        UiWnd* x = &g_ui[i];
+        if (!x->used || x->parent != ARG(0) || !x->visible || !x->enabled)
+            continue;
+        uint32_t o = c ? c->order : 0;
+        if (prev ? x->order < o && (!best || x->order > best->order) : x->order > o && (!best || x->order < best->order))
+            best = x;
+        if (!wrap || (prev ? x->order > wrap->order : x->order < wrap->order))
+            wrap = x;
+    }
+    RET(best ? best->hwnd : wrap ? wrap->hwnd : 0, 3);
+}
+
+/* window properties: a few per window, by atom or string (narrowed to an atom-like hash) */
+static uint32_t prop_key(uint32_t p)
+{
+    if (p < 0x10000u)
+        return p;
+    uint32_t h = 2166136261u;
+    for (uint16_t c; (c = rd16(p)); p += 2)
+        h = (h ^ c) * 16777619u;
+    return h | 0x80000000u;
+}
+
+static void sh_SetPropW(Guest* g)
+{
+    UiWnd* w = ui(ARG(0));
+    uint32_t k = prop_key(ARG(1));
+    for (int i = 0; w && i < 8; ++i)
+        if (w->props[i].atom == k || !w->props[i].atom)
+        {
+            w->props[i].atom = k, w->props[i].value = ARG(2);
+            RET(1, 3);
+        }
+    RET(0, 3);
+}
+
+static void sh_GetPropW(Guest* g)
+{
+    UiWnd* w = ui(ARG(0));
+    uint32_t k = prop_key(ARG(1));
+    for (int i = 0; w && i < 8; ++i)
+        if (w->props[i].atom == k)
+            RET(w->props[i].value, 2);
+    RET(0, 2);
+}
+
+static void sh_RemovePropW(Guest* g)
+{
+    UiWnd* w = ui(ARG(0));
+    uint32_t k = prop_key(ARG(1));
+    for (int i = 0; w && i < 8; ++i)
+        if (w->props[i].atom == k)
+        {
+            uint32_t v = w->props[i].value;
+            w->props[i].atom = w->props[i].value = 0;
+            RET(v, 2);
+        }
+    RET(0, 2);
+}
+
+/* MapDialogRect(dlg, RECT*): dialog units to pixels with the dialog's base units */
+static void sh_MapDialogRect(Guest* g)
+{
+    UiWnd* w = ui(ARG(0));
+    int bx = w && w->bx ? w->bx : 6, by = w && w->by ? w->by : 13;
+    uint32_t r = ARG(1);
+    wr32(r, (uint32_t)((int32_t)rd32(r) * bx / 4));
+    wr32(r + 4, (uint32_t)((int32_t)rd32(r + 4) * by / 8));
+    wr32(r + 8, (uint32_t)((int32_t)rd32(r + 8) * bx / 4));
+    wr32(r + 12, (uint32_t)((int32_t)rd32(r + 12) * by / 8));
+    RET(1, 2);
+}
+
+static void sh_PostThreadMessageW(Guest* g) { RET(user32_post(ARG(0), 0, ARG(1), ARG(2), ARG(3)), 4); }
+
+static void sh_RegisterWindowMessageW(Guest* g)
+{
+    static char names[32][64];
+    char n[64];
+    guest_name(ARG(0), n, sizeof n);
+    for (int i = 0; i < 32; ++i)
+    {
+        if (!names[i][0])
+            snprintf(names[i], sizeof names[i], "%s", n);
+        if (!strcmp(names[i], n))
+            RET(0xC200u + (uint32_t)i, 1);
+    }
+    RET(0, 1);
+}
+
+/* --- rectangles ----------------------------------------------------------------------------------------- */
+#define RL(r) ((int32_t)rd32(r))
+#define RT(r) ((int32_t)rd32((r) + 4))
+#define RR(r) ((int32_t)rd32((r) + 8))
+#define RB(r) ((int32_t)rd32((r) + 12))
+static void sh_CopyRect(Guest* g) { memcpy(GUEST_PTR(ARG(0)), GUEST_PTR(ARG(1)), 16); RET(1, 2); }
+static void sh_EqualRect(Guest* g) { RET(!memcmp(GUEST_PTR(ARG(0)), GUEST_PTR(ARG(1)), 16), 2); }
+static void sh_IsRectEmpty(Guest* g) { RET(RR(ARG(0)) <= RL(ARG(0)) || RB(ARG(0)) <= RT(ARG(0)), 1); }
+static void sh_PtInRect(Guest* g)
+{
+    int32_t x = (int32_t)ARG(1), y = (int32_t)ARG(2);
+    RET(x >= RL(ARG(0)) && x < RR(ARG(0)) && y >= RT(ARG(0)) && y < RB(ARG(0)), 3);
+}
+static void sh_OffsetRect(Guest* g)
+{
+    uint32_t r = ARG(0);
+    write_rect(r, RL(r) + (int32_t)ARG(1), RT(r) + (int32_t)ARG(2), RR(r) + (int32_t)ARG(1), RB(r) + (int32_t)ARG(2));
+    RET(1, 3);
+}
+static void sh_IntersectRect(Guest* g)
+{
+    uint32_t a = ARG(1), b = ARG(2);
+    int l = RL(a) > RL(b) ? RL(a) : RL(b), t = RT(a) > RT(b) ? RT(a) : RT(b);
+    int r = RR(a) < RR(b) ? RR(a) : RR(b), bo = RB(a) < RB(b) ? RB(a) : RB(b);
+    if (r <= l || bo <= t)
+    {
+        write_rect(ARG(0), 0, 0, 0, 0);
+        RET(0, 3);
+    }
+    write_rect(ARG(0), l, t, r, bo);
+    RET(1, 3);
+}
+
+/* --- colours, painting, menus: AppKit draws; the program's own drawing is not shown --------------- */
+static void sh_GetSysColor(Guest* g)
+{
+    switch (ARG(0))
+    {
+    case 5: case 14: RET(0xFFFFFFu, 1);     /* COLOR_WINDOW, COLOR_HIGHLIGHTTEXT */
+    case 8: case 9: case 18: RET(0, 1);     /* window, caption and button text */
+    case 13: RET(0xD77800u, 1);             /* COLOR_HIGHLIGHT */
+    case 16: RET(0xA0A0A0u, 1);             /* COLOR_BTNSHADOW */
+    case 20: RET(0xFFFFFFu, 1);             /* COLOR_BTNHIGHLIGHT */
+    }
+    RET(0xF0F0F0u, 1); /* COLOR_BTNFACE and the rest */
+}
+static void sh_GetSysColorBrush(Guest* g) { RET(0x00090000u | (ARG(0) & 0xFF), 1); }
+static void sh_InvalidateRect(Guest* g) { RET(1, 3); }
+static void sh_InvalidateRgn(Guest* g) { RET(1, 3); }
+static void sh_ValidateRect(Guest* g) { RET(1, 2); }
+static void sh_GetCapture(Guest* g) { RET(0, 0); }
+static void sh_GetMessagePos(Guest* g) { RET(0, 0); }
+static void sh_GetMessageTime(Guest* g) { RET((uint32_t)(rt_monotonic_ns() / 1000000u), 0); }
+static void sh_MessageBeep(Guest* g) { RET(1, 1); }
+static void sh_WinHelpW(Guest* g) { RET(0, 4); }
+static void sh_SetWindowContextHelpId(Guest* g) { RET(1, 2); }
+static void sh_CopyAcceleratorTableW(Guest* g) { RET(0, 3); }
+static void sh_CharUpperW(Guest* g)
+{
+    uint32_t p = ARG(0);
+    if (p < 0x10000u)
+        RET(p >= 'a' && p <= 'z' ? p - 32 : p, 1);
+    for (uint32_t q = p; rd16(q); q += 2)
+        if (rd16(q) >= 'a' && rd16(q) <= 'z')
+            wr16(q, rd16(q) - 32);
+    RET(p, 1);
+}
+static void sh_LoadIconW(Guest* g) { RET(0x00020001u, 2); }
+static void sh_LoadCursorW(Guest* g) { RET(0x00030001u, 2); }
+static void sh_LoadBitmapW(Guest* g) { RET(0x000A0001u, 2); }
+/* BeginPaint(hwnd, PAINTSTRUCT*): a DC that draws nothing, the whole client invalid */
+static void sh_BeginPaint(Guest* g)
+{
+    UiWnd* w = ui(ARG(0));
+    uint32_t ps = ARG(1);
+    memset(GUEST_PTR(ps), 0, 64);
+    wr32(ps, 0x000B0001u);
+    if (w)
+        write_rect(ps + 8, 0, 0, w->w, w->h);
+    RET(0x000B0001u, 2);
+}
+static void sh_EndPaint(Guest* g) { RET(1, 2); }
+static void sh_GetWindowDC(Guest* g) { RET(0x000B0001u, 1); }
+static void sh_ret1_2(Guest* g) { RET(1, 2); }
+static void sh_ret1_3(Guest* g) { RET(1, 3); }
+static void sh_ret1_4(Guest* g) { RET(1, 4); }
+static void sh_ret1_5(Guest* g) { RET(1, 5); }
+static void sh_ret1_6(Guest* g) { RET(1, 6); }
+static void sh_ret1_9(Guest* g) { RET(1, 9); }
+static void sh_ret0_1(Guest* g) { RET(0, 1); }
+static void sh_ret1_1(Guest* g) { RET(1, 1); }
+static void sh_ret1_8(Guest* g) { RET(1, 8); }
+static void sh_retm1_1(Guest* g) { RET((uint32_t)-1, 1); }
+static void sh_ret0_2(Guest* g) { RET(0, 2); }
+static void sh_retm1_2(Guest* g) { RET((uint32_t)-1, 2); }
+static void sh_retm1_3(Guest* g) { RET((uint32_t)-1, 3); }
+static void sh_GetMenuCheckMarkDimensions(Guest* g) { RET((13u << 16) | 13u, 0); }
+
+/* --- gdi32: device contexts that draw nothing --------------------------------------------------------- */
+static void sh_GetDeviceCaps(Guest* g)
+{
+    switch (ARG(1))
+    {
+    case 88: case 90: RET(96, 2);     /* LOGPIXELSX, LOGPIXELSY */
+    case 12: RET(32, 2);              /* BITSPIXEL */
+    case 14: RET(1, 2);               /* PLANES */
+    case 8: RET(1920, 2);             /* HORZRES */
+    case 10: RET(1080, 2);            /* VERTRES */
+    }
+    RET(0, 2);
+}
+static void sh_CreateGdiObject(Guest* g) { RET(0x000C0001u, 1); }
+static void sh_CreateBitmap(Guest* g) { RET(0x000C0002u, 5); }
+static void sh_GetBkColor(Guest* g) { RET(0xFFFFFFu, 1); }
+static void sh_GetTextColor(Guest* g) { RET(0, 1); }
+static void sh_GetMapMode(Guest* g) { RET(1, 1); } /* MM_TEXT */
+static void sh_SetMapMode(Guest* g) { RET(1, 2); }
+static void sh_SaveDC(Guest* g) { RET(1, 1); }
+static void sh_GetClipBox(Guest* g) { write_rect(ARG(1), 0, 0, 1920, 1080); RET(2, 2); } /* SIMPLEREGION */
+static void sh_GetRgnBox(Guest* g) { write_rect(ARG(1), 0, 0, 0, 0); RET(1, 2); }
+static void sh_ExtSelectClipRgn(Guest* g) { RET(2, 3); }
+static void sh_Escape(Guest* g) { RET(0, 5); }
+static void sh_PtVisible(Guest* g) { RET(1, 3); }
+static void sh_RectVisible(Guest* g) { RET(1, 2); }
+/* the extent and origin calls write their old SIZE/POINT when asked */
+static void sh_extent4(Guest* g) { if (ARG(3)) wr32(ARG(3), 1), wr32(ARG(3) + 4, 1); RET(1, 4); }
+static void sh_extent6(Guest* g) { if (ARG(5)) wr32(ARG(5), 1), wr32(ARG(5) + 4, 1); RET(1, 6); }
+static void sh_extent2(Guest* g) { if (ARG(1)) wr32(ARG(1), 1), wr32(ARG(1) + 4, 1); RET(1, 2); }
+static void sh_origin4(Guest* g) { if (ARG(3)) wr32(ARG(3), 0), wr32(ARG(3) + 4, 0); RET(1, 4); }
+
 const ShimDef ui_shims[] = {
     { "user32.dll", "CreateDialogParamW", sh_CreateDialogParamW },
     { "user32.dll", "CreateDialogIndirectParamW", sh_CreateDialogIndirectParamW },
@@ -1504,6 +2074,107 @@ const ShimDef ui_shims[] = {
     { "user32.dll", "CharNextW", sh_CharNextW },
     { "user32.dll", "SystemParametersInfoW", sh_SystemParametersInfoW },
     { "user32.dll", "GetDesktopWindow", sh_GetDesktopWindow },
+    { "user32.dll", "MonitorFromWindow", sh_MonitorFromWindow },
+    { "user32.dll", "MonitorFromRect", sh_MonitorFromRect },
+    { "user32.dll", "MonitorFromPoint", sh_MonitorFromPoint },
+    { "user32.dll", "GetMonitorInfoW", sh_GetMonitorInfoW },
+    { "user32.dll", "GetMonitorInfoA", sh_GetMonitorInfoW },
+    { "user32.dll", "RegisterClassW", sh_RegisterClassW },
+    { "user32.dll", "RegisterClassExW", sh_RegisterClassExW },
+    { "user32.dll", "UnregisterClassW", sh_UnregisterClassW },
+    { "user32.dll", "GetClassInfoW", sh_GetClassInfoW },
+    { "user32.dll", "GetClassInfoExW", sh_GetClassInfoExW },
+    { "user32.dll", "GetClassLongW", sh_GetClassLongW },
+    { "user32.dll", "GetClassNameW", sh_GetClassNameW },
+    { "user32.dll", "CreateWindowExW", sh_CreateWindowExW },
+    { "user32.dll", "SetWindowsHookExW", sh_SetWindowsHookExW },
+    { "user32.dll", "SetWindowsHookExA", sh_SetWindowsHookExW },
+    { "user32.dll", "UnhookWindowsHookEx", sh_UnhookWindowsHookEx },
+    { "user32.dll", "CallNextHookEx", sh_CallNextHookEx },
+    { "user32.dll", "CallWindowProcW", sh_CallWindowProcW },
+    { "user32.dll", "CallWindowProcA", sh_CallWindowProcW },
+    { "user32.dll", "GetDlgCtrlID", sh_GetDlgCtrlID },
+    { "user32.dll", "IsChild", sh_IsChild },
+    { "user32.dll", "GetTopWindow", sh_GetTopWindow },
+    { "user32.dll", "GetLastActivePopup", sh_GetLastActivePopup },
+    { "user32.dll", "GetNextDlgTabItem", sh_GetNextDlgTabItem },
+    { "user32.dll", "GetNextDlgGroupItem", sh_GetNextDlgTabItem },
+    { "user32.dll", "SetPropW", sh_SetPropW },
+    { "user32.dll", "GetPropW", sh_GetPropW },
+    { "user32.dll", "RemovePropW", sh_RemovePropW },
+    { "user32.dll", "MapDialogRect", sh_MapDialogRect },
+    { "user32.dll", "PostThreadMessageW", sh_PostThreadMessageW },
+    { "user32.dll", "RegisterWindowMessageW", sh_RegisterWindowMessageW },
+    { "user32.dll", "RegisterClipboardFormatW", sh_RegisterWindowMessageW },
+    { "user32.dll", "SendDlgItemMessageA", sh_SendDlgItemMessageW },
+    { "user32.dll", "CopyRect", sh_CopyRect },
+    { "user32.dll", "EqualRect", sh_EqualRect },
+    { "user32.dll", "IsRectEmpty", sh_IsRectEmpty },
+    { "user32.dll", "PtInRect", sh_PtInRect },
+    { "user32.dll", "OffsetRect", sh_OffsetRect },
+    { "user32.dll", "IntersectRect", sh_IntersectRect },
+    { "user32.dll", "GetSysColor", sh_GetSysColor },
+    { "user32.dll", "GetSysColorBrush", sh_GetSysColorBrush },
+    { "user32.dll", "InvalidateRect", sh_InvalidateRect },
+    { "user32.dll", "InvalidateRgn", sh_InvalidateRgn },
+    { "user32.dll", "ValidateRect", sh_ValidateRect },
+    { "user32.dll", "GetCapture", sh_GetCapture },
+    { "user32.dll", "GetMessagePos", sh_GetMessagePos },
+    { "user32.dll", "GetMessageTime", sh_GetMessageTime },
+    { "user32.dll", "MessageBeep", sh_MessageBeep },
+    { "user32.dll", "WinHelpW", sh_WinHelpW },
+    { "user32.dll", "SetWindowContextHelpId", sh_SetWindowContextHelpId },
+    { "user32.dll", "CopyAcceleratorTableW", sh_CopyAcceleratorTableW },
+    { "user32.dll", "CharUpperW", sh_CharUpperW },
+    { "user32.dll", "LoadIconW", sh_LoadIconW },
+    { "user32.dll", "LoadCursorW", sh_LoadCursorW },
+    { "user32.dll", "LoadBitmapW", sh_LoadBitmapW },
+    { "user32.dll", "BeginPaint", sh_BeginPaint },
+    { "user32.dll", "EndPaint", sh_EndPaint },
+    { "user32.dll", "GetWindowDC", sh_GetWindowDC },
+    { "user32.dll", "DrawEdge", sh_ret1_4 },
+    { "user32.dll", "DrawFocusRect", sh_ret1_2 },
+    { "user32.dll", "DrawIcon", sh_ret1_4 },
+    { "user32.dll", "DrawTextExW", sh_ret1_6 },
+    { "user32.dll", "FillRect", sh_ret1_3 },
+    { "user32.dll", "GrayStringW", sh_ret1_9 },
+    { "user32.dll", "TabbedTextOutW", sh_ret1_8 },
+    { "user32.dll", "CheckMenuItem", sh_retm1_3 },
+    { "user32.dll", "EnableMenuItem", sh_retm1_3 },
+    { "user32.dll", "DestroyMenu", sh_ret1_1 },
+    { "user32.dll", "GetMenuItemCount", sh_retm1_1 },
+    { "user32.dll", "GetMenuItemID", sh_retm1_2 },
+    { "user32.dll", "GetMenuState", sh_retm1_3 },
+    { "user32.dll", "GetSubMenu", sh_ret0_2 },
+    { "user32.dll", "ModifyMenuW", sh_ret1_5 },
+    { "user32.dll", "SetMenuItemBitmaps", sh_ret1_5 },
+    { "user32.dll", "GetMenuCheckMarkDimensions", sh_GetMenuCheckMarkDimensions },
+    { "gdi32.dll", "GetDeviceCaps", sh_GetDeviceCaps },
+    { "gdi32.dll", "CreateSolidBrush", sh_CreateGdiObject },
+    { "gdi32.dll", "CreateRectRgnIndirect", sh_CreateGdiObject },
+    { "gdi32.dll", "CreateBitmap", sh_CreateBitmap },
+    { "gdi32.dll", "GetBkColor", sh_GetBkColor },
+    { "gdi32.dll", "GetTextColor", sh_GetTextColor },
+    { "gdi32.dll", "GetMapMode", sh_GetMapMode },
+    { "gdi32.dll", "SetMapMode", sh_SetMapMode },
+    { "gdi32.dll", "SaveDC", sh_SaveDC },
+    { "gdi32.dll", "RestoreDC", sh_ret1_2 },
+    { "gdi32.dll", "GetClipBox", sh_GetClipBox },
+    { "gdi32.dll", "GetRgnBox", sh_GetRgnBox },
+    { "gdi32.dll", "ExtSelectClipRgn", sh_ExtSelectClipRgn },
+    { "gdi32.dll", "Escape", sh_Escape },
+    { "gdi32.dll", "PtVisible", sh_PtVisible },
+    { "gdi32.dll", "RectVisible", sh_RectVisible },
+    { "gdi32.dll", "TextOutW", sh_ret1_5 },
+    { "gdi32.dll", "ExtTextOutW", sh_ret1_8 },
+    { "gdi32.dll", "SetViewportExtEx", sh_extent4 },
+    { "gdi32.dll", "SetWindowExtEx", sh_extent4 },
+    { "gdi32.dll", "SetViewportOrgEx", sh_origin4 },
+    { "gdi32.dll", "OffsetViewportOrgEx", sh_origin4 },
+    { "gdi32.dll", "ScaleViewportExtEx", sh_extent6 },
+    { "gdi32.dll", "ScaleWindowExtEx", sh_extent6 },
+    { "gdi32.dll", "GetViewportExtEx", sh_extent2 },
+    { "gdi32.dll", "GetWindowExtEx", sh_extent2 },
     /* the built-in window procedures, as guest-callable addresses */
     { "user32.dll", "ui_dialog_proc", sh_ui_dialog_proc },
     { "user32.dll", "ui_control_proc", sh_ui_control_proc },
@@ -1515,7 +2186,7 @@ const ShimDef ui_shims[] = {
 void ui_appkit_init(void)
 {
     /* the shims ours replace, for windows that are not ours (registered before this runs) */
-    for (const ShimDef* d = ui_shims; d->name && g_nprev < 64; ++d)
+    for (const ShimDef* d = ui_shims; d->name && g_nprev < 255; ++d)
     {
         g_prev[g_nprev].name = d->name;
         g_prev[g_nprev].fn = thunk_shim(d->dll, d->name);

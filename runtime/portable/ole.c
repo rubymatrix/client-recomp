@@ -310,7 +310,9 @@ static const ShimDef OLE[] = {
     { "oleaut32.dll", "VarUI4FromStr", sh_VarUI4FromStr },
     /* FFXiMain imports OLEAUT32 by ordinal */
     { "oleaut32.dll", "#2", sh_SysAllocString },
+    { "oleaut32.dll", "#4", sh_SysAllocStringLen },
     { "oleaut32.dll", "#6", sh_SysFreeString },
+    { "oleaut32.dll", "#7", sh_SysStringLen },
     { "oleaut32.dll", "#161", sh_LoadTypeLib },
     { "oleaut32.dll", "#163", sh_RegisterTypeLib },
     { "oleaut32.dll", "#277", sh_VarUI4FromStr },

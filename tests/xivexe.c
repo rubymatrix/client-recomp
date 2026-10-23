@@ -14,6 +14,8 @@
 #include <pthread.h>
 #include <pthread/qos.h>
 #endif
+#include <mach-o/dyld.h>
+#include <spawn.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -42,6 +44,8 @@ void dsound_setup(void);
 void ws2_init(void);
 void k32_launch_init(void); /* k32_launch.c */
 void ui_appkit_init(void);  /* ui_appkit.m: after user32_init, whose shims it hands other windows to */
+void webbrowser_init(void); /* webbrowser.m: after ole_init and ui_appkit_init */
+void webbrowser_setup(void);
 void dinput_init(void);
 void dsound_init(void);
 
@@ -64,6 +68,75 @@ static char* dir_of(const char* path)
     return d;
 }
 
+/* --- starting the other programs (ShellExecuteExW, CreateProcessW) ---------------------------------
+ * ffxivboot starts ffxivlogin and ffxivupdater, ffxivupdater restarts its RebootModule, ffxivlogin
+ * starts ffxivgame.exe. Each is the native build beside this one (build/bin/<name>); the game is
+ * xivboot, given its argument through XIV_ARGS and the tick count now, so it decrypts the argument
+ * in the same tick window it was made in (GetTickCount is the system's here, in every program). */
+extern int (*k32_launch_hook)(const char* file, const char* params, const char* dir);
+extern char** environ;
+
+static char g_bin_dir[1024];
+
+static int exists(const char* p) { FILE* f = fopen(p, "rb"); if (f) fclose(f); return f != NULL; }
+
+static int launch(const char* file, const char* params, const char* dir)
+{
+    char host[1024];
+    if (!vfs_host_path(file, host, sizeof host) || !exists(host))
+    {
+        printf("launch: %s is not in the install\n", file);
+        return 0;
+    }
+    const char* base = strrchr(file, '\\') ? strrchr(file, '\\') + 1 : file;
+    char name[64], bin[1200];
+    snprintf(name, sizeof name, "%s", base);
+    char* dot = strrchr(name, '.');
+    if (dot)
+        *dot = 0;
+    for (char* c = name; *c; ++c)
+        *c = (char)(*c >= 'A' && *c <= 'Z' ? *c + 32 : *c);
+    char tick[16], argsenv[4096], tickenv[32];
+    char* argv[5] = { NULL };
+    char** env = environ;
+    char* game_env[512];
+    if (!strcmp(name, "ffxivgame"))
+    {
+        snprintf(bin, sizeof bin, "%s/../FINAL FANTASY XIV.app/Contents/MacOS/xivboot", g_bin_dir);
+        if (getenv("XIV_GAME_BIN")) /* another game binary (or a stand-in, for tests) */
+            snprintf(bin, sizeof bin, "%s", getenv("XIV_GAME_BIN"));
+        else if (!exists(bin))
+            snprintf(bin, sizeof bin, "%s/../xivboot", g_bin_dir);
+        snprintf(tick, sizeof tick, "0x%x", (uint32_t)(rt_monotonic_ns() / 1000000u));
+        snprintf(argsenv, sizeof argsenv, "XIV_ARGS=%s", params);
+        snprintf(tickenv, sizeof tickenv, "XIV_TICK=%s", tick);
+        int n = 0;
+        for (char** e = environ; *e && n < 509; ++e)
+            if (strncmp(*e, "XIV_ARGS=", 9) && strncmp(*e, "XIV_TICK=", 9))
+                game_env[n++] = *e;
+        game_env[n++] = argsenv;
+        game_env[n++] = tickenv;
+        game_env[n] = NULL;
+        env = game_env;
+        argv[0] = "xivboot", argv[1] = host;
+    }
+    else
+    {
+        snprintf(bin, sizeof bin, "%s/%s", g_bin_dir, name);
+        argv[0] = name, argv[1] = host, argv[2] = (char*)params;
+    }
+    if (!exists(bin))
+    {
+        printf("launch: no native build of %s (%s)\n", base, bin);
+        return 0;
+    }
+    pid_t pid;
+    int rc = posix_spawn(&pid, bin, NULL, NULL, argv, env);
+    printf("launch: %s -> %s: %s\n", base, bin, rc ? strerror(rc) : "started");
+    (void)dir;
+    return rc == 0;
+}
+
 static void main_thread(void* arg)
 {
     uint32_t code = guest_call(rt_image_oep, 0, NULL);
@@ -79,7 +152,17 @@ int main(int argc, char** argv)
         printf("usage: xivexe <program.exe> [command line]\n");
         return 2;
     }
+    static char exe_abs[1024]; /* the install by its absolute path: programs started from here are given it */
+    if (realpath(argv[1], exe_abs))
+        argv[1] = exe_abs;
     const char* base = strrchr(argv[1], '/') ? strrchr(argv[1], '/') + 1 : argv[1];
+    {
+        char self[1024];
+        uint32_t n = sizeof self;
+        if (!_NSGetExecutablePath(self, &n) && realpath(self, g_bin_dir))
+            *strrchr(g_bin_dir, '/') = 0;
+        k32_launch_hook = launch;
+    }
     if (!gwin_init())
     {
         printf("cannot reserve the guest window\n");
@@ -128,6 +211,7 @@ int main(int argc, char** argv)
     ws2_init();
     k32_launch_init();
     ui_appkit_init();
+    webbrowser_init();
     vfs_init(GAME_DIR_GUEST);
     reg_init(NULL, 0, NULL);
     rt_set_native_handler(thunk_dispatch);
@@ -148,6 +232,7 @@ int main(int argc, char** argv)
     gt_set_static_tls(tls_start, tls_size, tls_zero);
     dsound_setup();
     dinput_setup();
+    webbrowser_setup();
     gt_unlock();
 
     if (getenv("XIV_MISSING"))

@@ -185,7 +185,7 @@ def xivboot(exe, run_it, extra, debug=False, opt='-O1', pgo=None):
 
 # the launcher programs: no game hooks, their own translation each (tests/xivexe.c)
 EXE_PORTABLE = [p for p in PORTABLE if not re.search(r'xiv_(ui|probe|native|direct_login|groundsnap|discord)\.c$', p)]
-EXE_HOST = [p for p in HOST if 'xaudio2' not in p] + ['runtime/portable/k32_launch.c', 'runtime/portable/ui_appkit.m']
+EXE_HOST = [p for p in HOST if 'xaudio2' not in p] + ['runtime/portable/k32_launch.c', 'runtime/portable/ui_appkit.m', 'runtime/portable/webbrowser.m']
 
 
 def program(exe, name, run_it, extra):
@@ -200,7 +200,7 @@ def program(exe, name, run_it, extra):
     thirdparty.build('sdl3')
     objs += compile_stale(EXE_PORTABLE + EXE_HOST + ['tests/xivexe.c'], 'build/exe/obj', thirdparty.flags('sdl3'))
     os.makedirs(os.path.join(ROOT, 'build/bin'), exist_ok=True)
-    run(['clang', '-o', 'build/bin/' + name, '-mcpu=apple-m1', '-Wl,-U,___llvm_profile_write_file'] + objs + thirdparty.libs('sdl3') + GFX_LIBS + ['-lm', '-lpthread'])
+    run(['clang', '-o', 'build/bin/' + name, '-mcpu=apple-m1', '-Wl,-U,___llvm_profile_write_file'] + objs + thirdparty.libs('sdl3') + GFX_LIBS + ['-framework', 'WebKit', '-lm', '-lpthread'])
     if run_it:
         run(['build/bin/' + name, exe] + extra)
 
