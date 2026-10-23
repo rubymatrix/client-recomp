@@ -187,7 +187,7 @@ def xivboot(exe, run_it, extra, debug=False, opt='-O1', pgo=None):
 
 # the launcher programs: no game hooks, their own translation each (tests/xivexe.c)
 EXE_PORTABLE = [p for p in PORTABLE if not re.search(r'xiv_(ui|probe|native|direct_login|groundsnap|discord)\.c$', p)]
-EXE_HOST = [p for p in HOST if 'xaudio2' not in p] + ['runtime/portable/k32_launch.c', 'runtime/portable/ui_appkit.m', 'runtime/portable/webbrowser.m']
+EXE_HOST = [p for p in HOST if 'xaudio2' not in p] + ['runtime/portable/k32_launch.c', 'runtime/portable/ui_appkit.m', 'runtime/portable/webbrowser.m', 'runtime/portable/winhttp.c']
 
 
 def program_meta(exe, name):

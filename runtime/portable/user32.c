@@ -1963,6 +1963,22 @@ static void sh_DefWindowProcW(Guest* g) { forward_a(g, sh_DefWindowProcA); }
 static void sh_DispatchMessageW(Guest* g) { forward_a(g, sh_DispatchMessageA); }
 static void sh_PeekMessageW(Guest* g) { forward_a(g, sh_PeekMessageA); }
 
+/* GetWindowLongA(hwnd, index) */
+static void sh_GetWindowLongA(Guest* g)
+{
+    Wnd* w = wnd(ARG(0));
+    if (!w)
+        RET(0, 2);
+    switch ((int32_t)ARG(1))
+    {
+    case -4: RET(w->wndproc, 2);                                  /* GWL_WNDPROC */
+    case -16: RET(w->style | (w->visible ? 0x10000000u : 0), 2); /* GWL_STYLE */
+    case -20: RET(w->exstyle, 2);                                 /* GWL_EXSTYLE */
+    case -21: RET(w->userdata, 2);                                /* GWL_USERDATA */
+    }
+    RET(0, 2);
+}
+
 /* SetWindowLongA(hwnd, index, value): returns the previous value */
 static void sh_SetWindowLongA(Guest* g)
 {
@@ -2192,6 +2208,7 @@ static const ShimDef USER32_XIV[] = {
     { "user32.dll", "DispatchMessageW", sh_DispatchMessageW },
     { "user32.dll", "PeekMessageW", sh_PeekMessageW },
     { "user32.dll", "SetWindowLongA", sh_SetWindowLongA },
+    { "user32.dll", "GetWindowLongA", sh_GetWindowLongA },
     { "user32.dll", "SetWindowPos", sh_SetWindowPos },
     { "user32.dll", "SetWindowTextW", sh_SetWindowTextW },
     { "user32.dll", "GetDC", sh_GetDC },

@@ -253,8 +253,7 @@ static void sh_ShellExecuteExW(Guest* g)
     char* params = host_narrow(rd32(p + 20));
     char* dir = host_narrow(rd32(p + 24));
     int ok = k32_launch_hook ? k32_launch_hook(file, params, dir) : 0;
-    rt_log("[recomp] ShellExecuteExW(%s, %.60s%s, in %s): %s\n", file, params, strlen(params) > 60 ? "..." : "", dir,
-        ok ? "started" : "not started");
+    rt_log("[recomp] ShellExecuteExW(%s, %s, in %s): %s\n", file, params, dir, ok ? "started" : "not started");
     wr32(p + 32, ok ? 33u : 2u); /* hInstApp: > 32 success, SE_ERR_FNF */
     wr32(p + 56, 0);             /* hProcess */
     free(file);
@@ -272,6 +271,48 @@ static void sh_CreateActCtxW(Guest* g) { gt_set_error(1814); RET(0xFFFFFFFFu, 1)
 static void sh_ActivateActCtx(Guest* g) { if (ARG(1)) wr32(ARG(1), 0); RET(1, 2); }
 static void sh_DeactivateActCtx(Guest* g) { RET(1, 2); }
 static void sh_ReleaseActCtx(Guest* g) { RET(0, 1); }
+
+/* IsDBCSLeadByteEx(codepage, byte): Shift-JIS (932) lead bytes; the single-byte pages have none */
+static void sh_IsDBCSLeadByteEx(Guest* g)
+{
+    uint32_t b = ARG(1) & 0xFF;
+    RET(ARG(0) == 932 && ((b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC)), 2);
+}
+
+/* ExpandEnvironmentStringsA(src, dst, n): %NAME% from the host's environment */
+static void sh_ExpandEnvironmentStringsA(Guest* g)
+{
+    const char* src = (const char*)GUEST_PTR(ARG(0));
+    char out[4096];
+    size_t k = 0;
+    for (const char* p = src; *p && k < sizeof out - 1;)
+    {
+        const char* end = *p == '%' ? strchr(p + 1, '%') : NULL;
+        if (end)
+        {
+            char name[256];
+            snprintf(name, sizeof name, "%.*s", (int)(end - p - 1), p + 1);
+            const char* v = getenv(name);
+            if (v)
+            {
+                k += (size_t)snprintf(out + k, sizeof out - k, "%s", v);
+                p = end + 1;
+                continue;
+            }
+        }
+        out[k++] = *p++;
+    }
+    out[k] = 0;
+    if (ARG(1) && ARG(2) > k)
+        memcpy(GUEST_PTR(ARG(1)), out, k + 1);
+    RET((uint32_t)k + 1, 3);
+}
+
+static void sh_LockSetForegroundWindow(Guest* g) { RET(1, 1); }
+/* no input method editor here */
+static void sh_ImmGetDefaultIMEWnd(Guest* g) { RET(0, 1); }
+static void sh_ImmIsIME(Guest* g) { RET(0, 1); }
+static void sh_ImmGetIMEFileNameA(Guest* g) { RET(0, 3); }
 
 static void sh_GetUILanguage(Guest* g) { RET(0x0409u, 0); }
 static void sh_HeapSetInformation(Guest* g) { RET(1, 4); }
@@ -665,6 +706,12 @@ static const ShimDef k_shims[] = {
     { "kernel32.dll", "ActivateActCtx", sh_ActivateActCtx },
     { "kernel32.dll", "DeactivateActCtx", sh_DeactivateActCtx },
     { "kernel32.dll", "ReleaseActCtx", sh_ReleaseActCtx },
+    { "kernel32.dll", "IsDBCSLeadByteEx", sh_IsDBCSLeadByteEx },
+    { "kernel32.dll", "ExpandEnvironmentStringsA", sh_ExpandEnvironmentStringsA },
+    { "user32.dll", "LockSetForegroundWindow", sh_LockSetForegroundWindow },
+    { "imm32.dll", "ImmGetDefaultIMEWnd", sh_ImmGetDefaultIMEWnd },
+    { "imm32.dll", "ImmIsIME", sh_ImmIsIME },
+    { "imm32.dll", "ImmGetIMEFileNameA", sh_ImmGetIMEFileNameA },
     { "kernel32.dll", "GetUserDefaultUILanguage", sh_GetUILanguage },
     { "kernel32.dll", "GetSystemDefaultUILanguage", sh_GetUILanguage },
     { "kernel32.dll", "HeapSetInformation", sh_HeapSetInformation },

@@ -18,6 +18,15 @@
 #include "plat.h"
 #include "thunk.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_STATIC
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_BMP
+#define STBI_ONLY_TGA
+#define STBI_NO_STDIO
+#include "../../third_party/stb/stb_image.h"
+
 #define D3D_OK 0u
 #define D3DERR_INVALIDCALL 0x8876086Cu
 #define E_FAIL 0x80004005u
@@ -677,6 +686,107 @@ static void sh_D3DXLoadVolumeFromMemory(Guest* g)
     RET(hr, 11);
 }
 
+/* --- textures from image files in memory (ffxivboot's interface images) ----------------------------- */
+#define D3DFMT_A8R8G8B8 21u
+#define D3DFMT_X8R8G8B8 22u
+#define FOURCC(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+
+/* D3DXCreateTextureFromFileInMemoryEx(device, data, size, w, h, levels, usage, fmt, pool, filter,
+ * mipfilter, colorkey, D3DXIMAGE_INFO*, palette, IDirect3DTexture9**): one level at the image's own
+ * size and format. DDS (DXT1/3/5, 32-bit RGB) is copied as it is; PNG, JPEG, BMP and TGA are decoded
+ * to A8R8G8B8, the colour key (ARGB) made transparent. */
+static void sh_D3DXCreateTextureFromFileInMemoryEx(Guest* g)
+{
+    uint32_t dev = ARG(0), data = ARG(1), size = ARG(2), usage = ARG(6), pool = ARG(8), key = ARG(11), info = ARG(12),
+             out = ARG(14);
+    const uint8_t* src = GUEST_PTR(data);
+    uint32_t w = 0, h = 0, fmt = 0, file_fmt = 0, pitch_src = 0, rows = 0;
+    uint8_t* pixels = NULL; /* decoded BGRA */
+    const uint8_t* copy = NULL;
+    if (out)
+        wr32(out, 0);
+    if (size >= 128 && !memcmp(src, "DDS ", 4))
+    {
+        h = rd32(data + 12), w = rd32(data + 16);
+        uint32_t pf_flags = rd32(data + 80), fourcc = rd32(data + 84), bits = rd32(data + 88);
+        file_fmt = 4; /* D3DXIFF_DDS */
+        copy = src + 128;
+        if (pf_flags & 4) /* DDPF_FOURCC */
+        {
+            fmt = fourcc;
+            uint32_t block = fourcc == FOURCC('D', 'X', 'T', '1') ? 8 : 16;
+            pitch_src = ((w + 3) / 4) * block, rows = (h + 3) / 4;
+        }
+        else if (bits == 32)
+        {
+            fmt = rd32(data + 104) ? D3DFMT_A8R8G8B8 : D3DFMT_X8R8G8B8; /* alpha mask */
+            pitch_src = 4 * w, rows = h;
+        }
+        else
+        {
+            rt_log("[d3dx9] D3DXCreateTextureFromFileInMemoryEx: DDS with %u-bit pixels is not read yet\n", bits);
+            RET(0x8876086Cu, 15); /* D3DERR_INVALIDCALL */
+        }
+    }
+    else
+    {
+        int iw, ih, n;
+        uint8_t* rgba = stbi_load_from_memory(src, (int)size, &iw, &ih, &n, 4);
+        if (!rgba)
+        {
+            rt_log("[d3dx9] D3DXCreateTextureFromFileInMemoryEx: not an image this reads (%02x %02x %02x %02x)\n", src[0],
+                src[1], src[2], src[3]);
+            RET(0x88760B59u, 15); /* D3DXERR_INVALIDDATA */
+        }
+        w = (uint32_t)iw, h = (uint32_t)ih, fmt = D3DFMT_A8R8G8B8;
+        file_fmt = src[0] == 0x89 ? 3 : src[0] == 0xFF ? 1 : src[0] == 'B' ? 0 : 2; /* PNG, JPG, BMP, TGA */
+        pixels = malloc((size_t)w * h * 4);
+        for (uint32_t i = 0; i < w * h; ++i)
+        {
+            uint8_t r = rgba[4 * i], gg = rgba[4 * i + 1], b = rgba[4 * i + 2], a = rgba[4 * i + 3];
+            uint32_t argb = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)gg << 8) | b;
+            if (key && argb == key)
+                a = 0;
+            pixels[4 * i] = b, pixels[4 * i + 1] = gg, pixels[4 * i + 2] = r, pixels[4 * i + 3] = a;
+        }
+        stbi_image_free(rgba);
+        copy = pixels, pitch_src = 4 * w, rows = h;
+    }
+    if (info)
+    {
+        wr32(info, w), wr32(info + 4, h), wr32(info + 8, 1), wr32(info + 12, 1), wr32(info + 16, fmt);
+        wr32(info + 20, 3), wr32(info + 24, file_fmt); /* D3DRTYPE_TEXTURE */
+    }
+    uint32_t ptex = gheap_alloc(4, 1);
+    uint32_t a[8] = { w, h, 1, usage, fmt, pool, ptex, 0 };
+    uint32_t hr = device_call(dev, 23, 8, a); /* CreateTexture */
+    uint32_t tex = rd32(ptex);
+    gheap_free(ptex);
+    if (!hr && tex)
+    {
+        uint32_t lr = gheap_alloc(8, 1);
+        uint32_t lk[5] = { tex, 0, lr, 0, 0 };
+        if (!guest_call(rd32(rd32(tex) + 4 * 19), 5, lk)) /* IDirect3DTexture9::LockRect */
+        {
+            uint32_t pitch = rd32(lr), bits = rd32(lr + 4);
+            for (uint32_t y = 0; y < rows; ++y)
+                memcpy(GUEST_PTR(bits + y * pitch), copy + (size_t)y * pitch_src, pitch_src < pitch ? pitch_src : pitch);
+            uint32_t ul[2] = { tex, 0 };
+            guest_call(rd32(rd32(tex) + 4 * 20), 2, ul); /* UnlockRect */
+        }
+        gheap_free(lr);
+        if (out)
+            wr32(out, tex);
+    }
+    free(pixels);
+    RET(hr, 15);
+}
+
+/* screenshots and debug dumps: not written */
+static void sh_D3DXSaveSurfaceToFileA(Guest* g) { RET(D3D_OK, 5); }
+static void sh_D3DXSaveTextureToFileA(Guest* g) { RET(D3D_OK, 4); }
+static void sh_D3DXSaveSurfaceToFileInMemory(Guest* g) { if (ARG(0)) wr32(ARG(0), 0); RET(0x80004001u, 5); }
+
 static void sh_D3DXSaveSurfaceToFileW(Guest* g)
 {
     rt_log("[d3dx9] D3DXSaveSurfaceToFileW: screenshots are not written yet\n");
@@ -696,6 +806,10 @@ static const ShimDef D3DX9[] = {
     { "d3dx9_41.dll", "D3DXLoadSurfaceFromMemory", sh_D3DXLoadSurfaceFromMemory },
     { "d3dx9_41.dll", "D3DXLoadVolumeFromMemory", sh_D3DXLoadVolumeFromMemory },
     { "d3dx9_41.dll", "D3DXSaveSurfaceToFileW", sh_D3DXSaveSurfaceToFileW },
+    { "d3dx9_41.dll", "D3DXCreateTextureFromFileInMemoryEx", sh_D3DXCreateTextureFromFileInMemoryEx },
+    { "d3dx9_41.dll", "D3DXSaveSurfaceToFileA", sh_D3DXSaveSurfaceToFileA },
+    { "d3dx9_41.dll", "D3DXSaveTextureToFileA", sh_D3DXSaveTextureToFileA },
+    { "d3dx9_41.dll", "D3DXSaveSurfaceToFileInMemory", sh_D3DXSaveSurfaceToFileInMemory },
     CT(QueryInterface), CT(AddRef), CT(Release), CT(GetBufferPointer), CT(GetBufferSize), CT(GetDesc),
     CT(GetConstantDesc), CT(GetSamplerIndex), CT(GetConstant), CT(GetConstantByName), CT(GetConstantElement),
     CT(SetDefaults), CT(SetValue), CT(SetBool), { "d3dx9_41.dll", "ID3DXConstantTable::SetBoolArray", int_array },

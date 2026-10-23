@@ -47,6 +47,7 @@ void ui_appkit_init(void);  /* ui_appkit.m: after user32_init, whose shims it ha
 void webbrowser_init(void); /* webbrowser.m: after ole_init and ui_appkit_init */
 void ui_suppress_controls(const uint32_t* ids, int n);
 void webbrowser_setup(void);
+void winhttp_init(void);    /* winhttp.c: over xiv_misc.c's stubs */
 void dinput_init(void);
 void dsound_init(void);
 
@@ -78,6 +79,7 @@ extern int (*k32_launch_hook)(const char* file, const char* params, const char* 
 extern char** environ;
 
 static char g_bin_dir[1024];
+static char g_install[1024]; /* the host folder mounted as the install (XIV_INSTALL for the programs started) */
 
 static int exists(const char* p) { FILE* f = fopen(p, "rb"); if (f) fclose(f); return f != NULL; }
 
@@ -89,7 +91,14 @@ static int launch(const char* file, const char* params, const char* dir)
         printf("launch: %s is not in the install\n", file);
         return 0;
     }
-    const char* base = strrchr(file, '\\') ? strrchr(file, '\\') + 1 : file;
+    /* the guest's path may mix separators (ffxivboot: "...\\downloads/ffxivupdater.exe") */
+    const char* base = file;
+    for (const char* c = file; *c; ++c)
+        if (*c == '\\' || *c == '/')
+            base = c + 1;
+    char guest[1024];
+    if (!vfs_full_path(file, guest, sizeof guest))
+        snprintf(guest, sizeof guest, "%s", file);
     char name[64], bin[1200];
     snprintf(name, sizeof name, "%s", base);
     char* dot = strrchr(name, '.');
@@ -97,10 +106,21 @@ static int launch(const char* file, const char* params, const char* dir)
         *dot = 0;
     for (char* c = name; *c; ++c)
         *c = (char)(*c >= 'A' && *c <= 'Z' ? *c + 32 : *c);
-    char tick[16], argsenv[4096], tickenv[32];
+    char tick[16], argsenv[4096], tickenv[32], installenv[1100], guestenv[1100];
     char* argv[6] = { NULL };
-    char** env = environ;
-    char* game_env[512];
+    /* the environment, with the install it runs in and its own guest path (a program the
+     * updater runs may live in Documents\\My Games\\...\\downloads, not the install) */
+    char* env[512];
+    int ne = 0;
+    for (char** e = environ; *e && ne < 505; ++e)
+        if (strncmp(*e, "XIV_ARGS=", 9) && strncmp(*e, "XIV_TICK=", 9) && strncmp(*e, "XIV_INSTALL=", 12)
+            && strncmp(*e, "XIV_EXE_GUEST=", 14))
+            env[ne++] = *e;
+    snprintf(installenv, sizeof installenv, "XIV_INSTALL=%s", g_install);
+    snprintf(guestenv, sizeof guestenv, "XIV_EXE_GUEST=%s", guest);
+    env[ne++] = installenv;
+    env[ne++] = guestenv;
+    env[ne] = NULL;
     if (!strcmp(name, "ffxivgame"))
     {
         snprintf(bin, sizeof bin, "%s/../FINAL FANTASY XIV.app/Contents/MacOS/xivboot", g_bin_dir);
@@ -111,14 +131,9 @@ static int launch(const char* file, const char* params, const char* dir)
         snprintf(tick, sizeof tick, "0x%x", (uint32_t)(rt_monotonic_ns() / 1000000u));
         snprintf(argsenv, sizeof argsenv, "XIV_ARGS=%s", params);
         snprintf(tickenv, sizeof tickenv, "XIV_TICK=%s", tick);
-        int n = 0;
-        for (char** e = environ; *e && n < 509; ++e)
-            if (strncmp(*e, "XIV_ARGS=", 9) && strncmp(*e, "XIV_TICK=", 9))
-                game_env[n++] = *e;
-        game_env[n++] = argsenv;
-        game_env[n++] = tickenv;
-        game_env[n] = NULL;
-        env = game_env;
+        env[ne++] = argsenv;
+        env[ne++] = tickenv;
+        env[ne] = NULL;
         argv[0] = "xivboot", argv[1] = host;
     }
     else
@@ -184,7 +199,9 @@ int main(int argc, char** argv)
         printf("cannot reserve the guest window\n");
         return 1;
     }
-    vfs_mount(GAME_DIR_GUEST, dir_of(argv[1]));
+    /* the install: where the program that started this one had it, else the exe's own folder */
+    snprintf(g_install, sizeof g_install, "%s", getenv("XIV_INSTALL") ? getenv("XIV_INSTALL") : dir_of(argv[1]));
+    vfs_mount(GAME_DIR_GUEST, g_install);
     {
         /* "My Documents", shared with the game: My Games\FINAL FANTASY XIV holds the language,
          * region, login cache and patch downloads */
@@ -201,7 +218,10 @@ int main(int argc, char** argv)
 
     gt_init();
     char exe_guest[512];
-    snprintf(exe_guest, sizeof exe_guest, GAME_DIR_GUEST "\\%s", base);
+    if (getenv("XIV_EXE_GUEST"))
+        snprintf(exe_guest, sizeof exe_guest, "%s", getenv("XIV_EXE_GUEST"));
+    else
+        snprintf(exe_guest, sizeof exe_guest, GAME_DIR_GUEST "\\%s", base);
     k32_set_image_name(base);
     k32_init(GAME_DIR_GUEST, exe_guest);
     {
@@ -226,6 +246,7 @@ int main(int argc, char** argv)
     dinput_init();
     ws2_init();
     k32_launch_init();
+    winhttp_init();
     ui_appkit_init();
     if (!strcasecmp(base, "ffxivlogin.exe"))
     {
@@ -240,6 +261,27 @@ int main(int argc, char** argv)
     rt_set_native_handler(thunk_dispatch);
     if (!pe_load(argv[1]))
         return 1;
+    /* XIV_PATCH_CERT=<cert.der>: ffxivboot checks patch torrents' signatures against the X.509
+     * certificate in its BINARY resource 111, Square Enix's; the server's own (meteor-web
+     * PatchTool's patch_cert.der) goes in its place, the exe's code untouched */
+    if (!strcasecmp(base, "ffxivboot.exe") && getenv("XIV_PATCH_CERT"))
+    {
+        size_t n = 0;
+        unsigned char* der = plat_read_file(getenv("XIV_PATCH_CERT"), &n);
+        uint32_t type = gheap_strdup("BINARY");
+        uint32_t entry = der ? pe_find_resource(rt_image_base, type, 111, 0) : 0;
+        if (entry)
+        {
+            uint32_t data = gheap_alloc((uint32_t)n, 0);
+            memcpy(GUEST_PTR(data), der, n);
+            wr32(entry, data - rt_image_base); /* IMAGE_RESOURCE_DATA_ENTRY: OffsetToData (an RVA), Size */
+            wr32(entry + 4, (uint32_t)n);
+            printf("patch certificate: %s (%zu bytes)\n", getenv("XIV_PATCH_CERT"), n);
+        }
+        else
+            printf("patch certificate: cannot use %s\n", getenv("XIV_PATCH_CERT"));
+        free(der);
+    }
 
     gt_lock();
     uint32_t peb = gheap_alloc(0x1000, 1);
