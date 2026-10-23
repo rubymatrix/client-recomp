@@ -239,10 +239,39 @@ static NSRect label_frame(NSTextField* t, NSRect r, uint32_t ss)
 }
 
 /* the AppKit view for a new window (main thread) */
+/* An Edit menu: AppKit sends Cmd-X/C/V/A/Z to text fields (the login page's) through the main
+ * menu's items, and SDL's menu has none (main thread, once) */
+static void add_edit_menu(void)
+{
+    NSMenu* bar = [NSApp mainMenu];
+    if (!bar)
+    {
+        bar = [[[NSMenu alloc] init] autorelease];
+        [NSApp setMainMenu:bar];
+    }
+    if ([bar itemWithTitle:@"Edit"])
+        return;
+    NSMenu* edit = [[[NSMenu alloc] initWithTitle:@"Edit"] autorelease];
+    [edit addItemWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"];
+    NSMenuItem* redo = [edit addItemWithTitle:@"Redo" action:@selector(redo:) keyEquivalent:@"z"];
+    [redo setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagShift];
+    [edit addItem:[NSMenuItem separatorItem]];
+    [edit addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
+    [edit addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
+    [edit addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
+    [edit addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
+    NSMenuItem* item = [[[NSMenuItem alloc] initWithTitle:@"Edit" action:NULL keyEquivalent:@""] autorelease];
+    [item setSubmenu:edit];
+    [bar addItem:item];
+}
+
 static void make_view(UiWnd* w)
 {
     if (!g_target)
+    {
         g_target = [[UiTarget alloc] init];
+        add_edit_menu();
+    }
     if (w->kind == UK_DIALOG)
     {
         NSRect r = NSMakeRect(w->x, screen_h() - w->y - w->h, w->w, w->h);
