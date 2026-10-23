@@ -43,7 +43,7 @@ WANT_UPDATER=2e83ae594382e49ec0d41748b6a000e5cd06b8f750bd33fbd7542a7c44b5d836
 
 INSTALL="$DIR/install" DOCS="$DIR/documents" APPS="$DIR/apps" SRC="$DIR/source" LOG="$DIR/e2e.log"
 mkdir -p "$DIR" "$DOCS" "$APPS"
-T0=$(date +%s) FAILED=0
+T0=$(date +%s) FAILED=0 COMPLETE=0
 say()  { printf '%s\n' "$*" | tee -a "$LOG"; }
 stage_t=$T0
 result() { # result <PASS|FAIL> <stage> <detail>
@@ -63,6 +63,7 @@ wait_for() {
 }
 finish() {
     pkill -f "$INSTALL/" 2>/dev/null
+    [ $COMPLETE = 1 ] || FAILED=1  # stopped before the last stage
     rm -f "$DIR/signin.js"
     say "$( [ $FAILED = 0 ] && echo PASSED || echo FAILED ) in $(( $(date +%s) - T0 ))s; log $LOG"
     [ $KEEP = 1 ] || [ $FAILED = 1 ] || rm -rf "$INSTALL" "$SRC/build" "$SRC/generated"
@@ -135,3 +136,4 @@ case "$(lobby)" in
     *"Invalid session"*) result FAIL lobby "the lobby refused the session" ;;
     *) result FAIL lobby "the game never reached the lobby (see $RUNLOG)" ;;
 esac
+COMPLETE=1

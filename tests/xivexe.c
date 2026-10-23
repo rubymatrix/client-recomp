@@ -15,6 +15,7 @@
 #include <pthread/qos.h>
 #endif
 #include <mach-o/dyld.h>
+#include <mach/machine.h>
 #include <spawn.h>
 #include <stdlib.h>
 #include <string.h>
@@ -163,6 +164,11 @@ static int launch(const char* file, const char* params, const char* dir)
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    /* the arm64 slice of a universal binary (the runner's Python), whatever this process was
+     * started as: its packages are arm64 only */
+    cpu_type_t arm64 = CPU_TYPE_ARM64;
+    size_t got = 0;
+    posix_spawnattr_setbinpref_np(&attr, 1, &arm64, &got);
     pid_t pid;
     int rc = posix_spawn(&pid, bin, NULL, &attr, argv, env);
     posix_spawnattr_destroy(&attr);

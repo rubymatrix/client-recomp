@@ -112,6 +112,10 @@ APP_PLIST = {
     'LSApplicationCategoryType': 'public.app-category.role-playing-games',
     'LSSupportsGameMode': True,
     'NSHighResolutionCapable': True,
+    # the launcher is a script, which macOS may otherwise start under Rosetta: the Python it runs
+    # (and the recompiler's arm64-only libraries) must be native
+    'LSArchitecturePriority': ['arm64'],
+    'LSRequiresNativeExecution': True,
 }
 
 
@@ -135,7 +139,7 @@ def make_app(app_dir, install, server, cert, account_url, test_env):
         env += 'export %s="%s"\n' % (k, v)
     with open(launcher, 'w') as f:
         f.write('#!/bin/sh\n# FINAL FANTASY XIV: the native ffxivboot of this install (tools/xiv_install.py)\n' + env +
-                'exec "%s" "%s" ffxivboot "%s" >> "%s" 2>&1\n' % (
+                'exec /usr/bin/arch -arm64 "%s" "%s" ffxivboot "%s" >> "%s" 2>&1\n' % (
                     os.path.join(ROOT, '.venv', 'bin', 'python'), os.path.join(HERE, 'xiv_run.py'),
                     os.path.join(install, 'ffxivboot.exe'), os.path.join(ROOT, 'build', 'run.log')))
     os.chmod(launcher, 0o755)
