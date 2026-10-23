@@ -98,7 +98,7 @@ static int launch(const char* file, const char* params, const char* dir)
     for (char* c = name; *c; ++c)
         *c = (char)(*c >= 'A' && *c <= 'Z' ? *c + 32 : *c);
     char tick[16], argsenv[4096], tickenv[32];
-    char* argv[5] = { NULL };
+    char* argv[6] = { NULL };
     char** env = environ;
     char* game_env[512];
     if (!strcmp(name, "ffxivgame"))
@@ -126,7 +126,17 @@ static int launch(const char* file, const char* params, const char* dir)
         snprintf(bin, sizeof bin, "%s/%s", g_bin_dir, name);
         argv[0] = name, argv[1] = host, argv[2] = (char*)params;
     }
-    if (!exists(bin))
+    /* through tools/xiv_run.py when the sources are beside this build: it rebuilds a program whose
+     * exe the updater replaced (XIV_GAME_BIN, a stand-in for tests, is started as it is) */
+    char python[1200], runner[1200];
+    snprintf(python, sizeof python, "%s/../../.venv/bin/python", g_bin_dir);
+    snprintf(runner, sizeof runner, "%s/../../tools/xiv_run.py", g_bin_dir);
+    if (!getenv("XIV_GAME_BIN") && exists(python) && exists(runner))
+    {
+        snprintf(bin, sizeof bin, "%s", python);
+        argv[0] = "python3", argv[1] = runner, argv[2] = name, argv[3] = host, argv[4] = (char*)params;
+    }
+    else if (!exists(bin))
     {
         printf("launch: no native build of %s (%s)\n", base, bin);
         return 0;

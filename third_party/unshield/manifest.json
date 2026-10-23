@@ -1,0 +1,32 @@
+{
+ "version": "unshield 1.6.2 (libunshield only; https://github.com/twogood/unshield, tag 1.6.2, sha256 a937ef596ad94d16e7ed2c8553ad7be305798dcdcfd65ae60210b1e54ab51a2f)",
+ "public": [
+  "lib"
+ ],
+ "frameworks": [],
+ "weak_frameworks": [],
+ "groups": [
+  {
+   "include": [
+    ".",
+    "lib"
+   ],
+   "idirafter": [],
+   "flags": [
+    "-DHAVE_CONFIG_H",
+    "-w"
+   ],
+   "sources": [
+    "lib/component.c",
+    "lib/converter.c",
+    "lib/directory.c",
+    "lib/file.c",
+    "lib/file_group.c",
+    "lib/helper.c",
+    "lib/libunshield.c",
+    "lib/log.c",
+    "lib/md5/md5c.c"
+   ]
+  }
+ ]
+}

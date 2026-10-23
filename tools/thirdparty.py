@@ -20,7 +20,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-NAMES = ('sdl3', 'mbedtls', 'luajit', 'imgui', 'luasocket', 'lfs', 'sqlite')
+NAMES = ('sdl3', 'mbedtls', 'luajit', 'imgui', 'luasocket', 'lfs', 'sqlite', 'unshield')
 MIN_MACOS = '12.0'
 
 

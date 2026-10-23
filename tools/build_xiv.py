@@ -179,6 +179,8 @@ def xivboot(exe, run_it, extra, debug=False, opt='-O1', pgo=None):
          '-Wl,-cache_path_lto,build/xiv/lto-cache', '-Wl,-mllvm,-threads=%d' % (os.cpu_count() or 4)]
         + objs + thirdparty.libs('sdl3') + GFX_LIBS + ['-lm', '-lpthread'])
     xiv_bundle()
+    with open(os.path.join(ROOT, 'build', 'xivboot.sha256'), 'w') as f:  # which ffxivgame.exe (xiv_run.py)
+        f.write(sha256(exe) + '\n')
     if run_it:
         run(['build/xivboot', exe] + extra)
 
@@ -188,19 +190,43 @@ EXE_PORTABLE = [p for p in PORTABLE if not re.search(r'xiv_(ui|probe|native|dire
 EXE_HOST = [p for p in HOST if 'xaudio2' not in p] + ['runtime/portable/k32_launch.c', 'runtime/portable/ui_appkit.m', 'runtime/portable/webbrowser.m']
 
 
+def program_meta(exe, name):
+    """The address map for this build of a launcher program: the meta/<name>.<build>.meta.json whose
+    sha256 is the exe's (the disc's builds and the patched ones differ), and that sha256."""
+    want = sha256(exe)
+    for p in sorted(glob.glob(os.path.join(ROOT, 'meta', name + '.*.meta.json'))):
+        with open(p) as f:
+            m = re.search(r'"sha256":\s*"([0-9a-f]{64})"', f.read(4096))
+        if m and m.group(1) == want:
+            return os.path.relpath(p, ROOT), want
+    raise SystemExit('%s: no address map for this build (sha256 %s) in meta/' % (exe, want))
+
+
+def program_current(exe, name):
+    """Whether build/bin/<name> was built from this exe (build/bin/<name>.sha256 says what from)."""
+    stamp = os.path.join(ROOT, 'build', 'bin', name + '.sha256')
+    return (os.path.exists(os.path.join(ROOT, 'build', 'bin', name)) and os.path.exists(stamp)
+            and open(stamp).read().strip() == sha256(exe))
+
+
 def program(exe, name, run_it, extra):
-    """build/bin/<name> (ffxivboot, ffxivlogin, ffxivupdater): meta/<name>.1.23b.meta.json translated
-    into generated/<name>, linked with the shims the game uses."""
-    gen_dir = 'generated/' + name
+    """build/bin/<name> (ffxivboot, ffxivlogin, ffxivupdater): the exe translated with its address map
+    into generated/<name>-<sha256 prefix>, linked with the shims the game uses. The updater replaces
+    these programs; build/bin/<name>.sha256 records which build this one is, for program_current."""
+    meta_path, want = program_meta(exe, name)
+    tag = '%s-%s' % (name, want[:12])
+    gen_dir = 'generated/' + tag
     if not os.path.exists(os.path.join(ROOT, gen_dir, 'table.c')):
-        run([sys.executable, 'recomp/recomp.py', '--meta', 'meta/%s.1.23b.meta.json' % name, '--image', exe,
+        run([sys.executable, 'recomp/recomp.py', '--meta', meta_path, '--image', exe,
              '--retail', exe, '--out', gen_dir, '--all'])
     gen = sorted(os.path.relpath(p, ROOT) for p in glob.glob(os.path.join(ROOT, gen_dir, '*.c')))
-    objs = compile_stale(gen, 'build/%s/gen' % name, gen_flags=['-O2', '-mcpu=apple-m1', '-w'])
+    objs = compile_stale(gen, 'build/%s/gen' % tag, gen_flags=['-O2', '-mcpu=apple-m1', '-w'])
     thirdparty.build('sdl3')
     objs += compile_stale(EXE_PORTABLE + EXE_HOST + ['tests/xivexe.c'], 'build/exe/obj', thirdparty.flags('sdl3'))
     os.makedirs(os.path.join(ROOT, 'build/bin'), exist_ok=True)
     run(['clang', '-o', 'build/bin/' + name, '-mcpu=apple-m1', '-Wl,-U,___llvm_profile_write_file'] + objs + thirdparty.libs('sdl3') + GFX_LIBS + ['-framework', 'WebKit', '-lm', '-lpthread'])
+    with open(os.path.join(ROOT, 'build', 'bin', name + '.sha256'), 'w') as f:
+        f.write(want + '\n')
     if run_it:
         run(['build/bin/' + name, exe] + extra)
 
@@ -234,8 +260,10 @@ def xiv_bundle():
     if os.path.lexists(exe):
         os.remove(exe)
     os.link(os.path.join(ROOT, 'build', 'xivboot'), exe)
+    # an app tools/xiv_install.py made starts ffxivboot (its "FINAL FANTASY XIV" launcher): keep that
+    launcher = os.path.exists(os.path.join(macos, 'FINAL FANTASY XIV'))
     with open(os.path.join(ROOT, XIV_APP, 'Contents', 'Info.plist'), 'w') as f:
-        f.write(XIV_PLIST)
+        f.write(XIV_PLIST.replace('<string>xivboot</string>', '<string>FINAL FANTASY XIV</string>') if launcher else XIV_PLIST)
 
 
 def main():
