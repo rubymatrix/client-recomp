@@ -264,6 +264,12 @@ static int g_worker;
 
 static void notify(Handle* r, uint32_t hreq, uint32_t status, uint32_t info, uint32_t info_len)
 {
+    static int log = -1;
+    if (log < 0)
+        log = getenv("XIV_WINHTTP_LOG") != NULL;
+    if (log)
+        rt_log("[winhttp] %05x status %#x info %08x len %u (dword %u)%s\n", hreq, status, info, info_len,
+            info && info_len == 4 ? rd32(info) : 0, r->callback && (r->notify & status) ? "" : " not delivered");
     if (!r->callback || !(r->notify & status))
         return;
     uint32_t a[5] = { hreq, r->context, status, info, info_len };
@@ -395,6 +401,18 @@ static void sh_WinHttpWorker(Guest* g)
 /* async: queued for the worker (started on first use); sync: done now */
 static void submit(Handle* r, Job* j)
 {
+    /* data already here (or the body's end): done now, as WinHTTP completes such a call before it
+     * returns. ffxivboot reads 1 KB at a time and handles each callback on its next frame
+     * otherwise. */
+    if ((j->kind == API_QUERY_DATA_AVAILABLE || j->kind == API_READ_DATA)
+        && (r->buf_len || r->eof || r->remaining == 0))
+    {
+        run_job(j);
+        free(j->send);
+        return;
+    }
+    if (getenv("XIV_WINHTTP_LOG"))
+        rt_log("[winhttp] job %u on %05x (buffer %08x, %u bytes)\n", j->kind, j->req, j->buf, j->n);
     if (!(r->flags & FLAG_ASYNC))
     {
         run_job(j);

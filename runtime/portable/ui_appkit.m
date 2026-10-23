@@ -1623,6 +1623,11 @@ static uint32_t register_class(uint32_t namep, uint32_t proc, uint32_t style, ui
         return 0;
     snprintf(c->name, sizeof c->name, "%s", name);
     c->proc = proc, c->style = style, c->extra = extra;
+    /* and with user32.c, whose windows the top-level ones are (ui_create_window) */
+    uint32_t wc = gheap_alloc(40, 1), gname = gheap_strdup(name);
+    wr32(wc, style), wr32(wc + 4, proc), wr32(wc + 36, gname);
+    guest_call(thunk_for("user32.dll", "RegisterClassA"), 1, &wc);
+    gheap_free(wc);
     return 0xC100u + (uint32_t)(c - g_classes);
 }
 
@@ -1711,10 +1716,29 @@ uint32_t ui_create_window(uint32_t exstyle, const char* cls, uint32_t name, uint
         rt_log("[ui] CreateWindowExW: class %s is not registered\n", cls);
         return 0;
     }
+    int child = (style & WS_CHILD) != 0;
+    if (!child && kind == UK_OTHER)
+    {
+        /* a program's own top-level window (ffxivboot's, which Direct3D draws in): user32.c's SDL
+         * window, as the game's is */
+        uint32_t gcls = gheap_strdup(cls), gname = 0;
+        if (name >= 0x10000u)
+        {
+            char n[256];
+            guest_name(name, n, sizeof n);
+            gname = gheap_strdup(n);
+        }
+        uint32_t a[12] = { exstyle, gcls, gname, style, (uint32_t)x, (uint32_t)y, (uint32_t)cx, (uint32_t)cy, parent, menu,
+            hinst, params };
+        uint32_t h = guest_call(thunk_for("user32.dll", "CreateWindowExA"), 12, a);
+        gheap_free(gcls);
+        if (gname)
+            gheap_free(gname);
+        return h;
+    }
     UiWnd* w = ui_new();
     if (!w)
         return 0;
-    int child = (style & WS_CHILD) != 0;
     w->kind = kind == UK_DIALOG ? UK_OTHER : kind; /* a #32770 made by hand has no template */
     snprintf(w->cls, sizeof w->cls, "%s", cls);
     w->style = style & ~WS_VISIBLE;
@@ -2234,6 +2258,14 @@ void ui_appkit_init(void)
     {
         g_prev[g_nprev].name = d->name;
         g_prev[g_nprev].fn = thunk_shim(d->dll, d->name);
+        /* user32.c serves its windows with the A calls only: the W one without strings is the same */
+        size_t n = strlen(d->name);
+        if (!g_prev[g_nprev].fn && n > 1 && d->name[n - 1] == 'W')
+        {
+            char a[64];
+            snprintf(a, sizeof a, "%.*sA", (int)(n - 1), d->name);
+            g_prev[g_nprev].fn = thunk_shim(d->dll, a);
+        }
         g_nprev++;
     }
     g_prev[g_nprev].name = "SystemParametersInfoA";
