@@ -1225,6 +1225,19 @@ static void sh_GetMessageA(Guest* g)
     RET(m.message != WM_QUIT, 4);
 }
 
+int user32_post(uint32_t tid, uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp) { return post(tid, hwnd, msg, wp, lp); }
+
+int user32_take(uint32_t tid, uint32_t hwnd, uint32_t lo, uint32_t hi, int remove, uint32_t msg_out)
+{
+    Msg m;
+    if (!take(tid, hwnd, lo, hi, remove, &m))
+        return 0;
+    write_msg(msg_out, &m);
+    return 1;
+}
+
+void user32_pump(void) { pump(); }
+
 /* WM_CHAR comes from SDL's text input, and the control characters from pump() */
 static void sh_TranslateMessage(Guest* g) { RET(0, 1); }
 

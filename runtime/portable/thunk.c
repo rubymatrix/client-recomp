@@ -82,6 +82,16 @@ static Shim find_shim(const char* dll, const char* name)
 
 Shim thunk_shim(const char* dll, const char* name) { return find_shim(dll, name); }
 
+void thunk_override(const ShimDef* defs)
+{
+    if (g_ntables < sizeof g_tables / sizeof g_tables[0])
+    {
+        memmove(&g_tables[1], &g_tables[0], g_ntables * sizeof g_tables[0]);
+        g_tables[0] = defs;
+        g_ntables++;
+    }
+}
+
 uint32_t thunk_for(const char* dll, const char* name)
 {
     char full[96];

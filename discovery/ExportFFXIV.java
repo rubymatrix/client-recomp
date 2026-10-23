@@ -117,16 +117,25 @@ public class ExportFFXIV extends GhidraScript {
             }
             if (bound != null && bound < 4096) {
                 long n = bound + 1;
+                boolean ok = true;
                 if (idxTable != null) {
                     int max = 0;
-                    for (long i = 0; i <= bound; i++)
-                        max = Math.max(max, mem.getByte(space.getAddress(idxTable + i)) & 0xFF);
+                    for (long i = 0; i <= bound && ok; i++) {
+                        Address ia = space.getAddress(idxTable + i);
+                        // a guard read off a stack slot, not an index table (ffxivlogin.exe)
+                        if (!mem.contains(ia)) ok = false;
+                        else max = Math.max(max, mem.getByte(ia) & 0xFF);
+                    }
                     n = max + 1;
                 }
                 List<Long> read = new ArrayList<>();
-                boolean ok = true;
-                for (long i = 0; i < n; i++) {
-                    long v = mem.getInt(space.getAddress(table + 4 * i)) & 0xFFFFFFFFL;
+                for (long i = 0; i < n && ok; i++) {
+                    Address ta = space.getAddress(table + 4 * i);
+                    if (!mem.contains(ta) || !mem.contains(ta.add(3))) {
+                        ok = false;
+                        break;
+                    }
+                    long v = mem.getInt(ta) & 0xFFFFFFFFL;
                     Address a = space.getAddress(v);
                     // Cases live near their jump: a far target means the guard is not this switch's.
                     if (!text.contains(a) || Math.abs(a.subtract(ins.getAddress())) > 0x10000) {

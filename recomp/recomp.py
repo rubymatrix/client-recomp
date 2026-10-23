@@ -251,6 +251,8 @@ class Program:
                         count = n + 1
                     break
             break
+        if idx_table is not None and not 0 <= idx_table - self.base <= len(self.image) - (count or 0):
+            idx_table = None  # a byte load off the stack, not an index table (ffxivupdater.exe)
         if count is not None and idx_table is not None:
             count = max(self.image[idx_table - self.base + i] for i in range(count)) + 1
         targets = []

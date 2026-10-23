@@ -55,3 +55,10 @@ void user32_force_cursor(int on, float x, float y);
 int user32_set_subclass(uint32_t hwnd, uint32_t proc, uint32_t id, uint32_t ref);
 int user32_remove_subclass(uint32_t hwnd, uint32_t proc, uint32_t id);
 uint32_t user32_def_subclass(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp);
+
+/* The message queues, for windows another module owns (ui_appkit.m): post to a thread's queue;
+ * take the first message for hwnd (0 any) in [lo, hi] (0,0 any) into a guest MSG, removing it if
+ * asked (1 if there was one); pump the SDL events into the queues. */
+int user32_post(uint32_t tid, uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp);
+int user32_take(uint32_t tid, uint32_t hwnd, uint32_t lo, uint32_t hi, int remove, uint32_t msg_out);
+void user32_pump(void);

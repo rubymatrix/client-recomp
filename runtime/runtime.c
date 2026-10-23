@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* rt_table (table.c, generated): every translated function, sorted by guest address. */
 int rt_index(uint32_t addr)
@@ -134,6 +135,18 @@ void rt_call_indirect(Guest* g, uint32_t target)
      * The platform layer decides; without one this is fatal. */
     if (g_native && g_native(g, target))
         return;
+    /* ATL's window procedure thunk, x86 code ATL/WTL write into the heap at run time:
+     * mov dword [esp+4], <this> ; jmp <proc>. It swaps the HWND argument for the object. */
+    const uint8_t* t = (const uint8_t*)GUEST_PTR(target);
+    if (t[0] == 0xC7 && t[1] == 0x44 && t[2] == 0x24 && t[3] == 0x04 && t[8] == 0xE9)
+    {
+        uint32_t self, rel;
+        memcpy(&self, t + 4, 4);
+        memcpy(&rel, t + 9, 4);
+        *(uint32_t*)GUEST_PTR(g->esp + 4) = self;
+        rt_call_indirect(g, target + 13 + rel);
+        return;
+    }
     rt_fatal(g, target, "indirect call/jump to an address with no translation");
 }
 

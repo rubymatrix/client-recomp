@@ -183,6 +183,28 @@ def xivboot(exe, run_it, extra, debug=False, opt='-O1', pgo=None):
         run(['build/xivboot', exe] + extra)
 
 
+# the launcher programs: no game hooks, their own translation each (tests/xivexe.c)
+EXE_PORTABLE = [p for p in PORTABLE if not re.search(r'xiv_(ui|probe|native|direct_login|groundsnap|discord)\.c$', p)]
+EXE_HOST = [p for p in HOST if 'xaudio2' not in p] + ['runtime/portable/k32_launch.c', 'runtime/portable/ui_appkit.m']
+
+
+def program(exe, name, run_it, extra):
+    """build/bin/<name> (ffxivboot, ffxivlogin, ffxivupdater): meta/<name>.1.23b.meta.json translated
+    into generated/<name>, linked with the shims the game uses."""
+    gen_dir = 'generated/' + name
+    if not os.path.exists(os.path.join(ROOT, gen_dir, 'table.c')):
+        run([sys.executable, 'recomp/recomp.py', '--meta', 'meta/%s.1.23b.meta.json' % name, '--image', exe,
+             '--retail', exe, '--out', gen_dir, '--all'])
+    gen = sorted(os.path.relpath(p, ROOT) for p in glob.glob(os.path.join(ROOT, gen_dir, '*.c')))
+    objs = compile_stale(gen, 'build/%s/gen' % name, gen_flags=['-O2', '-mcpu=apple-m1', '-w'])
+    thirdparty.build('sdl3')
+    objs += compile_stale(EXE_PORTABLE + EXE_HOST + ['tests/xivexe.c'], 'build/exe/obj', thirdparty.flags('sdl3'))
+    os.makedirs(os.path.join(ROOT, 'build/bin'), exist_ok=True)
+    run(['clang', '-o', 'build/bin/' + name, '-mcpu=apple-m1', '-Wl,-U,___llvm_profile_write_file'] + objs + thirdparty.libs('sdl3') + GFX_LIBS + ['-lm', '-lpthread'])
+    if run_it:
+        run(['build/bin/' + name, exe] + extra)
+
+
 XIV_APP = 'build/FINAL FANTASY XIV.app'
 XIV_PLIST = '''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -218,18 +240,21 @@ def xiv_bundle():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('target', choices=('meta', 'translate', 'xivboot'))
+    ap.add_argument('target', choices=('meta', 'translate', 'xivboot', 'exe'))
     ap.add_argument('--exe', required=True, help='ffxivgame.exe (1.23b, 2012.09.19.0001)')
     ap.add_argument('--ghidra', help='meteor-decomp/build/ghidra (meta)')
     ap.add_argument('--run', action='store_true')
     ap.add_argument('--debug', action='store_true', help='build/xivboot-dbg: -g translation, no LTO (for lldb)')
     ap.add_argument('--opt', default='-O1', help='optimization for the translation in --debug builds (-O0 keeps every register local visible but runs slowly)')
     ap.add_argument('--pgo', choices=('gen', 'use'), help='profile-guided optimization: an instrumented build, or one using its profile')
+    ap.add_argument('--name', help='exe: which launcher program (ffxivboot, ffxivlogin, ffxivupdater); default from --exe')
     ap.add_argument('rest', nargs='*')
     a = ap.parse_args()
     exe = os.path.abspath(a.exe)
     if a.target == 'meta':
         meta(exe, a.ghidra or os.path.join(ROOT, '..', 'decomp', 'build', 'ghidra'))
+    elif a.target == 'exe':
+        program(exe, a.name or os.path.splitext(os.path.basename(exe))[0], a.run, a.rest)
     elif a.target == 'translate':
         translate(exe)
     else:
