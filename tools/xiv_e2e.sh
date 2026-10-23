@@ -3,7 +3,10 @@
 # of its own: a fresh clone of this checkout, a fresh install, Documents and app folder. Your own
 # install, settings and app are not touched.
 #
-#   tools/xiv_e2e.sh [--dir <test folder>] [--keep]
+#   tools/xiv_e2e.sh [--dir <test folder>] [--keep] [--resume]
+#
+# --resume picks up a run in --dir that was stopped after its bootstrap (the install carries on by
+# itself): it checks stages 3 to 6.
 #
 # Needs: the disc mounted; the server running on this Mac (meteor-web for the version check, patches
 # and login page; Meteor's lobby); the commits to test committed (the clone is of HEAD).
@@ -20,11 +23,12 @@
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WS="$(dirname "$HERE")"
-DIR="" KEEP=0
+DIR="" KEEP=0 RESUME=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --dir) DIR="$2"; shift 2 ;;
         --keep) KEEP=1; shift ;;
+        --resume) RESUME=1; shift ;;
         -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -53,7 +57,8 @@ result() { # result <PASS|FAIL> <stage> <detail>
     [ "$1" = FAIL ] && FAILED=1
     return 0
 }
-# wait_for <timeout s> <command...>: polls every 10 s
+# wait_for <timeout s> <command...>: runs the command every 10 s until it succeeds (give it a function,
+# so what it checks is read again each time)
 wait_for() {
     local limit=$(( $(date +%s) + $1 )); shift
     until "$@"; do
@@ -71,7 +76,8 @@ finish() {
 }
 trap finish EXIT
 
-say "end-to-end test in $DIR ($(git -C "$HERE" log --oneline -1))"
+say "end-to-end test in $DIR ($(git -C "$HERE" log --oneline -1))$( [ $RESUME = 1 ] && echo ', resumed')"
+if [ $RESUME = 0 ]; then
 DISC=$(for v in /Volumes/*; do [ -f "$v/ffxivsetup.exe" ] && [ -f "$v/data/data1.hdr" ] && echo "$v" && break; done)
 [ -n "$DISC" ] || { result FAIL setup "the FINAL FANTASY XIV disc is not mounted"; exit; }
 curl -sf -o /dev/null "http://$SERVER:54996/patch/vercheck/ffxiv/win32/release/boot/2010.09.18.0000" \
@@ -90,7 +96,7 @@ var b=document.querySelector('button[name=login]');if(b)b.click();else u.form.su
     json.dumps(acct['user']), json.dumps(acct['password'])))
 PY
 chmod 600 "$DIR/signin.js"
-LOBBY_START=$(wc -l < "$LOBBY_LOG")
+wc -l < "$LOBBY_LOG" | tr -d ' ' > "$DIR/lobby_start"  # the lobby lines before this run
 result PASS setup "disc $DISC, server $SERVER"
 
 # 1: the bootstrap, as a player runs it, from a clone of this checkout
@@ -104,14 +110,18 @@ XIV_REPO="file://$HERE" XIV_BRANCH="$(git -C "$HERE" branch --show-current)" XIV
 # 2: the disc's files
 n=$(find "$INSTALL" -type f | wc -l | tr -d ' ')
 [ "$n" -ge 137765 ] && result PASS unpack "$n files" || result FAIL unpack "$n files, want 137765"
+fi
+LOBBY_START=$(( $(cat "$DIR/lobby_start") + 1 ))
 
 # 3: the boot patch, and boot rebuilt for its new build
 ver() { cat "$INSTALL/$1.ver" 2>/dev/null; }
-wait_for 1800 test "$(ver boot)" = 2010.09.18.0000 \
+boot_patched() { [ "$(ver boot)" = 2010.09.18.0000 ]; }
+game_patched() { [ "$(ver game)" = 2012.09.19.0001 ]; }
+wait_for 1800 boot_patched \
     && result PASS "boot patch" "boot.ver $(ver boot)" || { result FAIL "boot patch" "boot.ver $(ver boot)"; exit; }
 
 # 4: every game patch, and the programs they bring as retail has them
-wait_for 5400 test "$(ver game)" = 2012.09.19.0001 \
+wait_for 5400 game_patched \
     || { result FAIL "game patch" "game.ver $(ver game)"; exit; }
 sha() { shasum -a 256 "$INSTALL/$1" 2>/dev/null | cut -d' ' -f1; }
 bad=""
@@ -130,7 +140,8 @@ wait_for 2400 signed_in && result PASS sign-in "login started the game" \
 
 # 6: the lobby took the session and sent the characters
 lobby() { tail -n +"$LOBBY_START" "$LOBBY_LOG" | grep -E "Get characters|Invalid session" | head -1; }
-wait_for 3600 test -n "$(lobby)"
+lobby_answered() { [ -n "$(lobby)" ]; }
+wait_for 3600 lobby_answered
 case "$(lobby)" in
     *"Get characters"*) result PASS lobby "character list sent" ;;
     *"Invalid session"*) result FAIL lobby "the lobby refused the session" ;;
