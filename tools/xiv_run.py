@@ -1,13 +1,20 @@
-"""Start one of FINAL FANTASY XIV's programs as its native build, rebuilding it first when the install's
-exe is not the build it was made from.
+"""Start one of FINAL FANTASY XIV's programs as its native build, and build the others in the background
+as the patches bring them.
   python3 tools/xiv_run.py <ffxivboot|ffxivlogin|ffxivupdater|ffxivgame> <the install's exe> [argument]
+  python3 tools/xiv_run.py --watch <install folder>
 
 FINAL FANTASY XIV.app starts ffxivboot through this, and the programs start each other through it
-(tests/xivexe.c, XIV_RUNNER). The updater replaces ffxivboot.exe and ffxivupdater.exe, and its
-patches bring ffxivlogin.exe and ffxivgame.exe: each build has its own address map in meta/, and a
-program whose exe changed is translated and compiled again here (minutes, once per build).
-ffxivgame is xivboot (tools/build_xiv.py xivboot), given its argument through XIV_ARGS.
+(tests/xivexe.c). Each build of a program has its own address map in meta/; a program is translated
+and compiled for the exe the install has now (minutes, once per build). ffxivgame is xivboot
+(tools/build_xiv.py xivboot), given its argument through XIV_ARGS.
+
+The first start also starts a watcher (--watch) for the install: while the programs run, it builds
+each exe the patches bring or replace as soon as it has settled - the patched ffxivupdater while
+ffxivboot downloads the game's patches, ffxivlogin and ffxivgame while the updater applies them - so
+each is ready by the time it is started. Builds run one at a time (build/build.lock); a program
+whose build is under way waits for it.
 """
+import fcntl
 import os
 import subprocess
 import sys
@@ -19,6 +26,11 @@ sys.path.insert(0, HERE)
 import build_xiv  # noqa: E402
 
 LOG = os.path.join(ROOT, 'build', 'run.log')
+BUILD_LOCK = os.path.join(ROOT, 'build', 'build.lock')
+WATCH_LOCK = os.path.join(ROOT, 'build', 'watch.lock')
+PROGRAMS = ('ffxivboot', 'ffxivupdater', 'ffxivlogin', 'ffxivgame')
+WHAT = {'ffxivboot': 'the launcher', 'ffxivupdater': 'the updater', 'ffxivlogin': 'the login window',
+        'ffxivgame': 'the game'}
 
 
 def tick():
@@ -28,7 +40,7 @@ def tick():
 
 def restamp(arg, made):
     """A sqex argument made at tick `made`, stamped with now: the programs take one only within a
-    minute of its T (ffxivboot, ffxivlogin), and a rebuild takes longer"""
+    minute of its T (ffxivboot, ffxivlogin), and a build takes longer"""
     import xiv_args
     if not arg.startswith('sqex000'):
         return arg
@@ -42,81 +54,131 @@ def notify(text):
     subprocess.call(['osascript', '-e', 'display notification "%s" with title "FINAL FANTASY XIV"' % text])
 
 
-def rebuild(cmd, what):
-    notify('Preparing %s for this Mac. This takes a few minutes, once.' % what)
+def log(text):
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
-    with open(LOG, 'a') as log:
-        rc = subprocess.call([sys.executable, os.path.join(HERE, 'build_xiv.py')] + cmd, cwd=ROOT, stdout=log,
-                             stderr=subprocess.STDOUT)
-    if rc:
-        notify('Could not prepare %s (see build/run.log).' % what)
-        raise SystemExit(rc)
+    with open(LOG, 'a') as f:
+        f.write('[xiv_run] %s %s\n' % (time.strftime('%H:%M:%S'), text))
 
 
-BUILDING = os.path.join(ROOT, 'build', 'xivboot.building')  # a game build in progress (its pid)
-
-
-def game_current(exe):
+def current(name, exe):
+    """whether the native build of this program is the one for this exe"""
+    if name != 'ffxivgame':
+        return build_xiv.program_current(exe, name)
     stamp = os.path.join(ROOT, 'build', 'xivboot.sha256')
     boot = os.path.join(ROOT, build_xiv.XIV_APP, 'Contents', 'MacOS', 'xivboot')
     return os.path.exists(boot) and os.path.exists(stamp) and open(stamp).read().strip() == build_xiv.sha256(exe)
 
 
-def building():
-    """the pid of a game build in progress, or None"""
+def buildable(name, exe):
+    """whether meta/ has an address map for this exe (the patches bring builds that are only steps
+    on the way to 1.23b: those are not built)"""
+    if name == 'ffxivgame':
+        with open(os.path.join(ROOT, build_xiv.META)) as f:
+            return build_xiv.sha256(exe) in f.read(4096)
     try:
-        pid = int(open(BUILDING).read())
-        os.kill(pid, 0)
-        return pid
-    except (OSError, ValueError):
-        return None
+        build_xiv.program_meta(exe, name)
+        return True
+    except SystemExit:
+        return False
 
 
-def prebuild_game(install):
-    """Patching has brought ffxivgame.exe: build the game now, while the player signs in, so it is
-    ready when login starts it (main waits for this build rather than starting another)"""
-    exe = os.path.join(install, 'ffxivgame.exe')
-    if not os.path.exists(exe) or game_current(exe) or building():
-        return
-    with open(os.path.join(ROOT, build_xiv.META)) as f:
-        if build_xiv.sha256(exe) not in f.read(4096):
-            return  # not 1.23b yet: login comes after the patches, so this is rare
-    os.makedirs(os.path.dirname(LOG), exist_ok=True)
-    log = open(LOG, 'a')
-    p = subprocess.Popen([sys.executable, '-c',
-                          'import os,subprocess,sys; open(%r,"w").write(str(os.getpid())); '
-                          'rc=subprocess.call([sys.executable,%r,"xivboot","--exe",%r],cwd=%r); os.remove(%r); sys.exit(rc)'
-                          % (BUILDING, os.path.join(HERE, 'build_xiv.py'), exe, ROOT, BUILDING)],
-                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-    notify('Preparing the game for this Mac while you sign in.')
-    return p
+def build(name, exe):
+    """build the program for this exe, after any build under way (one at a time); nothing to do
+    when that build was this one"""
+    os.makedirs(os.path.dirname(BUILD_LOCK), exist_ok=True)
+    with open(BUILD_LOCK, 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if current(name, exe):
+            return
+        log('building %s for %s' % (name, exe))
+        notify('Preparing %s for this Mac. This takes a few minutes, once.' % WHAT[name])
+        cmd = ['xivboot', '--exe', exe] if name == 'ffxivgame' else ['exe', '--exe', exe, '--name', name]
+        with open(LOG, 'a') as out:
+            rc = subprocess.call([sys.executable, os.path.join(HERE, 'build_xiv.py')] + cmd, cwd=ROOT, stdout=out,
+                                 stderr=subprocess.STDOUT)
+        log('%s %s' % (name, 'built' if rc == 0 else 'failed (%d)' % rc))
+        if rc:
+            notify('Could not prepare %s (see build/run.log).' % WHAT[name])
+            raise SystemExit(rc)
+
+
+def chain_running(install):
+    """whether one of the programs runs (the watcher's reason to keep going): by name, as the
+    updater runs from the downloads folder, not the install; or a build or start for this install"""
+    out = subprocess.run(['ps', '-axo', 'pid=,args='], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        pid, _, args = line.strip().partition(' ')
+        first = args.split(' ', 1)[0]
+        if int(pid) == os.getpid() or '--watch' in args:
+            continue
+        if first in ('ffxivboot', 'ffxivupdater', 'ffxivlogin', 'xivboot') or (install in args and 'xiv_run.py' in args):
+            return True
+    return False
+
+
+def watch(install):
+    """--watch: build each program the install has an exe for, once that exe has settled (the
+    updater writes it in pieces), while the programs run; stop two minutes after they all end"""
+    with open(WATCH_LOCK, 'w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return  # another watcher has this
+        log('watching %s' % install)
+        idle_since = time.time()
+        while time.time() - idle_since < 120:
+            for name in PROGRAMS:
+                exe = os.path.join(install, name + '.exe')
+                try:
+                    settled = time.time() - os.path.getmtime(exe) > 10
+                except OSError:
+                    continue
+                if settled and not current(name, exe) and buildable(name, exe):
+                    try:
+                        build(name, exe)
+                    except SystemExit:
+                        pass  # said so in the log; the program's own start tries again
+            if chain_running(install):
+                idle_since = time.time()
+            time.sleep(5)
+        log('watcher done')
+
+
+def start_watcher(install):
+    with open(WATCH_LOCK, 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        except OSError:
+            return  # one runs already
+    with open(LOG, 'a') as out:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), '--watch', install], stdout=out,
+                         stderr=subprocess.STDOUT, start_new_session=True, cwd=ROOT)
 
 
 def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == '--watch':
+        return watch(os.path.abspath(sys.argv[2]))
     if len(sys.argv) < 3:
         raise SystemExit(__doc__)
     name, exe, rest = sys.argv[1], os.path.abspath(sys.argv[2]), sys.argv[3:]
     started = tick()
+    # the updater may run from Documents\...\downloads: the install is the starting program's
+    install = os.environ.get('XIV_INSTALL') or os.path.dirname(exe)
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    start_watcher(install)
+    if not current(name, exe):
+        build_xiv.program_meta(exe, name) if name != 'ffxivgame' else None  # says so when no address map
+        build(name, exe)
+    if rest and (tick() - started) & 0xFFFFFFFF > 30000:
+        rest = [restamp(rest[0], started)] + rest[1:]
     if name == 'ffxivgame':
-        boot = os.path.join(ROOT, build_xiv.XIV_APP, 'Contents', 'MacOS', 'xivboot')
-        while building():  # started when login opened (prebuild_game)
-            time.sleep(1)
-        if not game_current(exe):
-            rebuild(['xivboot', '--exe', exe], 'the game')
-            rest = [restamp(rest[0], started)] + rest[1:] if rest else rest
         env = dict(os.environ)
         if rest:
             env['XIV_ARGS'] = rest[0]
         env['XIV_TICK'] = hex(tick())  # the game's clock starts at the system's, the argument's window
-        os.execve(boot, ['xivboot', exe], env)
-    if name == 'ffxivlogin':
-        prebuild_game(os.path.dirname(exe))
-    if not build_xiv.program_current(exe, name):
-        build_xiv.program_meta(exe, name)  # stops here, saying so, when this build has no address map
-        rebuild(['exe', '--exe', exe, '--name', name], name)
-        rest = [restamp(rest[0], started)] + rest[1:] if rest else rest
-    binary = os.path.join(ROOT, 'build', 'bin', name)
-    os.execv(binary, [name, exe] + rest)
+        os.execve(os.path.join(ROOT, build_xiv.XIV_APP, 'Contents', 'MacOS', 'xivboot'), ['xivboot', exe], env)
+    os.execv(os.path.join(ROOT, 'build', 'bin', name), [name, exe] + rest)
 
 
 if __name__ == '__main__':

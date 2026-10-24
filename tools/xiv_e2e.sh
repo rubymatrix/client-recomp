@@ -16,7 +16,8 @@
 #   3 boot patch  boot.ver 2010.09.18.0000 (ffxivboot patched and rebuilt itself)
 #   4 game patch  game.ver 2012.09.19.0001, the four programs byte-identical to retail 1.23b
 #   5 sign-in     ffxivlogin found <x-sqexauth> and started the game (signed in by script)
-#   6 lobby       the lobby sent the character list; "Invalid session" fails
+#   6 background  the patched updater and ffxivlogin were built before they were started
+#   7 lobby       the lobby sent the character list; "Invalid session" fails
 # Settings: XIV_E2E_SERVER (127.0.0.1), XIV_E2E_ACCOUNT_URL (http://127.0.0.1:8090),
 # XIV_E2E_CERT (../patch-signing/patch_cert.der), XIV_E2E_ACCOUNT (../meteor-develop/.client-account:
 # user= and password= lines), XIV_E2E_LOBBY_LOG (../meteor-develop/.run/logs/lobby.log).
@@ -138,7 +139,18 @@ signed_in() { grep -q "CreateProcessW(.*ffxivgame.exe.*started" "$RUNLOG" 2>/dev
 wait_for 2400 signed_in && result PASS sign-in "login started the game" \
     || { result FAIL sign-in "no game started (see $RUNLOG)"; exit; }
 
-# 6: the lobby took the session and sent the characters
+# 6: the watcher built the programs the patches brought before anything waited on them
+line_of() { grep -n "$1" "$RUNLOG" | head -1 | cut -d: -f1; }
+early=""
+for p in ffxivupdater ffxivlogin; do
+    b=$(line_of "\[xiv_run\] .*$p built") l=$(line_of "launch: $p.exe")
+    [ -n "$b" ] && [ -n "$l" ] && [ "$b" -lt "$l" ] || early="$early $p"
+done
+grep "\[xiv_run\]" "$RUNLOG" >> "$LOG"
+[ -z "$early" ] && result PASS background "updater and login built before their start" \
+    || result FAIL background "not built ahead:$early (see the [xiv_run] lines above)"
+
+# 7: the lobby took the session and sent the characters
 lobby() { tail -n +"$LOBBY_START" "$LOBBY_LOG" | grep -E "Get characters|Invalid session" | head -1; }
 lobby_answered() { [ -n "$(lobby)" ]; }
 wait_for 3600 lobby_answered
