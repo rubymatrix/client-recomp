@@ -140,10 +140,13 @@ wait_for 2400 signed_in && result PASS sign-in "login started the game" \
     || { result FAIL sign-in "no game started (see $RUNLOG)"; exit; }
 
 # 6: the watcher built the programs the patches brought before anything waited on them
-line_of() { grep -n "$1" "$RUNLOG" | head -1 | cut -d: -f1; }
+# (the first updater, for the boot patch, is the disc's, which the installer built: the last start
+# is the patched one)
+first_line() { grep -n "$1" "$RUNLOG" | head -1 | cut -d: -f1; }
+last_line() { grep -n "$1" "$RUNLOG" | tail -1 | cut -d: -f1; }
 early=""
 for p in ffxivupdater ffxivlogin; do
-    b=$(line_of "\[xiv_run\] .*$p built") l=$(line_of "launch: $p.exe")
+    b=$(first_line "\[xiv_run\] .*$p built") l=$(last_line "launch: $p.exe")
     [ -n "$b" ] && [ -n "$l" ] && [ "$b" -lt "$l" ] || early="$early $p"
 done
 grep "\[xiv_run\]" "$RUNLOG" >> "$LOG"
