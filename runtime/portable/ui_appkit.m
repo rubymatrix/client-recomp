@@ -87,7 +87,6 @@ typedef struct UiWnd
     uint32_t wndproc, dlgproc, userdata, msgresult, dlguser, font, hinst;
     int x, y, w, h; /* children: in the parent's client area; dialogs: the client area on the screen */
     int visible, enabled;
-    int suppressed; /* a control the host leaves out (ui_suppress_controls): never shown */
     uint16_t text[UI_TEXT];
     char cls[48];      /* the class name GetClassName reports */
     int bx, by;        /* a dialog's base units (MapDialogRect) */
@@ -331,7 +330,7 @@ static void make_view(UiWnd* w)
     }
     else
         v = [[UiFlipped alloc] initWithFrame:r];
-    [v setHidden:!w->visible || w->suppressed];
+    [v setHidden:!w->visible];
     [pv addSubview:v];
     w->view = v;
     if (getenv("XIV_UI_LOG"))
@@ -397,7 +396,7 @@ static void sync_view(UiWnd* w)
     }
     NSView* v = (NSView*)w->view;
     NSRect r = NSMakeRect(w->x, w->y, w->w, w->h);
-    [v setHidden:!w->visible || w->suppressed];
+    [v setHidden:!w->visible];
     if (w->kind == UK_STATIC)
     {
         [(NSTextField*)v setStringValue:caption(w, (w->style & SS_NOPREFIX) != 0)];
@@ -647,17 +646,6 @@ static void destroy(UiWnd* w)
         });
 }
 
-/* controls the host leaves out of every dialog, by id (tests/xivexe.c: ffxivlogin's Cancel and
- * Update Page buttons; its window's close button still cancels) */
-static uint32_t g_suppressed[8];
-static int g_nsuppressed;
-
-void ui_suppress_controls(const uint32_t* ids, int n)
-{
-    for (int i = 0; i < n && g_nsuppressed < 8; ++i)
-        g_suppressed[g_nsuppressed++] = ids[i];
-}
-
 /* --- creation hooks (SetWindowsHookEx WH_CBT): MFC attaches its CWnd objects to new windows from
  * HCBT_CREATEWND, subclassing them before their first message ------------------------------------ */
 typedef struct { uint32_t id, type, proc, tid; } Hook;
@@ -841,9 +829,6 @@ static uint32_t create_dialog(uint32_t hinst, uint32_t tpl, uint32_t parent, uin
         c->tid = d->tid;
         c->wndproc = proc_for(c->kind);
         c->visible = (ist & WS_VISIBLE) != 0;
-        for (int k = 0; k < g_nsuppressed; ++k)
-            if (g_suppressed[k] == iid)
-                c->suppressed = 1;
         c->enabled = !(ist & WS_DISABLED);
         c->x = DX(ix), c->y = DY(iy), c->w = DX(icx), c->h = DY(icy);
         if (ititle)
@@ -1402,7 +1387,7 @@ static void sh_IsWindowVisible(Guest* g)
         forward_n(g, "IsWindowVisible", 1);
         return;
     }
-    RET(w->visible && !w->suppressed, 1);
+    RET(w->visible, 1);
 }
 
 static void sh_EnableWindow(Guest* g)
