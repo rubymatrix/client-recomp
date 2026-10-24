@@ -15,8 +15,8 @@
    replaces it.
 
 --server is the host Square Enix's names go to (default 127.0.0.1); --patch-cert the server's patch
-signing certificate (meteor-web PatchTool's patch_cert.der), which ffxivboot checks patch torrents
-against; --account-url the server's login page (meteor-web: http://<host>:8090). The app's launcher
+signing certificate, which ffxivboot checks patch torrents against (default: fetched from the
+server, http://<server>:54996/patch/cert, which meteor-web serves); --account-url the server's login page (meteor-web: http://<host>:8090). The app's launcher
 keeps them.
 
 --test-env KEY=VALUE (repeatable) adds an environment setting to the launcher: tools/xiv_e2e.sh
@@ -119,6 +119,23 @@ APP_PLIST = {
 }
 
 
+def fetch_cert(server):
+    """the server's patch signing certificate, from meteor-web's patch port, kept beside the install"""
+    import urllib.request
+    out = os.path.expanduser('~/Library/Application Support/FFXIV1_0/patch_cert.der')
+    try:
+        with urllib.request.urlopen('http://%s:54996/patch/cert' % server, timeout=15) as r:
+            data = r.read()
+    except OSError as e:
+        print('The server sent no patch certificate (%s): patches will not install. Give --patch-cert.' % e)
+        return None
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, 'wb') as f:
+        f.write(data)
+    print('Patch certificate from %s: %s' % (server, out))
+    return out
+
+
 def make_app(app_dir, install, server, cert, account_url, test_env):
     """The app is a launcher: it starts ffxivboot (xiv_run.py) with the server's settings. The game
     runs from its own bundle in build/ (build_xiv.py), so macOS sees a game when it runs."""
@@ -190,6 +207,8 @@ def main():
     if os.path.exists(game):
         print('ffxivgame: built when it is first started (after patching to 1.23b)')
 
+    if not a.patch_cert:
+        a.patch_cert = fetch_cert(a.server)
     app = make_app(os.path.expanduser(a.app_dir or default_app_dir()), install, a.server, a.patch_cert, a.account_url,
                    a.test_env)
     print('Ready: %s' % app)

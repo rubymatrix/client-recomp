@@ -34,7 +34,7 @@ Mount the FINAL FANTASY XIV disc (or its image) and double-click `install.comman
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/rubymatrix/client-recomp/main/install.command | bash -s -- \
-    --server <host> --patch-cert <patch_cert.der> --account-url http://<host>:8090
+    --server <host> --account-url http://<host>:8090
 ```
 
 It gets Apple's command line tools if they are missing, puts these sources in
@@ -46,7 +46,7 @@ version with the server, downloads the patches and has the native updater apply 
 then ffxivlogin signs in and the game starts. Each program is translated again when a patch
 replaces it (`tools/xiv_run.py`); the game is built while you sign in. The server runs
 [meteor-web](https://github.com/rubymatrix/Project-Meteor-Web) for the version check, patches and
-login page; `--patch-cert` is its PatchTool certificate.
+login page; the installer fetches its patch signing certificate from it (`/patch/cert`).
 
 `tools/xiv_e2e.sh` tests all of it end to end, from the disc to the lobby's character list, in
 folders of its own (a fresh clone, install, Documents and app folder).

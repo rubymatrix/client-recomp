@@ -9,8 +9,9 @@
 # the disc is unpacked, its programs are translated and compiled on this Mac, and
 # "FINAL FANTASY XIV.app" lands in /Applications. Nothing from the disc leaves this Mac.
 #
-# Options go to tools/xiv_install.py: --server <host>, --patch-cert <file>, --account-url <url>,
-# --disc <folder>, --install-dir <folder>. Run it again to update the sources and resume.
+# Options go to tools/xiv_install.py: --server <host> (the patch certificate is fetched from it),
+# --account-url <url>, --disc <folder>, --install-dir <folder>, --patch-cert <file> (instead of
+# fetching it). Run it again to update the sources and resume.
 # XIV_SOURCE (folder), XIV_REPO (git URL or path) and XIV_BRANCH (default main) override where the
 # sources go, where they come from and which branch.
 

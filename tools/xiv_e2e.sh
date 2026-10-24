@@ -19,7 +19,7 @@
 #   6 background  the patched updater and ffxivlogin were built before they were started
 #   7 lobby       the lobby sent the character list; "Invalid session" fails
 # Settings: XIV_E2E_SERVER (127.0.0.1), XIV_E2E_ACCOUNT_URL (http://127.0.0.1:8090),
-# XIV_E2E_CERT (../patch-signing/patch_cert.der), XIV_E2E_ACCOUNT (../meteor-develop/.client-account:
+# XIV_E2E_CERT (default none: fetched from the server), XIV_E2E_ACCOUNT (../meteor-develop/.client-account:
 # user= and password= lines), XIV_E2E_LOBBY_LOG (../meteor-develop/.run/logs/lobby.log).
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -37,7 +37,7 @@ done
 DIR="${DIR:-${TMPDIR:-/tmp}/xiv-e2e-$(date +%Y%m%d-%H%M%S)}"
 SERVER="${XIV_E2E_SERVER:-127.0.0.1}"
 ACCOUNT_URL="${XIV_E2E_ACCOUNT_URL:-http://127.0.0.1:8090}"
-CERT="${XIV_E2E_CERT:-$WS/patch-signing/patch_cert.der}"
+CERT="${XIV_E2E_CERT:-}"  # empty: the installer fetches it from the server
 ACCOUNT="${XIV_E2E_ACCOUNT:-$WS/meteor-develop/.client-account}"
 LOBBY_LOG="${XIV_E2E_LOBBY_LOG:-$WS/meteor-develop/.run/logs/lobby.log}"
 # retail 1.23b's programs (SHA-256), what the patches must produce
@@ -84,7 +84,7 @@ DISC=$(for v in /Volumes/*; do [ -f "$v/ffxivsetup.exe" ] && [ -f "$v/data/data1
 curl -sf -o /dev/null "http://$SERVER:54996/patch/vercheck/ffxiv/win32/release/boot/2010.09.18.0000" \
     || { result FAIL setup "no version check at $SERVER:54996 (meteor-web)"; exit; }
 nc -z "$SERVER" 54994 2>/dev/null || { result FAIL setup "no lobby at $SERVER:54994"; exit; }
-[ -f "$CERT" ] || { result FAIL setup "no patch certificate $CERT"; exit; }
+[ -z "$CERT" ] || [ -f "$CERT" ] || { result FAIL setup "no patch certificate $CERT"; exit; }
 [ -f "$ACCOUNT" ] || { result FAIL setup "no test account $ACCOUNT"; exit; }
 [ -f "$LOBBY_LOG" ] || { result FAIL setup "no lobby log $LOBBY_LOG"; exit; }
 # the sign-in: meteor-web's form filled from the test account, in the login window's page
@@ -103,7 +103,7 @@ result PASS setup "disc $DISC, server $SERVER"
 # 1: the bootstrap, as a player runs it, from a clone of this checkout
 XIV_REPO="file://$HERE" XIV_BRANCH="$(git -C "$HERE" branch --show-current)" XIV_SOURCE="$SRC" XIV_CALLER_DIR="$DIR" \
     bash "$HERE/install.command" --disc "$DISC" --install-dir "$INSTALL" --app-dir "$APPS" --server "$SERVER" \
-    --patch-cert "$CERT" --account-url "$ACCOUNT_URL" \
+    ${CERT:+--patch-cert "$CERT"} --account-url "$ACCOUNT_URL" \
     --test-env "XIV_DOCUMENTS=$DOCS" --test-env "XIV_WEB_SCRIPT=$DIR/signin.js" >> "$LOG" 2>&1 \
     && result PASS bootstrap "app $APPS/FINAL FANTASY XIV.app opened" \
     || { result FAIL bootstrap "install.command failed (see the log)"; exit; }
