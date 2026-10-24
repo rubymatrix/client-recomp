@@ -33,7 +33,7 @@ This produces `build/xivboot`.
 Mount the FINAL FANTASY XIV disc (or its image) and double-click `install.command`, or:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/rubymatrix/client-recomp/main/install.command | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/rubymatrix/ffxiv-classic-recomp/main/install.command | bash -s -- \
     --server <host> --account-url http://<host>:8090
 ```
 

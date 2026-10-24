@@ -2,7 +2,7 @@
 # Install FINAL FANTASY XIV (1.23b) on this Mac from the retail disc. Mount the disc (or its image),
 # then double-click this file, or paste into Terminal:
 #
-#   curl -fsSL https://raw.githubusercontent.com/rubymatrix/client-recomp/main/install.command | bash -s -- --server <host>
+#   curl -fsSL https://raw.githubusercontent.com/rubymatrix/ffxiv-classic-recomp/main/install.command | bash -s -- --server <host>
 #
 # It gets Apple's command line tools when they are missing (a dialog: click Install), puts the
 # sources in ~/Library/Application Support/FFXIV1_0/source, and runs tools/xiv_install.py there:
@@ -18,7 +18,7 @@
 # Everything is inside main, so a download cut short runs nothing.
 main() {
     set -e
-    local repo="${XIV_REPO:-https://github.com/rubymatrix/client-recomp.git}"
+    local repo="${XIV_REPO:-https://github.com/rubymatrix/ffxiv-classic-recomp.git}"
     local branch="${XIV_BRANCH:-main}"
     local src="${XIV_SOURCE:-$HOME/Library/Application Support/FFXIV1_0/source}"
 
