@@ -82,6 +82,21 @@ def buildable(name, exe):
         return False
 
 
+def progress_window(what):
+    """tools/xiv_progress.m, built here the first time: a window with the build's steps and a bar,
+    fed the build's progress lines (None when it cannot be shown)"""
+    src = os.path.join(HERE, 'xiv_progress.m')
+    binary = os.path.join(ROOT, 'build', 'bin', 'xiv_progress')
+    if not os.path.exists(binary) or os.path.getmtime(binary) < os.path.getmtime(src):
+        os.makedirs(os.path.dirname(binary), exist_ok=True)
+        if subprocess.call(['clang', '-fobjc-arc', '-O2', '-framework', 'AppKit', '-o', binary, src]):
+            return None
+    w = subprocess.Popen([binary], stdin=subprocess.PIPE, text=True, start_new_session=True)
+    w.stdin.write('title %s\n' % what)
+    w.stdin.flush()
+    return w
+
+
 def build(name, exe):
     """build the program for this exe, after any build under way (one at a time); nothing to do
     when that build was this one"""
@@ -91,11 +106,25 @@ def build(name, exe):
         if current(name, exe):
             return
         log('building %s for %s' % (name, exe))
-        notify('Preparing %s for this Mac. This takes a few minutes, once.' % WHAT[name])
         cmd = ['xivboot', '--exe', exe] if name == 'ffxivgame' else ['exe', '--exe', exe, '--name', name]
+        window = progress_window(WHAT[name])
+        p = subprocess.Popen([sys.executable, os.path.join(HERE, 'build_xiv.py')] + cmd, cwd=ROOT, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=dict(os.environ, XIV_PROGRESS='1'))
         with open(LOG, 'a') as out:
-            rc = subprocess.call([sys.executable, os.path.join(HERE, 'build_xiv.py')] + cmd, cwd=ROOT, stdout=out,
-                                 stderr=subprocess.STDOUT)
+            for line in p.stdout:
+                if line.startswith('@progress '):
+                    if window:
+                        try:
+                            window.stdin.write(line)
+                            window.stdin.flush()
+                        except OSError:
+                            window = None  # closed: the build carries on
+                else:
+                    out.write(line)
+                    out.flush()
+        rc = p.wait()
+        if window:
+            window.stdin.close()
         log('%s %s' % (name, 'built' if rc == 0 else 'failed (%d)' % rc))
         if rc:
             notify('Could not prepare %s (see build/run.log).' % WHAT[name])

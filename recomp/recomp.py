@@ -751,6 +751,7 @@ def main():
     unimpl = collections.Counter()
     unimpl_funcs = set()
     queue = list(todo)
+    progress = os.environ.get('XIV_PROGRESS')  # "@progress translate <done> <total>" lines (tools/xiv_run.py)
     while queue:
         e = queue.pop()
         if e in done:
@@ -758,6 +759,8 @@ def main():
         prog.referenced = set()
         t = FunctionTranslator(prog, e, prog.functions[e])
         done[e] = t.translate()
+        if progress and len(done) % 250 == 0:
+            print('@progress translate %d %d' % (len(done), len(done) + len(queue)), flush=True)
         flaginfo[e] = t.flaginfo
         reginfo[e] = t.reginfo
         variants = []

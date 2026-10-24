@@ -74,6 +74,11 @@ def run(cmd):
     subprocess.check_call(cmd, cwd=ROOT)
 
 
+# XIV_PROGRESS: "@progress <step> <done> <total>" lines for each step (translate, compile, link), which
+# tools/xiv_run.py turns into its progress window
+PROGRESS = bool(os.environ.get('XIV_PROGRESS'))
+
+
 def run_lto(cmd, cache, modules):
     """The ThinLTO link with a progress bar: each module the link compiles writes its cache file in
     `cache`, so the files written since the link started count the modules done (of `modules`, the
@@ -94,6 +99,9 @@ def run_lto(cmd, cache, modules):
             done = 0
         frac = min(done / modules, 1.0) if modules else 0
         elapsed = time.time() - start
+        if PROGRESS:
+            print('@progress link %d %d' % (min(done, modules), modules), flush=True)
+            continue
         if tty:
             sys.stdout.write('\r  linking [%-40s] %3d%%  %d / %d modules  %ds ' % (
                 '#' * int(frac * 40), 100 * frac, min(done, modules), modules, elapsed))
@@ -139,9 +147,12 @@ def compile_stale(sources, objdir, extra=(), gen_flags=None):
         print('compiling %d of %d' % (len(jobs), len(sources)), flush=True)
         failed = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as ex:
-            for cmd, rc in zip(jobs, ex.map(lambda c: subprocess.call(c, cwd=ROOT), jobs)):
-                if rc:
-                    failed.append(cmd[-3])
+            futures = {ex.submit(subprocess.call, c, cwd=ROOT): c for c in jobs}
+            for n, f in enumerate(concurrent.futures.as_completed(futures), 1):
+                if f.result():
+                    failed.append(futures[f][-3])
+                if PROGRESS:
+                    print('@progress compile %d %d' % (n, len(jobs)), flush=True)
         if failed:
             raise SystemExit('compile failed: ' + ', '.join(failed))
     with open(stamp, 'w') as f:
@@ -266,7 +277,11 @@ def program(exe, name, run_it, extra):
     thirdparty.build('sdl3')
     objs += compile_stale(EXE_PORTABLE + EXE_HOST + ['tests/xivexe.c'], 'build/exe/obj', thirdparty.flags('sdl3'))
     os.makedirs(os.path.join(ROOT, 'build/bin'), exist_ok=True)
+    if PROGRESS:
+        print('@progress link 0 1', flush=True)
     run(['clang', '-o', 'build/bin/' + name, '-mcpu=apple-m1', '-Wl,-U,___llvm_profile_write_file'] + objs + thirdparty.libs('sdl3') + GFX_LIBS + ['-framework', 'WebKit', '-lm', '-lpthread'])
+    if PROGRESS:
+        print('@progress link 1 1', flush=True)
     with open(os.path.join(ROOT, 'build', 'bin', name + '.sha256'), 'w') as f:
         f.write(want + '\n')
     if run_it:
