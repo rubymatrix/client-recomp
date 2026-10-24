@@ -30,6 +30,8 @@
 
 #include <SDL3/SDL.h>
 
+void app_icon_from_image(uint32_t base); /* app_icon.m */
+
 #define GAME_DIR_GUEST "C:\\Program Files\\SquareEnix\\FINAL FANTASY XIV"
 
 void xiv_misc_init(void);
@@ -316,6 +318,7 @@ int main(int argc, char** argv)
     fflush(stdout);
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD))
         printf("SDL_Init: %s\n", SDL_GetError());
+    app_icon_from_image(rt_image_base); /* the Dock shows the exe's own icon (app_icon.m) */
     static volatile int done;
 #if defined(__APPLE__)
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);

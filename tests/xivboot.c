@@ -33,6 +33,8 @@
 
 #include <SDL3/SDL.h>
 
+void app_icon_from_image(uint32_t base); /* app_icon.m */
+
 static void write_config_sys(const char* path)
 {
     static const uint32_t fields[24] = {
@@ -337,6 +339,7 @@ int main(int argc, char** argv)
     }
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD))
         printf("SDL_Init: %s\n", SDL_GetError());
+    app_icon_from_image(rt_image_base); /* the Dock shows the exe's own icon (app_icon.m) */
     static volatile int done;
     sampler_start();
 #if defined(__APPLE__)

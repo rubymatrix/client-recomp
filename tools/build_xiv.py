@@ -58,7 +58,7 @@ PORTABLE = ['runtime/runtime.c', 'runtime/portable/plat_posix.c', 'runtime/porta
             'runtime/portable/k32_misc.c', 'runtime/portable/k32_xiv.c',
             'runtime/portable/xiv_misc.c', 'runtime/portable/fiber.c', 'runtime/portable/xiv_ui.c', 'runtime/portable/xiv_probe.c', 'runtime/portable/sampler_posix.c',
             'runtime/portable/xiv_native.c', 'runtime/portable/xiv_direct_login.c', 'runtime/portable/xiv_groundsnap.c',
-            'runtime/portable/xiv_discord.c']
+            'runtime/portable/xiv_discord.c', 'runtime/portable/app_icon.m']
 
 
 # Win32 shims on SDL3 (windowing, input, timers, sockets, audio) shared with FFXI.
@@ -231,7 +231,7 @@ def xivboot(exe, run_it, extra, debug=False, opt='-O1', pgo=None):
     run_lto(['clang', '-o', 'build/xivboot', '-flto=thin', '-O3', '-mcpu=apple-m1', '-Wl,-U,___llvm_profile_write_file'] + pgo_flags + inl_flags + [
              '-Wl,-cache_path_lto,build/xiv/lto-cache', '-Wl,-mllvm,-threads=%d' % (os.cpu_count() or 4)]
             + objs + thirdparty.libs('sdl3') + GFX_LIBS + ['-lm', '-lpthread'], 'build/xiv/lto-cache', len(gen))
-    xiv_bundle()
+    xiv_bundle(exe)
     with open(os.path.join(ROOT, 'build', 'xivboot.sha256'), 'w') as f:  # which ffxivgame.exe (xiv_run.py)
         f.write(sha256(exe) + '\n')
     if run_it:
@@ -308,19 +308,56 @@ XIV_PLIST = '''<?xml version="1.0" encoding="UTF-8"?>
 '''
 
 
-def xiv_bundle():
+def exe_icns(exe, out):
+    """The exe's own icon (its RT_GROUP_ICON and RT_ICON resources, put back together as a .ico) as
+    a .icns for an app bundle, made from the player's file at build time. False when it has none."""
+    import struct
+    import tempfile
+    import pefile
+    pe = pefile.PE(exe, fast_load=True)
+    pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
+    types = {t.id: t for t in pe.DIRECTORY_ENTRY_RESOURCE.entries} if hasattr(pe, 'DIRECTORY_ENTRY_RESOURCE') else {}
+    if 14 not in types or 3 not in types:
+        return False
+
+    def data(tid, name=None):
+        for e in types[tid].directory.entries:
+            if name is None or e.id == name:
+                d = e.directory.entries[0].data.struct
+                return pe.get_data(d.OffsetToData, d.Size)
+        return b''
+    grp = data(14)
+    n = struct.unpack_from('<H', grp, 4)[0]
+    images = [data(3, struct.unpack_from('<H', grp, 6 + 14 * i + 12)[0]) for i in range(n)]
+    ico = bytearray(struct.pack('<HHH', 0, 1, n))
+    off = 6 + 16 * n
+    for i in range(n):
+        ico += grp[6 + 14 * i:6 + 14 * i + 8] + struct.pack('<II', len(images[i]), off)
+        off += len(images[i])
+    for d in images:
+        ico += d
+    with tempfile.NamedTemporaryFile(suffix='.ico') as f:
+        f.write(ico)
+        f.flush()
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        return subprocess.call(['sips', '-s', 'format', 'icns', f.name, '--out', out], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL) == 0
+
+
+def xiv_bundle(game_exe=None):
     """build/xivboot inside an app bundle (a hard link), so macOS sees a game: Game Mode turns on
-    when it runs full screen. xiv_login.py starts this copy."""
+    when it runs full screen, and it shows ffxivgame.exe's icon. xiv_login.py starts this copy."""
     macos = os.path.join(ROOT, XIV_APP, 'Contents', 'MacOS')
     os.makedirs(macos, exist_ok=True)
     exe = os.path.join(macos, 'xivboot')
     if os.path.lexists(exe):
         os.remove(exe)
     os.link(os.path.join(ROOT, 'build', 'xivboot'), exe)
-    # an app tools/xiv_install.py made starts ffxivboot (its "FINAL FANTASY XIV" launcher): keep that
-    launcher = os.path.exists(os.path.join(macos, 'FINAL FANTASY XIV'))
+    plist = XIV_PLIST
+    if game_exe and exe_icns(game_exe, os.path.join(ROOT, XIV_APP, 'Contents', 'Resources', 'AppIcon.icns')):
+        plist = plist.replace('<key>CFBundleName</key>', '<key>CFBundleIconFile</key><string>AppIcon</string>\n\t<key>CFBundleName</key>')
     with open(os.path.join(ROOT, XIV_APP, 'Contents', 'Info.plist'), 'w') as f:
-        f.write(XIV_PLIST.replace('<string>xivboot</string>', '<string>FINAL FANTASY XIV</string>') if launcher else XIV_PLIST)
+        f.write(plist)
 
 
 def main():

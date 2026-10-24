@@ -126,6 +126,9 @@ def make_app(app_dir, install, server, cert, account_url, test_env):
     macos = os.path.join(APP, 'Contents', 'MacOS')
     os.makedirs(macos, exist_ok=True)
     plist = dict(APP_PLIST)
+    # ffxivboot.exe's icon, as the retail shortcut showed it
+    if build_xiv.exe_icns(os.path.join(install, 'ffxivboot.exe'), os.path.join(APP, 'Contents', 'Resources', 'AppIcon.icns')):
+        plist['CFBundleIconFile'] = 'AppIcon'
     with open(os.path.join(APP, 'Contents', 'Info.plist'), 'wb') as f:
         plistlib.dump(plist, f)
     launcher = os.path.join(macos, 'FINAL FANTASY XIV')
