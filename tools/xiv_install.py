@@ -149,7 +149,7 @@ def make_app(app_dir, install, server, cert, account_url, test_env):
     with open(os.path.join(APP, 'Contents', 'Info.plist'), 'wb') as f:
         plistlib.dump(plist, f)
     launcher = os.path.join(macos, 'FINAL FANTASY XIV')
-    env = 'export XIV_SERVER_HOST="%s"\nexport XIV_LOBBY="%s"\n' % (server, server)  # the game's lobby too
+    env = 'export XIV_SERVER_HOST="%s"\n' % server
     if cert:
         env += 'export XIV_PATCH_CERT="%s"\n' % os.path.abspath(cert)
     if account_url:
